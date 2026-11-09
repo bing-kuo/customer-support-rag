@@ -5,22 +5,30 @@
 ## 開發環境
 
 - CI 已驗證 Python 3.12 與 3.13
-- 開發工具版本固定於 `pyproject.toml`
+- `uv.lock` 固定應用程式與開發依賴的完整版本及雜湊
+- FastAPI 提供 HTTP routing，Pydantic 定義並驗證健康檢查回應，Uvicorn 在本機啟動 ASGI app
+- Starlette 固定在相容版本，讓開發依賴中的 HTTPX 支援 FastAPI `TestClient`；pytest 執行測試，Ruff 負責格式與 lint
 
 ```sh
-python -m venv .venv
-source .venv/bin/activate
-python -m pip install -e ".[dev]"
+uv sync --locked --extra dev
 ```
 
 ## 本機檢查
 
 ```sh
-ruff format --check .
-ruff check .
-pytest
+uv run --locked ruff format --check .
+uv run --locked ruff check .
+uv run --locked pytest
 ```
 
-GitHub Actions 會執行相同的格式、lint 與測試檢查，並以 Gitleaks 掃描 secrets。
+## 啟動 API
 
-目前只包含 Python 專案骨架與最小 CI。API、RAG 行為、模型整合及合成語料會在後續 PR 分別提出 review。
+```sh
+uv run --locked uvicorn customer_support_rag.api:app --host 127.0.0.1 --port 8000
+```
+
+`GET http://127.0.0.1:8000/health` 回傳服務狀態、應用程式名稱與版本。這個端點只回報 API 程序狀態，不檢查尚未加入的模型、知識庫或儲存服務。
+
+GitHub Actions 會使用 `uv.lock` 安裝依賴，在 Python 3.12 與 3.13 執行相同的格式、lint 與測試檢查，並以 Gitleaks 掃描 secrets。
+
+目前只包含最小 FastAPI app 與健康檢查端點。RAG 行為、模型整合及合成語料會在後續 PR 分別提出 review。
