@@ -4,7 +4,7 @@
 
 ## 開發環境
 
-- Python 3.12 或更新版本
+- CI 已驗證 Python 3.12 與 3.13
 - 開發工具版本固定於 `pyproject.toml`
 
 ```sh
