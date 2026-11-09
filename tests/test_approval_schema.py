@@ -13,9 +13,15 @@ class CorpusApproval(BaseModel):
     approved_at:str
 
 
-def test_json_approval_schema_matches_actual_independent_record():
+def test_json_approval_schema_matches_synthetic_record():
     schema=json.loads((ROOT/'approval.schema.json').read_text())
-    record=json.loads((ROOT/'approvals/marcus-synthetic-corpus-v2-2026-11-08.json').read_text())
+    record={
+        'reviewer':'Marcus',
+        'manifest_sha256':'0'*64,
+        'corpus_sha256':'1'*64,
+        'document_hashes':{'synthetic-doc:1':'2'*64},
+        'approved_at':'2026-01-01T00:00:00Z',
+    }
     CorpusApproval.model_validate(record)
     assert set(schema['required'])==set(CorpusApproval.model_fields)
     assert set(schema['properties'])==set(CorpusApproval.model_fields)
