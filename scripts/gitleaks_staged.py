@@ -5,6 +5,7 @@ from __future__ import annotations
 import subprocess
 import sys
 import tempfile
+import unicodedata
 from collections.abc import Callable
 from pathlib import Path, PurePosixPath
 
@@ -49,9 +50,14 @@ def parse_index_entries(index_output: bytes) -> dict[str, tuple[str, str]]:
         if mode not in {"100644", "100755"} or stage != "0":
             raise ScanError("Only resolved regular files can be scanned")
 
-        normalized_path = path.casefold()
+        normalized_path = unicodedata.normalize(
+            "NFD", unicodedata.normalize("NFD", path).casefold()
+        )
         if normalized_path in normalized_paths:
-            raise ScanError("Refusing staged paths that collide by case")
+            raise ScanError(
+                "Refusing staged paths that collide after Unicode normalization "
+                "and case folding"
+            )
         normalized_paths.add(normalized_path)
         entries[path] = (mode, object_id)
 

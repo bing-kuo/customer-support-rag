@@ -9,6 +9,14 @@
 - FastAPI 提供 HTTP routing，Pydantic 定義並驗證健康檢查回應，Uvicorn 在本機啟動 ASGI app
 - Starlette 固定在相容版本，讓開發依賴中的 HTTPX 支援 FastAPI `TestClient`；pytest 執行測試，Ruff 負責格式與 lint
 
+Clone 後在獨立 repository checkout 執行一次，啟用 staged secret scan：
+
+```sh
+python3 scripts/install_git_hooks.py
+```
+
+安裝器只設定此 clone 的 local `core.hooksPath`。它會保留既有自訂 hooks，並拒絕在 linked worktree、已有 hooks 設定或其他 linked worktrees 存在時覆寫；請在建立 linked worktrees 前執行。安裝後一般 `git commit` 會執行 project-local Gitleaks hook。
+
 ```sh
 uv sync --locked --extra dev
 ```
