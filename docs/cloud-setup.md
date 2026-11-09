@@ -1,6 +1,6 @@
 # 雲端生成：只需專案 key
 
-編輯既有 `/Users/bing/Developer/projects/customer-support-rag/.env`，只需要：
+在專案根目錄建立或編輯 `.env`，只需要：
 
 ```text
 OPENAI_API_KEY=[本案專用 API key]
