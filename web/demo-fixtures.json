@@ -1,0 +1,8 @@
+{
+  "answer": {"status":"answer","answer":"請先將耳機放回充電盒，再依來源的配對步驟操作。","clarification":null,"citations":[{"source_id":"src-demo-a","doc_id":"pairing-a","revision":"1","section":"重新配對","excerpt":"將耳機放回充電盒後重新開始配對。","url":"/api/v1/sources/src-demo-a"}],"handoff_summary":null,"release_id":"rel-demo-1","request_id":"req-answer"},
+  "clarify": {"status":"clarify","answer":null,"clarification":{"question":"請問耳機是哪個型號？","options":["hp-a","hp-b"]},"citations":[],"handoff_summary":null,"release_id":"rel-demo-1","request_id":"req-clarify"},
+  "handoff": {"status":"handoff","answer":null,"clarification":null,"citations":[],"handoff_summary":{"issue":"使用者詢問退款","confirmed_product":"hp-a","attempted_steps":[],"missing_fields":["購買資訊"],"reason":"refund_request","source_ids":[],"user_statements":["我想退款"]},"release_id":"rel-demo-1","request_id":"req-handoff"},
+  "unavailable": {"status":"unavailable","answer":null,"clarification":null,"citations":[],"handoff_summary":null,"release_id":"rel-demo-1","request_id":"req-unavailable"},
+  "source": {"source_id":"src-demo-a","release_id":"rel-demo-1","doc_id":"pairing-a","revision":"1","title":"A 型號配對","section":"重新配對","text":"將耳機放回充電盒後重新開始配對。","status":"active"},
+  "error": {"error":{"code":"capacity_exceeded","message":"Server is busy."},"request_id":"req-busy"}
+}

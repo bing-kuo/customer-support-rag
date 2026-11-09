@@ -1,0 +1,354 @@
+[
+  {
+    "doc_id": "hp-a-pairing",
+    "revision": "2",
+    "title": "配對",
+    "product_ids": [
+      "hp-a"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-a-pairing",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "abf6fdf28dcca4f2179c04211f2a10a1ca2c6f4640c5fbe358c111e96c0c33fb",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": "1",
+    "filename": "hp-a-pairing-v2.md"
+  },
+  {
+    "doc_id": "hp-a-charging",
+    "revision": "1",
+    "title": "充電",
+    "product_ids": [
+      "hp-a"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-a-charging",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "a043d543236fa0eea2639813c1bc6b3756ab7070ec4f464d4f902d957c9fd9d2",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-a-charging-v1.md"
+  },
+  {
+    "doc_id": "hp-a-compatibility",
+    "revision": "1",
+    "title": "相容性",
+    "product_ids": [
+      "hp-a"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-a-compatibility",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "6fdfe0befec85f9fcac6bfad8dee3d8fbbaa17b00c938c2cdbebb7aa54f4c55f",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-a-compatibility-v1.md"
+  },
+  {
+    "doc_id": "hp-a-cleaning",
+    "revision": "1",
+    "title": "清潔",
+    "product_ids": [
+      "hp-a"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-a-cleaning",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "c8a1502116193f43f3b1ac66b5a87b7503745bdc6c5dace186a43f2300c44cc4",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-a-cleaning-v1.md"
+  },
+  {
+    "doc_id": "hp-a-audio",
+    "revision": "1",
+    "title": "聲音",
+    "product_ids": [
+      "hp-a"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-a-audio",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "c1c7eb453bb8d830eba851eba3bbb80c406924ef642543781687e439f5492a45",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-a-audio-v1.md"
+  },
+  {
+    "doc_id": "hp-a-microphone",
+    "revision": "1",
+    "title": "麥克風",
+    "product_ids": [
+      "hp-a"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-a-microphone",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "63a3669bc545f52081df28bb27a0ff2432c797c2ed0c491ed3fd2a0f87d0919f",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-a-microphone-v1.md"
+  },
+  {
+    "doc_id": "hp-a-reset",
+    "revision": "1",
+    "title": "重設",
+    "product_ids": [
+      "hp-a"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-a-reset",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "e57e5cebfab1b7638232e65b8433c0cff96d29055d6277c0f659fd367e4f79c3",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-a-reset-v1.md"
+  },
+  {
+    "doc_id": "hp-a-safety",
+    "revision": "1",
+    "title": "安全",
+    "product_ids": [
+      "hp-a"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-a-safety",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "158d10741de2023ed7df34e22aa26262c03e259ced68fc9718fe926e3000e7f6",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-a-safety-v1.md"
+  },
+  {
+    "doc_id": "hp-b-pairing",
+    "revision": "2",
+    "title": "配對",
+    "product_ids": [
+      "hp-b"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-b-pairing",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "02b5be68af50b2c23d1d9034abcb0560322763fa62942a9f282b22ff8a040a61",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": "1",
+    "filename": "hp-b-pairing-v2.md"
+  },
+  {
+    "doc_id": "hp-b-charging",
+    "revision": "1",
+    "title": "充電",
+    "product_ids": [
+      "hp-b"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-b-charging",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "a043d543236fa0eea2639813c1bc6b3756ab7070ec4f464d4f902d957c9fd9d2",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-b-charging-v1.md"
+  },
+  {
+    "doc_id": "hp-b-compatibility",
+    "revision": "1",
+    "title": "相容性",
+    "product_ids": [
+      "hp-b"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-b-compatibility",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "6fdfe0befec85f9fcac6bfad8dee3d8fbbaa17b00c938c2cdbebb7aa54f4c55f",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-b-compatibility-v1.md"
+  },
+  {
+    "doc_id": "hp-b-cleaning",
+    "revision": "1",
+    "title": "清潔",
+    "product_ids": [
+      "hp-b"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-b-cleaning",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "c8a1502116193f43f3b1ac66b5a87b7503745bdc6c5dace186a43f2300c44cc4",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-b-cleaning-v1.md"
+  },
+  {
+    "doc_id": "hp-b-audio",
+    "revision": "1",
+    "title": "聲音",
+    "product_ids": [
+      "hp-b"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-b-audio",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "c1c7eb453bb8d830eba851eba3bbb80c406924ef642543781687e439f5492a45",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-b-audio-v1.md"
+  },
+  {
+    "doc_id": "hp-b-microphone",
+    "revision": "1",
+    "title": "麥克風",
+    "product_ids": [
+      "hp-b"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-b-microphone",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "63a3669bc545f52081df28bb27a0ff2432c797c2ed0c491ed3fd2a0f87d0919f",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-b-microphone-v1.md"
+  },
+  {
+    "doc_id": "hp-b-reset",
+    "revision": "1",
+    "title": "重設",
+    "product_ids": [
+      "hp-b"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-b-reset",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "e57e5cebfab1b7638232e65b8433c0cff96d29055d6277c0f659fd367e4f79c3",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-b-reset-v1.md"
+  },
+  {
+    "doc_id": "hp-b-safety",
+    "revision": "1",
+    "title": "安全",
+    "product_ids": [
+      "hp-b"
+    ],
+    "locale": "zh-TW",
+    "policy_scope": "hp-b-safety",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "158d10741de2023ed7df34e22aa26262c03e259ced68fc9718fe926e3000e7f6",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "hp-b-safety-v1.md"
+  },
+  {
+    "doc_id": "general-warranty",
+    "revision": "3",
+    "title": "保固政策",
+    "product_ids": [],
+    "locale": "zh-TW",
+    "policy_scope": "general-warranty",
+    "effective_from": "2026-01-01",
+    "effective_to": "2026-07-01",
+    "status": "candidate",
+    "content_sha256": "9d1452c7a585ec222640f9a290d45d13e70db3b7823d167f769abef9da04abab",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": "1",
+    "filename": "general-warranty-v3.md"
+  },
+  {
+    "doc_id": "general-warranty",
+    "revision": "4",
+    "title": "保固政策",
+    "product_ids": [],
+    "locale": "zh-TW",
+    "policy_scope": "general-warranty",
+    "effective_from": "2026-07-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "39027c81912ea332b440b1ca0c8a0b5a240bc843611c936e75b291a80506bfca",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": "2",
+    "filename": "general-warranty-v4.md"
+  },
+  {
+    "doc_id": "general-refund",
+    "revision": "1",
+    "title": "退款",
+    "product_ids": [],
+    "locale": "zh-TW",
+    "policy_scope": "general-refund",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "c7f3abedaa19471bc8d4f0cb2880bfee13e6bafb9c17b029c8378a420d7d0453",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "general-refund-v1.md"
+  },
+  {
+    "doc_id": "general-contact",
+    "revision": "1",
+    "title": "人工聯絡",
+    "product_ids": [],
+    "locale": "zh-TW",
+    "policy_scope": "general-contact",
+    "effective_from": "2026-01-01",
+    "effective_to": null,
+    "status": "candidate",
+    "content_sha256": "282337b0cbd6e466cbef1a524494f85d074f2f17c874b36ff48eee4a076721fe",
+    "approved_by": null,
+    "approved_at": null,
+    "supersedes": null,
+    "filename": "general-contact-v1.md"
+  }
+]
