@@ -1,0 +1,154 @@
+{
+  "answer": {
+    "status": "answer",
+    "answer": "請先將耳機放回充電盒，再依來源的配對步驟操作。",
+    "clarification": null,
+    "citations": [
+      {
+        "source_id": "src-demo-a",
+        "doc_id": "pairing-a",
+        "revision": "1",
+        "section": "重新配對",
+        "excerpt": "將耳機放回充電盒後重新開始配對。",
+        "url": "/api/v1/sources/src-demo-a"
+      }
+    ],
+    "handoff_summary": null,
+    "release_id": "rel-demo-1",
+    "request_id": "req-answer"
+  },
+  "clarify": {
+    "status": "clarify",
+    "answer": null,
+    "clarification": {
+      "question": "請問耳機是哪個型號？",
+      "options": [
+        "hp-a",
+        "hp-b"
+      ]
+    },
+    "citations": [],
+    "handoff_summary": null,
+    "release_id": "rel-demo-1",
+    "request_id": "req-clarify"
+  },
+  "handoff": {
+    "status": "handoff",
+    "answer": null,
+    "clarification": null,
+    "citations": [],
+    "handoff_summary": {
+      "issue": "使用者詢問退款",
+      "confirmed_product": "hp-a",
+      "attempted_steps": [],
+      "missing_fields": [
+        "購買資訊"
+      ],
+      "reason": "refund_request",
+      "source_ids": [],
+      "user_statements": [
+        "我想退款"
+      ]
+    },
+    "release_id": "rel-demo-1",
+    "request_id": "req-handoff"
+  },
+  "unavailable": {
+    "status": "unavailable",
+    "answer": null,
+    "clarification": null,
+    "citations": [],
+    "handoff_summary": null,
+    "release_id": "rel-demo-1",
+    "request_id": "req-unavailable"
+  },
+  "source": {
+    "source_id": "src-demo-a",
+    "release_id": "rel-demo-1",
+    "doc_id": "pairing-a",
+    "revision": "1",
+    "title": "A 型號配對",
+    "section": "重新配對",
+    "text": "將耳機放回充電盒後重新開始配對。",
+    "status": "active"
+  },
+  "error": {
+    "error": {
+      "code": "capacity_exceeded",
+      "message": "Server is busy."
+    },
+    "request_id": "req-busy"
+  },
+  "source-superseded": {
+    "source_id": "src-demo-a",
+    "release_id": "rel-demo-1",
+    "doc_id": "pairing-a",
+    "revision": "1",
+    "title": "A 型號配對",
+    "section": "重新配對",
+    "text": "將耳機放回充電盒後重新開始配對。",
+    "status": "superseded"
+  },
+  "source-withdrawn": {
+    "source_id": "src-demo-a",
+    "release_id": "rel-demo-1",
+    "doc_id": "pairing-a",
+    "revision": "1",
+    "title": "Withdrawn source",
+    "section": "",
+    "text": null,
+    "status": "withdrawn"
+  },
+  "source-xss": {
+    "source_id": "src-demo-a",
+    "release_id": "rel-demo-1",
+    "doc_id": "pairing-a",
+    "revision": "1",
+    "title": "A 型號配對",
+    "section": "重新配對",
+    "text": "<img src=x onerror=alert(1)>",
+    "status": "active"
+  },
+  "source404": {
+    "error": {
+      "code": "source_not_found",
+      "message": "Request cannot be completed."
+    },
+    "request_id": "req-source404"
+  },
+  "session404": {
+    "error": {
+      "code": "session_not_found",
+      "message": "Request cannot be completed."
+    },
+    "request_id": "req-session404"
+  },
+  "422": {
+    "error": {
+      "code": "validation_error",
+      "message": "Request cannot be completed."
+    },
+    "request_id": "req-422"
+  },
+  "429": {
+    "error": {
+      "code": "capacity_exceeded",
+      "message": "Request cannot be completed."
+    },
+    "request_id": "req-429"
+  },
+  "503": {
+    "error": {
+      "code": "no_active_release",
+      "message": "Request cannot be completed."
+    },
+    "request_id": "req-503"
+  },
+  "504": {
+    "error": {
+      "code": "turn_timeout",
+      "message": "Request cannot be completed."
+    },
+    "request_id": "req-504"
+  }
+}

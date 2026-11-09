@@ -1,0 +1,15 @@
+.venv/
+.env
+.env.*
+__pycache__/
+.pytest_cache/
+*.sqlite3
+*.sqlite3-*
+# Local handoffs and runtime measurement artifacts are not publication artifacts.
+eval/backend-handoff.md
+eval/checks/pytest-raw.xml
+
+# One private project credential/budget source; never stage these files.
+project.env
+.env
+runtime/

@@ -1,0 +1,18 @@
+This project's own code is MIT licensed. Third-party dependencies retain their own licenses.
+Actual installed distribution LICENSE/NOTICE texts and SHA-256 checksums are collected in
+ eval/licenses/ and eval/dependency-notices.json by scripts/dependency_notices.py.
+NumPy includes bundled third-party notices. certifi includes Mozilla Public License 2.0
+materials. These are not relicensed by this project's MIT license.
+
+Ollama is an external locally installed runtime, not vendored in this repository. The
+Qwen3-14B and Qwen3-Embedding-0.6B model weights are not distributed here. Their model-card
+license identification is Apache-2.0; this is separate from the code license. Existing
+local model digests are pinned in app/ollama.py. No new model downloads are performed.
+
+The installed Qwen3-14B runtime returns its license text; that exact text and hash
+are preserved in eval/licenses/model-qwen3-14b-LICENSE.txt and eval/model-notices.json.
+The installed embedding runtime did not return a license file. Its official model-card
+metadata was fetched separately and declares apache-2.0:
+https://huggingface.co/Qwen/Qwen3-Embedding-0.6B
+https://qwenlm.github.io/blog/qwen3-embedding/
+This records provenance and does not claim that an absent upstream LICENSE file was found.

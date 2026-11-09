@@ -1,0 +1,10 @@
+#!/bin/sh
+set -eu
+if command -v gitleaks >/dev/null 2>&1; then
+  exec gitleaks git --pre-commit --staged --redact --no-banner
+fi
+if command -v docker >/dev/null 2>&1; then
+  exec docker run --rm -v "$PWD:/repo:ro" -w /repo ghcr.io/gitleaks/gitleaks@sha256:e1b35e12a8c6fa8901f060459cfb6b2fc4c484d3afbe3b029733a3bbfab07055 git --pre-commit --staged --redact --no-banner
+fi
+printf '%s\n' 'Secret scanner unavailable; commit blocked.' >&2
+exit 1

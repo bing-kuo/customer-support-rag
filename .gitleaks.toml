@@ -1,0 +1,4 @@
+[extend]
+useDefault = true
+[allowlist]
+paths = ['''(^|/)\.venv/''', '''(^|/)\.git/''', '''(^|/)__pycache__/''']
