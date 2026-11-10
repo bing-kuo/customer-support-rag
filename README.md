@@ -39,4 +39,4 @@ uv run --locked uvicorn customer_support_rag.api:app --host 127.0.0.1 --port 800
 
 GitHub Actions 會使用 `uv.lock` 安裝依賴，在 Python 3.12 與 3.13 執行相同的格式、lint 與測試檢查，並以 Gitleaks 掃描 secrets。
 
-目前只包含最小 FastAPI app 與健康檢查端點。RAG 行為、模型整合及合成語料會在後續 PR 分別提出 review。
+目前包含最小 FastAPI app、健康檢查端點，以及以 TOML front matter 標記的少量合成知識文件範例（見 [`knowledge/README.md`](knowledge/README.md)）。文件讀取成功不等於人工審查、核准或啟用於線上 RAG。RAG 行為與模型整合會在後續 PR 分別提出 review。
