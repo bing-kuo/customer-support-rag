@@ -47,3 +47,17 @@ class KnowledgeDocument(BaseModel):
 
     metadata: KnowledgeMetadata
     body: str
+
+
+class KnowledgeChunk(BaseModel):
+    """An immutable, exact slice of a knowledge document body."""
+
+    model_config = ConfigDict(frozen=True)
+
+    metadata: KnowledgeMetadata
+    body_sha256: str
+    index: int
+    char_start: int
+    char_end: int
+    text: str
+    heading_path: tuple[str, ...]
