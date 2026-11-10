@@ -77,7 +77,6 @@ def embed_response(
 def run_embed(
     chunks: list[KnowledgeChunk],
     handler: Handler,
-    **client_options: object,
 ) -> tuple[list, list[httpx.Request]]:
     requests: list[httpx.Request] = []
 
@@ -85,9 +84,8 @@ def run_embed(
         requests.append(request)
         return handler(request)
 
-    options = {"trust_env": False, "follow_redirects": False, **client_options}
-    with httpx.Client(transport=httpx.MockTransport(record), **options) as client:
-        embedded = OllamaEmbeddingAdapter(client).embed_chunks(chunks)
+    with OllamaEmbeddingAdapter(httpx.MockTransport(record)) as adapter:
+        embedded = adapter.embed_chunks(chunks)
     return embedded, requests
 
 
@@ -173,10 +171,7 @@ def test_rejects_more_than_eight_original_chunks(count: int) -> None:
         calls.append(1)
         return embed_response([vector(1) for _ in chunks])
 
-    with httpx.Client(
-        transport=httpx.MockTransport(handler), trust_env=False
-    ) as client:
-        adapter = OllamaEmbeddingAdapter(client)
+    with OllamaEmbeddingAdapter(httpx.MockTransport(handler)) as adapter:
         if count > 8:
             with pytest.raises(ValueError, match="8"):
                 adapter.embed_chunks(chunks)
@@ -194,11 +189,9 @@ def test_rejects_overlong_text_without_request(text: str) -> None:
         calls.append(1)
         return embed_response([vector(1)])
 
-    with httpx.Client(
-        transport=httpx.MockTransport(handler), trust_env=False
-    ) as client:
+    with OllamaEmbeddingAdapter(httpx.MockTransport(handler)) as adapter:
         with pytest.raises(ValueError, match="1200"):
-            OllamaEmbeddingAdapter(client).embed_chunks([make_chunk(text)])
+            adapter.embed_chunks([make_chunk(text)])
 
     assert calls == []
 
@@ -216,12 +209,11 @@ def test_accepts_text_at_the_character_limit() -> None:
 
 @pytest.mark.parametrize("chunks", ["not-chunks", [make_chunk("kept"), object()]])
 def test_rejects_input_that_is_not_knowledge_chunks(chunks: object) -> None:
-    with httpx.Client(
-        transport=httpx.MockTransport(lambda request: embed_response([vector(1)])),
-        trust_env=False,
-    ) as client:
+    with OllamaEmbeddingAdapter(
+        httpx.MockTransport(lambda request: embed_response([vector(1)]))
+    ) as adapter:
         with pytest.raises(ValueError, match="knowledge chunks"):
-            OllamaEmbeddingAdapter(client).embed_chunks(chunks)  # type: ignore[arg-type]
+            adapter.embed_chunks(chunks)  # type: ignore[arg-type]
 
 
 @pytest.mark.parametrize(
@@ -382,11 +374,7 @@ def test_transport_failures_do_not_retry(failure: str, message: str) -> None:
         return httpx.Response(503, text=HOSTILE)
 
     with pytest.raises(EmbeddingError) as caught:
-        run_embed(
-            [make_chunk(HOSTILE), make_chunk("other")],
-            handler,
-            follow_redirects=True,
-        )
+        run_embed([make_chunk(HOSTILE), make_chunk("other")], handler)
 
     assert str(caught.value) == message
     assert calls == [OLLAMA_EMBED_URL]
@@ -402,20 +390,16 @@ def test_request_sets_timeout_and_disables_redirects(
     def handler(request: httpx.Request) -> httpx.Response:
         return embed_response([vector(1)])
 
-    with httpx.Client(
-        transport=httpx.MockTransport(handler),
-        trust_env=False,
-        follow_redirects=True,
-        timeout=0.01,
-    ) as client:
-        original = client.post
+    adapter = OllamaEmbeddingAdapter(httpx.MockTransport(handler))
+    original = adapter._client.post
 
-        def post(*args: object, **kwargs: object) -> httpx.Response:
-            captured["kwargs"] = kwargs
-            return original(*args, **kwargs)
+    def post(*args: object, **kwargs: object) -> httpx.Response:
+        captured["kwargs"] = kwargs
+        return original(*args, **kwargs)
 
-        monkeypatch.setattr(client, "post", post)
-        OllamaEmbeddingAdapter(client).embed_chunks([make_chunk("one")])
+    monkeypatch.setattr(adapter._client, "post", post)
+    with adapter:
+        adapter.embed_chunks([make_chunk("one")])
 
     kwargs = captured["kwargs"]
     assert kwargs["follow_redirects"] is False
@@ -443,42 +427,162 @@ def test_hostile_text_is_sent_only_to_the_fixed_endpoint(
     assert len(embedded) == 1
 
 
-@pytest.mark.parametrize(
-    "build",
-    [
-        lambda: httpx.Client(
-            transport=httpx.HTTPTransport(retries=1),
-            trust_env=False,
-        ),
-        lambda: httpx.Client(proxy="http://127.0.0.1:9", trust_env=False),
-        lambda: httpx.Client(transport=_DivertingTransport(), trust_env=False),
-        lambda: httpx.Client(
-            transport=httpx.MockTransport(lambda request: httpx.Response(204)),
-            event_hooks={"request": [lambda request: None]},
-            trust_env=False,
-        ),
-        lambda: _ClientSubclass(
-            transport=httpx.MockTransport(lambda request: httpx.Response(204)),
-            trust_env=False,
-        ),
-    ],
-)
-def test_rejects_clients_that_can_retry_or_leave_the_destination(
-    build: Callable[[], httpx.Client],
+def test_large_json_integer_in_second_vector_is_embedding_error() -> None:
+    calls: list[int] = []
+    second = [0] * EMBEDDING_DIMENSIONS
+    second[0] = 10**400
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return httpx.Response(
+            200,
+            json={"model": EMBEDDING_MODEL, "embeddings": [vector(1), second]},
+        )
+
+    with pytest.raises(EmbeddingError, match="non-finite") as caught:
+        run_embed([make_chunk("one"), make_chunk("two")], handler)
+
+    assert calls == [1]
+    assert "OverflowError" not in str(caught.value)
+
+
+def test_finite_component_fsum_overflow_in_second_vector_is_embedding_error() -> None:
+    calls: list[int] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(1)
+        return embed_response([vector(1), [1e154] * EMBEDDING_DIMENSIONS])
+
+    with pytest.raises(EmbeddingError, match="non-finite") as caught:
+        run_embed([make_chunk("one"), make_chunk("two")], handler)
+
+    assert calls == [1]
+    assert "OverflowError" not in str(caught.value)
+
+
+def test_deep_json_failure_is_embedding_error() -> None:
+    content = b"[" * 12000 + b"0" + b"]" * 12000
+
+    with pytest.raises(EmbeddingError, match="malformed JSON") as caught:
+        run_embed(
+            [make_chunk(HOSTILE)],
+            lambda request: httpx.Response(200, content=content),
+        )
+
+    assert "RecursionError" not in str(caught.value)
+    assert HOSTILE not in str(caught.value)
+
+
+def test_owned_request_stays_on_the_fixed_destination() -> None:
+    with pytest.raises(TypeError):
+        OllamaEmbeddingAdapter(auth=httpx.DigestAuth("synthetic", "synthetic"))  # type: ignore[call-arg]
+
+    _, requests = run_embed(
+        [make_chunk("one")], lambda request: embed_response([vector(1)])
+    )
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.method == "POST"
+    assert str(request.url) == OLLAMA_EMBED_URL
+    assert request.url.scheme == "http"
+    assert request.url.host == "127.0.0.1"
+    assert request.url.port == 11434
+    assert request.url.path == "/api/embed"
+
+
+def test_owned_request_is_not_replayed() -> None:
+    class _ExtraSend(httpx.MockTransport):
+        def __init__(self) -> None:
+            super().__init__(lambda request: embed_response([vector(1)]))
+
+    with pytest.raises(TypeError, match="MockTransport"):
+        OllamaEmbeddingAdapter(_ExtraSend())
+
+    _, requests = run_embed(
+        [make_chunk("one")], lambda request: embed_response([vector(1)])
+    )
+
+    assert len(requests) == 1
+    assert requests[0].method == "POST"
+    assert str(requests[0].url) == OLLAMA_EMBED_URL
+
+
+def test_owned_request_has_no_caller_query_host_authorization_or_cookie() -> None:
+    with pytest.raises(TypeError):
+        OllamaEmbeddingAdapter(  # type: ignore[call-arg]
+            headers={
+                "Host": "outside.invalid",
+                "Authorization": "Bearer synthetic-marker",
+            },
+            params={"truncate": "true"},
+            cookies={"session": "synthetic-marker"},
+        )
+
+    _, requests = run_embed(
+        [make_chunk("one")], lambda request: embed_response([vector(1)])
+    )
+
+    request = requests[0]
+    assert len(requests) == 1
+    assert request.url.query == b""
+    assert "truncate" not in str(request.url)
+    assert request.headers["host"] == "127.0.0.1:11434"
+    assert "authorization" not in request.headers
+    assert "cookie" not in request.headers
+
+
+def test_digest_challenge_is_not_retried() -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if len(calls) == 1:
+            return httpx.Response(
+                401,
+                headers={
+                    "WWW-Authenticate": (
+                        'Digest realm="synthetic", nonce="synthetic", '
+                        'algorithm=MD5, qop="auth"'
+                    )
+                },
+            )
+        return embed_response([vector(1)])
+
+    with pytest.raises(EmbeddingError, match="HTTP 401") as caught:
+        run_embed([make_chunk(HOSTILE)], handler)
+
+    assert calls == [OLLAMA_EMBED_URL]
+    assert "synthetic" not in str(caught.value)
+    assert HOSTILE not in str(caught.value)
+
+
+def test_rejects_caller_client_and_non_mock_transport() -> None:
+    with httpx.Client(trust_env=False) as client:
+        with pytest.raises(TypeError, match="MockTransport"):
+            OllamaEmbeddingAdapter(client)  # type: ignore[arg-type]
+    with pytest.raises(TypeError, match="MockTransport"):
+        OllamaEmbeddingAdapter(object())  # type: ignore[arg-type]
+
+
+def test_context_manager_closes_without_a_default_connection(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    with build() as client:
-        with pytest.raises(ValueError, match="client"):
-            OllamaEmbeddingAdapter(client)
+    def guard(*args: object, **kwargs: object) -> None:
+        raise AssertionError("unexpected socket")
 
+    monkeypatch.setattr(socket, "socket", guard)
+    monkeypatch.setattr(socket, "create_connection", guard)
+    with OllamaEmbeddingAdapter():
+        pass
 
-def test_accepts_mock_and_non_retrying_default_client() -> None:
-    with httpx.Client(
-        transport=httpx.MockTransport(lambda request: httpx.Response(204)),
-        trust_env=False,
-    ) as client:
-        OllamaEmbeddingAdapter(client)
-    with httpx.Client(trust_env=False, follow_redirects=False) as client:
-        OllamaEmbeddingAdapter(client)
+    adapter = OllamaEmbeddingAdapter(
+        httpx.MockTransport(lambda request: embed_response([vector(1)]))
+    )
+    with adapter:
+        assert len(adapter.embed_chunks([make_chunk("one")])) == 1
+    with pytest.raises(RuntimeError):
+        adapter.embed_chunks([make_chunk("one")])
 
 
 def test_hp_a_care_document_embeds_only_the_eligible_chunk() -> None:
@@ -505,12 +609,3 @@ def test_hp_a_care_document_embeds_only_the_eligible_chunk() -> None:
     assert embedded[0].chunk.index == 1
     assert embedded[0].chunk.body_sha256 == chunks[0].body_sha256
     assert len(embedded[0].vector) == EMBEDDING_DIMENSIONS
-
-
-class _DivertingTransport(httpx.BaseTransport):
-    def handle_request(self, request: httpx.Request) -> httpx.Response:
-        raise AssertionError("diverted request")
-
-
-class _ClientSubclass(httpx.Client):
-    pass

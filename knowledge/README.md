@@ -27,11 +27,9 @@ chunks = chunk_document(document, max_chars=1200)
 
 單次最多 8 個原始 chunks，每段最多 1200 個 Python 字元。超過任一個上限時整批 `ValueError`，不會自動分批或截斷。字元數不是 token 數。這次沒有 query embedding；文件向量與未來問句若要使用 Qwen instruct 格式，必須另外定義，不能視為已經對齊。
 
-Payload 只有固定 `model`、`input`、`truncate: false`、`keep_alive: 0`。呼叫端建立並關閉 client。下面是預期的 live 呼叫形狀；本變更的測試使用 `httpx.MockTransport`，沒有執行這段，也沒有連到 Ollama：
+Payload 只有固定 `model`、`input`、`truncate: false`、`keep_alive: 0`。Adapter 建立並關閉自己的 HTTPX client：`trust_env` 為 false、沒有 auth、params、cookies 或 event hooks，也不跟隨 redirect。正式路徑使用 `HTTPTransport()`，預設連線重試次數是 0。測試只能傳入精確的 `httpx.MockTransport`，不能傳入 caller client。下面是預期的 live 呼叫形狀；本變更的測試使用 mock transport，沒有執行這段，也沒有連到 Ollama：
 
 ```python
-import httpx
-
 from customer_support_rag.knowledge import (
     OllamaEmbeddingAdapter,
     chunk_document,
@@ -40,13 +38,13 @@ from customer_support_rag.knowledge import (
 
 document = read_document("knowledge", "hp-a/headphone-care.md")
 chunks = chunk_document(document)
-with httpx.Client(trust_env=False, follow_redirects=False) as client:
-    embedded = OllamaEmbeddingAdapter(client).embed_chunks(chunks)
+with OllamaEmbeddingAdapter() as adapter:
+    embedded = adapter.embed_chunks(chunks)
 ```
 
-Adapter 每次請求另外指定 `follow_redirects=False`，以及 connect 5 秒、read 60 秒、write 5 秒、pool 5 秒。這是各階段 timeout，不是嚴格的整體 deadline。client 不可使用會重試的 transport、proxy、event hook 或其他目的地；正式路徑用預設且不重試的 HTTP transport，測試才注入 mock。3xx、非 2xx、連線錯誤、timeout 與不合契約的回應都拋 `EmbeddingError`，不重試、不換模型、不回傳部分結果。timeout 不表示 Ollama 已經停止。錯誤訊息只標 timeout、request、HTTP status 或 invalid response，不包含正文。
+每次請求指定 `follow_redirects=False`，以及 connect 5 秒、read 60 秒、write 5 秒、pool 5 秒。這是各階段 timeout，不是嚴格的整體 deadline。目的地固定為上面的 URL，不重試、不換模型、不回傳部分結果。3xx、非 2xx、連線錯誤、timeout 與不合契約的回應都拋 `EmbeddingError`。timeout 不表示 Ollama 已經停止。錯誤訊息只標 timeout、request、HTTP status 或 invalid response，不包含正文。
 
-設計依據是 [Ollama embed API](https://docs.ollama.com/api/embed) 的文字陣列、`truncate=false` 與 `keep_alive`，以及 [Qwen3-Embedding-0.6B model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) 列出的 1024 維。官方說明不是本機 tag、digest 或維度的 live 實測。開發用的 Grok 不是這個產品的 embedding 模型。
+設計依據是 [Ollama embed API](https://docs.ollama.com/api/embed) 的文字陣列、`truncate=false` 與 `keep_alive`，以及 [Qwen3-Embedding-0.6B model card](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) 列出的 1024 維。官方說明不是本機 tag、digest 或維度的 live 實測。
 
 ### HP-A 範例（mock，非 live）
 
@@ -57,19 +55,9 @@ Adapter 每次請求另外指定 `follow_redirects=False`，以及 connect 5 秒
 | 原始 index | offsets | 字元數 | heading path | 此次處理 |
 | --- | --- | --- | --- | --- |
 | 0 | [0, 1) | 1 | 空 | 文字是 `\n`，略過；原 chunk 保留 |
-| 1 | [1, 71) | 70 | 日常保養 | 精確送出下面的字串 |
+| 1 | [1, 71) | 70 | 日常保養 | 精確送出下面 repr 的字串 |
 
-實際送出的 Python 字串如下，結尾有一個 LF。`# 日常保養` 來自正文，不是 metadata title，也不是模型產生的文字：
-
-```text
-# 日常保養
-
-使用後以乾燥柔軟的布擦拭耳罩。請勿將耳機浸入水中，也不要使用溶劑清潔。
-
-如需檢查保固條件，請聯絡購買通路並備妥購買證明。
-```
-
-略過的 chunk 0 是 `"\n"`。送出字串的 repr 是：
+實際送出的 Python 字串 repr 如下。結尾的 `\n` 是正文的 LF。`# 日常保養` 來自正文，不是 metadata title，也不是模型產生的文字。略過的 chunk 0 是 `"\n"`。
 
 ```text
 '# 日常保養\n\n使用後以乾燥柔軟的布擦拭耳罩。請勿將耳機浸入水中，也不要使用溶劑清潔。\n\n如需檢查保固條件，請聯絡購買通路並備妥購買證明。\n'

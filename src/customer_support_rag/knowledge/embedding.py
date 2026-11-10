@@ -1,13 +1,12 @@
 """Synchronous local embedding for existing knowledge chunks.
 
-Importing this module does not open a client or contact a model. The caller
-owns the HTTPX client and closes it. Results stay in memory.
+Importing this module does not open a connection or contact a model. The
+adapter owns its HTTPX client. Results stay in memory.
 """
 
 import math
 from collections.abc import Sequence
 
-import httpcore
 import httpx
 from pydantic import BaseModel, ConfigDict
 
@@ -52,11 +51,37 @@ class OllamaEmbeddingAdapter:
     Only ``chunk.text`` is sent. Blank text is skipped and the original chunks
     are left unchanged. The call rejects oversized batches instead of splitting
     or truncating them, and it returns no partial result after a failed response.
+
+    The adapter builds the client with public HTTPX arguments: ``trust_env``
+    is off, there is no auth, and redirects are disabled. Production uses
+    ``HTTPTransport()``, whose default connection retry count is zero. A test
+    may pass an exact ``MockTransport``; there is no caller-supplied client.
+    Use :meth:`close` or the context manager when finished.
     """
 
-    def __init__(self, client: httpx.Client) -> None:
-        _require_direct_client(client)
-        self._client = client
+    def __init__(self, transport: httpx.MockTransport | None = None) -> None:
+        if transport is not None and type(transport) is not httpx.MockTransport:
+            raise TypeError("transport must be an httpx.MockTransport")
+        self._client = httpx.Client(
+            transport=transport if transport is not None else httpx.HTTPTransport(),
+            trust_env=False,
+            auth=None,
+            params=None,
+            headers=None,
+            cookies=None,
+            follow_redirects=False,
+            event_hooks=None,
+        )
+
+    def close(self) -> None:
+        """Close the owned client."""
+        self._client.close()
+
+    def __enter__(self) -> "OllamaEmbeddingAdapter":
+        return self
+
+    def __exit__(self, *exc: object) -> None:
+        self.close()
 
     def embed_chunks(self, chunks: Sequence[KnowledgeChunk]) -> list[EmbeddedChunk]:
         """Return embeddings for non-blank chunks, in input order."""
@@ -96,36 +121,6 @@ class OllamaEmbeddingAdapter:
         return response
 
 
-def _require_direct_client(client: httpx.Client) -> None:
-    """Allow a non-retrying HTTPX client or an exact mock transport.
-
-    A subclass, proxy mount, event hook, or connection retry could send the
-    document text more than once or to another destination.
-    """
-    if type(client) is not httpx.Client:
-        raise ValueError("client must be an httpx.Client")
-    hooks = client.event_hooks
-    if hooks.get("request") or hooks.get("response"):
-        raise ValueError("client must not define event hooks")
-    if any(mounted is not None for mounted in client._mounts.values()):
-        raise ValueError("client must not route requests through another transport")
-
-    transport = client._transport
-    if type(transport) is httpx.MockTransport:
-        return
-    if type(transport) is not httpx.HTTPTransport:
-        raise ValueError(
-            "client transport must be the default HTTP transport or a mock"
-        )
-    pool = transport._pool
-    if type(pool) is not httpcore.ConnectionPool:
-        raise ValueError("client transport must not use a proxy")
-    if type(pool._retries) is not int or pool._retries != 0:
-        raise ValueError("client transport must not retry")
-    if pool._proxy is not None or pool._uds is not None:
-        raise ValueError("client transport must not use a proxy or local socket")
-
-
 def _validated_chunks(chunks: Sequence[KnowledgeChunk]) -> tuple[KnowledgeChunk, ...]:
     if isinstance(chunks, (str, bytes)) or not isinstance(chunks, Sequence):
         raise ValueError("chunks must be a sequence of knowledge chunks")
@@ -156,6 +151,8 @@ def _vectors(
 def _json_object(response: httpx.Response) -> dict[str, object]:
     try:
         payload = response.json()
+    except RecursionError:
+        raise EmbeddingError(_INVALID_JSON) from None
     except ValueError:
         raise EmbeddingError(_INVALID_JSON) from None
     if not isinstance(payload, dict):
@@ -170,11 +167,17 @@ def _vector(value: object) -> tuple[float, ...]:
     for item in value:
         if isinstance(item, bool) or not isinstance(item, (int, float)):
             raise EmbeddingError(_INVALID_NUMBER)
-        number = float(item)
+        try:
+            number = float(item)
+        except OverflowError:
+            raise EmbeddingError(_NON_FINITE) from None
         if not math.isfinite(number):
             raise EmbeddingError(_NON_FINITE)
         numbers.append(number)
-    squared = math.fsum(number * number for number in numbers)
+    try:
+        squared = math.fsum(number * number for number in numbers)
+    except OverflowError:
+        raise EmbeddingError(_NON_FINITE) from None
     if not math.isfinite(squared) or squared <= 0:
         raise EmbeddingError(_ZERO_VECTOR if squared == 0 else _NON_FINITE)
     return tuple(numbers)
