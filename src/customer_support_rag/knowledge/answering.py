@@ -9,9 +9,9 @@ import json
 import math
 import re
 from collections.abc import Mapping, Sequence
-from typing import Literal
+from typing import Literal, Self
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from customer_support_rag.knowledge.models import KnowledgeChunk, KnowledgeMetadata
 from customer_support_rag.knowledge.retrieval import RetrievalHit
@@ -76,7 +76,12 @@ class ResolvedSource(BaseModel):
 
 
 class AnswerRequest(BaseModel):
-    """One bounded request. The fixed policy is not part of the data block."""
+    """One bounded request. The fixed policy is not part of the data block.
+
+    The fields are plain data. ``prepare_answer`` is the factory that aligns
+    them with a hit. A public constructor or ``model_copy`` still has to
+    carry that same text, source id, and product, or it is rejected.
+    """
 
     model_config = ConfigDict(extra="forbid", frozen=True)
 
@@ -87,8 +92,22 @@ class AnswerRequest(BaseModel):
     evidence: tuple[ModelEvidence, ...]
     sources: tuple[ResolvedSource, ...] = Field(exclude=True, repr=False)
 
+    @model_validator(mode="after")
+    def _reject_diverged_sources(self) -> Self:
+        _reject_if_diverged(self)
+        return self
+
+    def model_copy(
+        self, *, update: Mapping[str, object] | None = None, deep: bool = False
+    ) -> Self:
+        """Copy this request and keep the cited hit, text, and product aligned."""
+        copied = super().model_copy(update=update, deep=deep)
+        _reject_if_diverged(copied)
+        return copied
+
     def model_data_json(self) -> str:
         """Serialize the model-visible data. Policy and hit metadata stay out."""
+        _reject_if_diverged(self)
         return _encode_model_data(
             question=self.question,
             product_id=self.product_id,
@@ -157,6 +176,8 @@ def handoff_without_evidence(request: AnswerRequest) -> GroundedDraft:
         raise ValueError("empty evidence handoff requires an answer request")
     if request.prompt_revision != PROMPT_REVISION or request.policy != GROUNDED_POLICY:
         raise ValueError("empty evidence handoff requires the fixed policy")
+    if not _request_matches_sources(request):
+        raise ValueError("answer request evidence does not match its sources")
     if request.evidence or request.sources:
         raise ValueError("empty evidence handoff requires no hits")
     return GroundedDraft(
@@ -175,9 +196,7 @@ def resolve_draft(
         raise DraftValidationError("draft request is invalid")
     if request.prompt_revision != PROMPT_REVISION or request.policy != GROUNDED_POLICY:
         raise DraftValidationError("draft request policy is not the fixed policy")
-    if [item.source_id for item in request.evidence] != [
-        item.source_id for item in request.sources
-    ]:
+    if not _request_matches_sources(request):
         raise DraftValidationError("draft request evidence does not match its sources")
     parsed = _parse_payload(payload)
     if parsed.status == "handoff":
@@ -274,6 +293,58 @@ def _require_one_version(sources: Sequence[ResolvedSource]) -> None:
         if previous is not None and previous != version:
             raise AnswerPreparationError("one document has conflicting versions")
         seen[document_id] = version
+
+
+def _request_matches_sources(request: AnswerRequest) -> bool:
+    """Return whether the model evidence is the cited hit for this product.
+
+    Serialization and resolution share this check. It does not approve the
+    wording of an answer, and it does not revisit the storage schema.
+    """
+    evidence = request.evidence
+    sources = request.sources
+    if not isinstance(evidence, tuple) or not isinstance(sources, tuple):
+        return False
+    if len(evidence) != len(sources):
+        return False
+    for item, source in zip(evidence, sources, strict=True):
+        if not _cited_hit_matches(item, source, request.product_id):
+            return False
+    return True
+
+
+def _reject_if_diverged(request: AnswerRequest) -> None:
+    if not _request_matches_sources(request):
+        raise AnswerPreparationError(
+            "answer request evidence does not match its sources"
+        )
+
+
+def _cited_hit_matches(item: object, source: object, product_id: object) -> bool:
+    if not isinstance(item, ModelEvidence) or not isinstance(source, ResolvedSource):
+        return False
+    try:
+        hit = source.hit
+        chunk = hit.chunk
+        artifact_key = hit.artifact_key
+        index = chunk.index
+        text = chunk.text
+        product = chunk.metadata.product_id
+    except AttributeError:
+        return False
+    if (
+        not isinstance(artifact_key, str)
+        or type(index) is not int
+        or not isinstance(text, str)
+    ):
+        return False
+    identity = f"ev:{artifact_key}:{index}"
+    return (
+        item.source_id == identity
+        and source.source_id == identity
+        and item.text == text
+        and product == product_id
+    )
 
 
 def _encode_model_data(

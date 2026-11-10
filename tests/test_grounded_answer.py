@@ -21,6 +21,8 @@ from customer_support_rag.knowledge.answering import (
     AnswerPreparationError,
     AnswerRequest,
     DraftValidationError,
+    ModelEvidence,
+    ResolvedSource,
     handoff_without_evidence,
     prepare_answer,
     resolve_draft,
@@ -719,6 +721,112 @@ def test_resolve_rejects_invalid_payloads(name: str) -> None:
     rendered = str(caught.value)
     assert MARKER not in rendered
     assert "d" * 64 not in rendered
+
+
+def test_public_request_must_match_the_cited_hit_text_and_product(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A copied request keeps the hit text. Schema success is not approval."""
+    block_network(monkeypatch)
+    document = read_document(KNOWLEDGE, "hp-a/headphone-care.md")
+    chunk = next(item for item in chunk_document(document) if item.text.strip())
+    hit = RetrievalHit(artifact_key="a" * 64, chunk=chunk, raw_score=0.5)
+    request = prepare_answer("可以用水洗嗎？", product_id="hp-a", hits=[hit])
+    source_id = request.evidence[0].source_id
+    forged = "可以浸水並保證全額退款。"
+    changed = (ModelEvidence(source_id=source_id, text=forged),)
+
+    copied = request.model_copy()
+    draft = resolve_draft(
+        copied,
+        {
+            "status": "answer",
+            "answer": "請依上述說明處理。",
+            "source_ids": [source_id],
+            "reason": None,
+        },
+    )
+    payload = json.loads(copied.model_data_json())
+    assert payload["evidence"][0]["text"] == chunk.text
+    assert payload["product_id"] == "hp-a"
+    assert draft.answer == "請依上述說明處理。"
+    assert draft.sources[0].hit.chunk.text == chunk.text
+    assert draft.sources[0].hit.chunk.metadata.product_id == "hp-a"
+
+    aligned = AnswerRequest(
+        prompt_revision=request.prompt_revision,
+        question=request.question,
+        product_id=request.product_id,
+        policy=request.policy,
+        evidence=request.evidence,
+        sources=request.sources,
+    )
+    assert aligned.model_data_json() == request.model_data_json()
+
+    def rejected(build: Callable[[], object]) -> None:
+        with pytest.raises(
+            AnswerPreparationError, match="does not match its sources"
+        ) as caught:
+            build()
+        rendered = str(caught.value)
+        assert forged not in rendered
+        assert request.question not in rendered
+        assert chunk.text not in rendered
+
+    rejected(
+        lambda: AnswerRequest(
+            prompt_revision=request.prompt_revision,
+            question=request.question,
+            product_id=request.product_id,
+            policy=request.policy,
+            evidence=changed,
+            sources=request.sources,
+        )
+    )
+    rejected(lambda: request.model_copy(update={"evidence": changed}))
+    rejected(
+        lambda: AnswerRequest(
+            prompt_revision=request.prompt_revision,
+            question=request.question,
+            product_id="hp-b",
+            policy=request.policy,
+            evidence=request.evidence,
+            sources=request.sources,
+        )
+    )
+    rejected(lambda: request.model_copy(update={"product_id": "hp-b"}))
+    wrong_id = "ev:" + ("b" * 64) + ":1"
+    rejected(
+        lambda: AnswerRequest(
+            prompt_revision=request.prompt_revision,
+            question=request.question,
+            product_id=request.product_id,
+            policy=request.policy,
+            evidence=(ModelEvidence(source_id=wrong_id, text=chunk.text),),
+            sources=(ResolvedSource(source_id=wrong_id, hit=hit),),
+        )
+    )
+
+    forged_request = AnswerRequest.model_construct(
+        prompt_revision=request.prompt_revision,
+        question=request.question,
+        product_id=request.product_id,
+        policy=request.policy,
+        evidence=changed,
+        sources=request.sources,
+    )
+    rejected(forged_request.model_data_json)
+    with pytest.raises(
+        DraftValidationError, match="does not match its sources"
+    ) as caught:
+        resolve_draft(forged_request, answer_payload("請依上述說明處理。", request))
+    rendered = str(caught.value)
+    assert forged not in rendered
+    assert request.question not in rendered
+    with pytest.raises(ValueError, match="does not match its sources") as caught:
+        handoff_without_evidence(forged_request)
+    assert forged not in str(caught.value)
+    assert request.question not in str(caught.value)
 
 
 def test_citation_from_another_request_is_rejected() -> None:
