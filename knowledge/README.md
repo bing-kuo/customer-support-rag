@@ -122,16 +122,13 @@ CREATE TABLE embedding_documents (
 
 沒有 approval、active、ready 或 published 欄位。空白 chunk 的 `vector` 是 JSON null；其餘是完整 1024 個有限且平方和大於 0 的數字。chunk 原文用 `source.body[char_start:char_end]` 還原，不另外存一份正文。
 
-`artifact_key` 是 identity 的 canonical JSON UTF-8 SHA-256。identity 含 `format_version`、五欄 metadata、`body_sha256`、整個 embedding 設定與整個 chunking 設定，不含向量、也不含正文本身。這是內容識別，不是核准或簽章。HP-A 在 digest `ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d`、`max_chars=1200` 時，key 的輸入是：
+`artifact_key` 是 identity 的 canonical JSON UTF-8 SHA-256。identity 含 `format_version`、五欄 metadata、`body_sha256`、整個 embedding 設定與整個 chunking 設定，不含向量、也不含正文本身。這是內容識別，不是核准或簽章。精確 key 在 `tests/test_embedding_storage.py`。
 
-```text
-{"body_sha256":"223243a3ba9c40840746b1b2ee66e40b970a8fefd1324bb586930a381f9f4e59","chunking":{"max_chars":1200,"profile":"heading-char-v1"},"embedding":{"dimensions":1024,"input_profile":"chunk-text-v1","model":"qwen3-embedding:0.6b","model_digest":"ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"},"format_version":1,"metadata":{"document_id":"hp-a-care","product_id":"hp-a","synthetic":true,"title":"HP-A 耳機日常保養","version":"1"}}
-```
-
-呼叫者可以在任何推論前用同一份文件和已知 digest 計算 key。digest 由呼叫端提供，store 不查 Ollama。上面這個 digest 是先前 live 觀察到的 tag digest；本節沒有重新查詢或執行模型。
+呼叫者在推論前用同一份文件和已知 digest 計算 key。digest 由呼叫端提供，store 不查 Ollama。下面的 digest 是先前 live 觀察到的 tag digest；本範例沒有重新查詢或執行模型。向量是 `(1 + index) / 1024` 的 mock，不是 live 前綴補零。
 
 ```python
 from customer_support_rag.knowledge import (
+    EmbeddedChunk,
     EmbeddingStore,
     chunk_document,
     document_embedding_key,
@@ -140,38 +137,21 @@ from customer_support_rag.knowledge import (
 
 document = read_document("knowledge", "hp-a/headphone-care.md")
 digest = "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"
-key = document_embedding_key(document, model_digest=digest)
 chunks = chunk_document(document)
-# embeddings 必須逐筆對上非空白 chunks。本變更的測試用 mock vector，沒有呼叫 Ollama。
+embeddings = [
+    EmbeddedChunk(
+        chunk=chunk,
+        vector=tuple((1 + index) / 1024 for index in range(1024)),
+    )
+    for index, chunk in enumerate(chunks)
+    if chunk.text.strip()
+]
+key = document_embedding_key(document, model_digest=digest)
 with EmbeddingStore(".data/embeddings.sqlite") as store:
     stored_key = store.put_document(document, embeddings, model_digest=digest)
 
-# store 關閉後，新的程序只開資料庫並用 key 讀回，不再建立 adapter。
 with EmbeddingStore(".data/embeddings.sqlite") as store:
     loaded = store.get_document(stored_key)
 ```
 
-驗證在記憶體做完才進入 `BEGIN IMMEDIATE`。SQLite lock timeout 是 5 秒，失敗不重試。commit 成功才回傳 key。寫入失敗會 rollback，舊列保持不變。同 key 且 canonical payload 完全相同時不新增列；同 key 但向量不同時拋 `StorageConflictError`，舊值保留。沒有自動 latest、刪除或 active pointer。`get_document` 找不到 key 才回 `None`；列存在但內容不合契約時拋 `StorageError`，不把它當成 miss，也不修復或重算。
-
-### HP-A 保存範例（mock）
-
-`tests/test_embedding_storage.py` 用真實 reader、chunker 與 mock adapter 保存 HP-A，關閉後由另一個 Python 程序讀回。那個程序沒有呼叫 adapter。向量是 `(1 + index) / 1024` 的 1024 個 mock 數字，不是 live 前四維補零。
-
-| 項目 | 值 |
-| --- | --- |
-| artifact key | `9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad` |
-| body SHA-256 | `223243a3ba9c40840746b1b2ee66e40b970a8fefd1324bb586930a381f9f4e59` |
-| chunks / vectors / 維度 | 2 / 1 / 1024 |
-| 空白 chunk | index 0，`vector` 為 null |
-| eligible chunk | index 1，heading `日常保養` |
-
-同一份 HP-A 再 put 一次，key 與列數不變。只改向量會被拒絕，舊 mock 向量仍在。下面的變更各自得到新 key，原來的 HP-A key 仍讀回原正文：
-
-| 變更 | 新 key |
-| --- | --- |
-| 正文末尾加上 `補充。\n` | `e87a5d1a3cf5ec1a49129b18d5dd16b0deece91393d52ffdaf2b88ca9d6d4338` |
-| title 改為 `HP-A 保養改版` | `3c8e61013408d7fdbf2ee6154545f87eed646c44a1777f50d78225f3fd6c04d5` |
-| 另存 HP-B `hp-b-connection` | `18812b328a8e3614c4c83a849c2bfcd108e695453c8eaf9d57cf87200cefafae` |
-| 同一 HP-A，digest 改成測試用的 `b` 重複 64 次 | `8de241d30a4b524e9556d8ce6bfcb6af7d3ed2db60d44140c315983b6a01c17c` |
-
-最後一列的 digest 不是觀察到的模型 digest，只用來說明 identity 會變。正文修改後的 body SHA-256 是 `ea34241f90ad2e0b13f77d5f1024d733cfb6b47c6010611b3216113a401606c0`。HP-B 的 body SHA-256 仍是 `6a36c4072418b7d8ac1152ecfff2804b4a1c8085087e8b476df5006880b01cc4`。這些 key 都能同時留在檔案裡。get 成功只表示這筆技術保存可讀，不表示文件已核准，也不能當作檢索或問答結果。
+正文必須有非空白內容，metadata 必須能再通過合成資料與 `hp-a` / `hp-b` 檢查；`model_copy` 繞過驗證時，key 與 put 會在 transaction 前拒絕。驗證在記憶體做完才進入 `BEGIN IMMEDIATE`。SQLite lock timeout 是 5 秒，失敗不重試。commit 成功才回傳 key。寫入失敗會 rollback，舊列保持不變。同 key 且 canonical payload 完全相同時不新增列；同 key 但向量不同時拋 `StorageConflictError`，舊值保留。沒有自動 latest、刪除或 active pointer。`get_document` 找不到 key 才回 `None`；列存在但內容不合契約時拋 `StorageError`，不把它當成 miss，也不修復或重算。讀回時 `format_version` 與 `dimensions` 必須是精確整數。get 成功只表示這筆技術保存可讀，不表示文件已核准，也不能當作檢索或問答結果。

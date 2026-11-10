@@ -1,5 +1,6 @@
 """Offline tests for SQLite embedding storage."""
 
+import hashlib
 import json
 import os
 import sqlite3
@@ -23,6 +24,11 @@ from customer_support_rag.knowledge import (
     chunk_document,
     document_embedding_key,
     read_document,
+)
+from customer_support_rag.knowledge.storage import (
+    CHUNKING_PROFILE,
+    FORMAT_VERSION,
+    INPUT_PROFILE,
 )
 
 REPO = Path(__file__).parents[1]
@@ -534,3 +540,172 @@ def test_closed_store_cannot_read(tmp_path: Path) -> None:
     store.close()
     with pytest.raises(StorageError, match="read failed"):
         store.get_document("0" * 64)
+
+
+def _canonical(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _identity_key(source: KnowledgeDocument, body_hash: str) -> str:
+    identity = {
+        "format_version": FORMAT_VERSION,
+        "metadata": {
+            "document_id": source.metadata.document_id,
+            "product_id": source.metadata.product_id,
+            "title": source.metadata.title,
+            "version": source.metadata.version,
+            "synthetic": source.metadata.synthetic,
+        },
+        "body_sha256": body_hash,
+        "embedding": {
+            "model": EMBEDDING_MODEL,
+            "model_digest": MODEL_DIGEST,
+            "dimensions": EMBEDDING_DIMENSIONS,
+            "input_profile": INPUT_PROFILE,
+        },
+        "chunking": {"profile": CHUNKING_PROFILE, "max_chars": 1200},
+    }
+    return hashlib.sha256(_canonical(identity).encode("utf-8")).hexdigest()
+
+
+def _replace_row(
+    path: Path, key: str, payload: str, new_key: str | None = None
+) -> None:
+    with sqlite3.connect(path) as connection:
+        if new_key is None:
+            connection.execute(
+                """
+                UPDATE embedding_documents
+                SET payload_json = ?
+                WHERE artifact_key = ?
+                """,
+                (payload, key),
+            )
+            return
+        connection.execute(
+            """
+            UPDATE embedding_documents
+            SET artifact_key = ?, payload_json = ?
+            WHERE artifact_key = ?
+            """,
+            (new_key, payload, key),
+        )
+
+
+@pytest.mark.parametrize("case", ["deep_json", "huge_integer", "lone_surrogate"])
+def test_decode_boundary_is_storage_error(tmp_path: Path, case: str) -> None:
+    path = tmp_path / "embeddings.sqlite"
+    source = document("alpha\n")
+    with EmbeddingStore(path) as store:
+        key = store.put_document(
+            source, embed_eligible(chunk_document(source)), model_digest=MODEL_DIGEST
+        )
+        payload = rows(path)[0][1]
+        if case == "deep_json":
+            damaged = "[" * 12000 + "0" + "]" * 12000
+        elif case == "huge_integer":
+            damaged = '{"x":' + ("9" * 5000) + "}"
+        else:
+            record = json.loads(payload)
+            record["source"]["body"] = "\ud800"
+            damaged = json.dumps(record)
+        _replace_row(path, key, damaged)
+        with pytest.raises(
+            StorageError, match="Invalid stored embedding payload"
+        ) as caught:
+            loaded = store.get_document(key)
+            assert loaded is None
+        assert caught.type is StorageError
+        assert caught.value.__cause__ is None
+        assert rows(path) == [(key, damaged)]
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("synthetic", False), ("product_id", "unsupported")],
+)
+def test_forged_metadata_is_rejected_before_write(
+    tmp_path: Path, field: str, value: object
+) -> None:
+    path = tmp_path / "embeddings.sqlite"
+    source = document("alpha\n")
+    forged = source.model_copy(
+        update={"metadata": source.metadata.model_copy(update={field: value})}
+    )
+    with pytest.raises(ValueError, match="metadata"):
+        document_embedding_key(forged, model_digest=MODEL_DIGEST)
+    embedded = embed_eligible(chunk_document(forged))
+    with EmbeddingStore(path) as store:
+        key = store.put_document(
+            source, embed_eligible(chunk_document(source)), model_digest=MODEL_DIGEST
+        )
+        before = rows(path)
+        with pytest.raises(ValueError, match="metadata"):
+            store.put_document(forged, embedded, model_digest=MODEL_DIGEST)
+        assert rows(path) == before
+        loaded = store.get_document(key)
+    assert loaded is not None
+    assert loaded.document.metadata.synthetic is True
+    assert loaded.document.metadata.product_id == "hp-a"
+    assert loaded.document.body == source.body
+
+
+@pytest.mark.parametrize(
+    "case", ["boolean_format_version", "float_dimensions", "blank_body"]
+)
+def test_loose_or_blank_payload_is_storage_error(tmp_path: Path, case: str) -> None:
+    path = tmp_path / "embeddings.sqlite"
+    source = document("alpha\n")
+    legal_hash = hashlib.sha256(b"alpha\n").hexdigest()
+    assert _identity_key(source, legal_hash) == document_embedding_key(
+        source, model_digest=MODEL_DIGEST
+    )
+    with EmbeddingStore(path) as store:
+        key = store.put_document(
+            source, embed_eligible(chunk_document(source)), model_digest=MODEL_DIGEST
+        )
+        record = json.loads(rows(path)[0][1])
+        read_key = key
+        if case == "boolean_format_version":
+            record["format_version"] = True
+        elif case == "float_dimensions":
+            record["embedding"]["dimensions"] = 1024.0
+        else:
+            blank = document(" \n")
+            with pytest.raises(ValueError, match="non-blank"):
+                document_embedding_key(blank, model_digest=MODEL_DIGEST)
+            body_hash = hashlib.sha256(b" \n").hexdigest()
+            read_key = _identity_key(blank, body_hash)
+            record["source"]["body"] = " \n"
+            record["source"]["body_sha256"] = body_hash
+            chunks = chunk_document(blank)
+            assert chunks
+            assert all(not chunk.text.strip() for chunk in chunks)
+            record["chunks"] = [
+                {
+                    "index": chunk.index,
+                    "char_start": chunk.char_start,
+                    "char_end": chunk.char_end,
+                    "heading_path": list(chunk.heading_path),
+                    "vector": None,
+                }
+                for chunk in chunks
+            ]
+        damaged = _canonical(record)
+        _replace_row(path, key, damaged, None if read_key == key else read_key)
+        with pytest.raises(StorageError, match="Invalid stored embedding payload"):
+            store.get_document(read_key)
+        assert rows(path) == [(read_key, damaged)]
+        reread = json.loads(damaged)
+        if case == "boolean_format_version":
+            assert reread["format_version"] is True
+        elif case == "float_dimensions":
+            assert type(reread["embedding"]["dimensions"]) is float
+        else:
+            assert reread["source"]["body"] == " \n"

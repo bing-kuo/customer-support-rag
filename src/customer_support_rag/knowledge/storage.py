@@ -93,6 +93,7 @@ def document_embedding_key(
         model_digest, "model digest must be 64 lowercase hex characters"
     )
     limit = _require_max_chars(max_chars)
+    _require_source(checked)
     return _key_for(checked, digest, limit)
 
 
@@ -269,8 +270,7 @@ def _prepare_put(
         model_digest, "model digest must be 64 lowercase hex characters"
     )
     limit = _require_max_chars(max_chars)
-    if not checked.body.strip():
-        raise ValueError("document body must contain non-blank text")
+    _require_source(checked)
     chunks = tuple(chunk_document(checked, max_chars=limit))
     if not any(chunk.text.strip() for chunk in chunks):
         raise ValueError("document body must contain non-blank text")
@@ -301,17 +301,20 @@ def _decode(artifact_key: str, payload_json: str) -> StoredEmbeddingDocument:
     try:
         payload = json.loads(payload_json)
         return _stored_from_payload(artifact_key, payload)
-    except json.JSONDecodeError:
-        raise StorageError("Invalid stored embedding payload.") from None
-    except _Rejected:
-        raise StorageError("Invalid stored embedding payload.") from None
-    except ValidationError:
+    except (
+        json.JSONDecodeError,
+        RecursionError,
+        ValueError,
+        UnicodeEncodeError,
+        _Rejected,
+        ValidationError,
+    ):
         raise StorageError("Invalid stored embedding payload.") from None
 
 
 def _stored_from_payload(artifact_key: str, payload: object) -> StoredEmbeddingDocument:
     record = _object(payload, _PAYLOAD_KEYS)
-    if record.get("format_version") != FORMAT_VERSION:
+    if not _exact_int(record.get("format_version"), FORMAT_VERSION):
         raise _Rejected
     source = _object(record.get("source"), _SOURCE_KEYS)
     metadata_record = _object(source.get("metadata"), _METADATA_KEYS)
@@ -326,7 +329,7 @@ def _stored_from_payload(artifact_key: str, payload: object) -> StoredEmbeddingD
     digest = embedding.get("model_digest")
     if (
         embedding.get("model") != EMBEDDING_MODEL
-        or embedding.get("dimensions") != EMBEDDING_DIMENSIONS
+        or not _exact_int(embedding.get("dimensions"), EMBEDDING_DIMENSIONS)
         or embedding.get("input_profile") != INPUT_PROFILE
         or not isinstance(digest, str)
         or _SHA256.fullmatch(digest) is None
@@ -344,6 +347,7 @@ def _stored_from_payload(artifact_key: str, payload: object) -> StoredEmbeddingD
         version=_text(metadata_record.get("version")),
         synthetic=_true(metadata_record.get("synthetic")),
     )
+    _reject_invalid_source(metadata, body)
     document = KnowledgeDocument(metadata=metadata, body=body)
     expected = tuple(chunk_document(document, max_chars=limit))
     raw_chunks = record.get("chunks")
@@ -479,6 +483,32 @@ def _require_document(document: object) -> KnowledgeDocument:
     if not isinstance(document, KnowledgeDocument):
         raise ValueError("document must be a knowledge document")
     return document
+
+
+def _reject_invalid_source(metadata: object, body: object) -> None:
+    """Re-check a source that model_copy can build without field validators."""
+    if not isinstance(body, str) or not body.strip():
+        raise _Rejected("document body must contain non-blank text")
+    if not isinstance(metadata, KnowledgeMetadata):
+        raise _Rejected("document metadata must be synthetic hp-a or hp-b")
+    try:
+        KnowledgeMetadata(
+            document_id=metadata.document_id,
+            product_id=metadata.product_id,
+            title=metadata.title,
+            version=metadata.version,
+            synthetic=metadata.synthetic,
+        )
+    except ValidationError:
+        raise _Rejected("document metadata must be synthetic hp-a or hp-b") from None
+
+
+def _require_source(document: KnowledgeDocument) -> None:
+    try:
+        _reject_invalid_source(document.metadata, document.body)
+    except _Rejected as rejected:
+        message = rejected.args[0] if rejected.args else "invalid document source"
+        raise ValueError(message) from None
 
 
 def _require_embeddings(embeddings: object) -> tuple[EmbeddedChunk, ...]:
