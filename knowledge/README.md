@@ -64,3 +64,114 @@ with OllamaEmbeddingAdapter() as adapter:
 ```
 
 只有這一個 eligible input，所以只會有一筆 1024 維結果，來源 index 仍是 1。Mock 測試只檢查組裝、數量與來源，不使用或展示 Ollama 的真實向量。空白 chunk 被略過時，結果數可以少於原 chunks。等長回應若被 provider 重排，shape 檢查看不出來；live 核對尚未執行。
+
+## 持久保存
+
+`EmbeddingStore` 把一份文件的來源、chunk 位置與向量放進呼叫者指定的 SQLite 檔。它不呼叫 adapter、不掃資料夾、也不重算向量。路徑的 parent 必須已經存在；建議用 `.data/`，這個目錄已在 `.gitignore`，不要提交 DB 或 journal。
+
+新的空檔才會建立 schema。`PRAGMA user_version` 必須是 1，而且只能有這一張表：
+
+```sql
+CREATE TABLE embedding_documents (
+    artifact_key TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+```
+
+`payload_json` 是一段 canonical JSON：`ensure_ascii=False`、`sort_keys=True`、`separators=(",", ":")`、`allow_nan=False`。下面的縮排範例只給人讀，向量用說明文字代替，不是資料庫裡的內容，也不能拿來算 key。
+
+```json
+{
+  "format_version": 1,
+  "source": {
+    "metadata": {
+      "document_id": "hp-a-care",
+      "product_id": "hp-a",
+      "title": "HP-A 耳機日常保養",
+      "version": "1",
+      "synthetic": true
+    },
+    "body": "<完整原正文，含開頭 LF>",
+    "body_sha256": "223243a3ba9c40840746b1b2ee66e40b970a8fefd1324bb586930a381f9f4e59"
+  },
+  "embedding": {
+    "model": "qwen3-embedding:0.6b",
+    "model_digest": "<64 位小寫 hex>",
+    "dimensions": 1024,
+    "input_profile": "chunk-text-v1"
+  },
+  "chunking": {"profile": "heading-char-v1", "max_chars": 1200},
+  "chunks": [
+    {
+      "index": 0,
+      "char_start": 0,
+      "char_end": 1,
+      "heading_path": [],
+      "vector": null
+    },
+    {
+      "index": 1,
+      "char_start": 1,
+      "char_end": 71,
+      "heading_path": ["日常保養"],
+      "vector": "<資料庫裡是完整 1024 個 JSON number，這裡省略>"
+    }
+  ]
+}
+```
+
+沒有 approval、active、ready 或 published 欄位。空白 chunk 的 `vector` 是 JSON null；其餘是完整 1024 個有限且平方和大於 0 的數字。chunk 原文用 `source.body[char_start:char_end]` 還原，不另外存一份正文。
+
+`artifact_key` 是 identity 的 canonical JSON UTF-8 SHA-256。identity 含 `format_version`、五欄 metadata、`body_sha256`、整個 embedding 設定與整個 chunking 設定，不含向量、也不含正文本身。這是內容識別，不是核准或簽章。HP-A 在 digest `ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d`、`max_chars=1200` 時，key 的輸入是：
+
+```text
+{"body_sha256":"223243a3ba9c40840746b1b2ee66e40b970a8fefd1324bb586930a381f9f4e59","chunking":{"max_chars":1200,"profile":"heading-char-v1"},"embedding":{"dimensions":1024,"input_profile":"chunk-text-v1","model":"qwen3-embedding:0.6b","model_digest":"ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"},"format_version":1,"metadata":{"document_id":"hp-a-care","product_id":"hp-a","synthetic":true,"title":"HP-A 耳機日常保養","version":"1"}}
+```
+
+呼叫者可以在任何推論前用同一份文件和已知 digest 計算 key。digest 由呼叫端提供，store 不查 Ollama。上面這個 digest 是先前 live 觀察到的 tag digest；本節沒有重新查詢或執行模型。
+
+```python
+from customer_support_rag.knowledge import (
+    EmbeddingStore,
+    chunk_document,
+    document_embedding_key,
+    read_document,
+)
+
+document = read_document("knowledge", "hp-a/headphone-care.md")
+digest = "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"
+key = document_embedding_key(document, model_digest=digest)
+chunks = chunk_document(document)
+# embeddings 必須逐筆對上非空白 chunks。本變更的測試用 mock vector，沒有呼叫 Ollama。
+with EmbeddingStore(".data/embeddings.sqlite") as store:
+    stored_key = store.put_document(document, embeddings, model_digest=digest)
+
+# store 關閉後，新的程序只開資料庫並用 key 讀回，不再建立 adapter。
+with EmbeddingStore(".data/embeddings.sqlite") as store:
+    loaded = store.get_document(stored_key)
+```
+
+驗證在記憶體做完才進入 `BEGIN IMMEDIATE`。SQLite lock timeout 是 5 秒，失敗不重試。commit 成功才回傳 key。寫入失敗會 rollback，舊列保持不變。同 key 且 canonical payload 完全相同時不新增列；同 key 但向量不同時拋 `StorageConflictError`，舊值保留。沒有自動 latest、刪除或 active pointer。`get_document` 找不到 key 才回 `None`；列存在但內容不合契約時拋 `StorageError`，不把它當成 miss，也不修復或重算。
+
+### HP-A 保存範例（mock）
+
+`tests/test_embedding_storage.py` 用真實 reader、chunker 與 mock adapter 保存 HP-A，關閉後由另一個 Python 程序讀回。那個程序沒有呼叫 adapter。向量是 `(1 + index) / 1024` 的 1024 個 mock 數字，不是 live 前四維補零。
+
+| 項目 | 值 |
+| --- | --- |
+| artifact key | `9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad` |
+| body SHA-256 | `223243a3ba9c40840746b1b2ee66e40b970a8fefd1324bb586930a381f9f4e59` |
+| chunks / vectors / 維度 | 2 / 1 / 1024 |
+| 空白 chunk | index 0，`vector` 為 null |
+| eligible chunk | index 1，heading `日常保養` |
+
+同一份 HP-A 再 put 一次，key 與列數不變。只改向量會被拒絕，舊 mock 向量仍在。下面的變更各自得到新 key，原來的 HP-A key 仍讀回原正文：
+
+| 變更 | 新 key |
+| --- | --- |
+| 正文末尾加上 `補充。\n` | `e87a5d1a3cf5ec1a49129b18d5dd16b0deece91393d52ffdaf2b88ca9d6d4338` |
+| title 改為 `HP-A 保養改版` | `3c8e61013408d7fdbf2ee6154545f87eed646c44a1777f50d78225f3fd6c04d5` |
+| 另存 HP-B `hp-b-connection` | `18812b328a8e3614c4c83a849c2bfcd108e695453c8eaf9d57cf87200cefafae` |
+| 同一 HP-A，digest 改成測試用的 `b` 重複 64 次 | `8de241d30a4b524e9556d8ce6bfcb6af7d3ed2db60d44140c315983b6a01c17c` |
+
+最後一列的 digest 不是觀察到的模型 digest，只用來說明 identity 會變。正文修改後的 body SHA-256 是 `ea34241f90ad2e0b13f77d5f1024d733cfb6b47c6010611b3216113a401606c0`。HP-B 的 body SHA-256 仍是 `6a36c4072418b7d8ac1152ecfff2804b4a1c8085087e8b476df5006880b01cc4`。這些 key 都能同時留在檔案裡。get 成功只表示這筆技術保存可讀，不表示文件已核准，也不能當作檢索或問答結果。
