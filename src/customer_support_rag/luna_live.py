@@ -1,27 +1,20 @@
-"""One HP-A readiness check and one explicit Luna send.
+"""One HP-A live call. Key-only. No local budget admission.
 
 Importing this module does not read a key, open a ledger, or make a network
-call. ``hp_a_check`` is read-only. ``hp_a_once`` is the only send, and only
-after that check allows it. This module does not record a live answer.
+call. ``hp_a_check`` reports the key and the wire bytes. It does not authorize
+a send. ``hp_a_once`` is the only live entry: it reads the key again, posts
+at most once, and does not open the historical ledger or a policy file.
+A stopped call does not write an unknown row. This module does not record a
+live answer.
 """
 
 from __future__ import annotations
 
-import hashlib
 import os
 import stat
 from dataclasses import dataclass
 from pathlib import Path
 
-from customer_support_rag.budget import (
-    BudgetError,
-    LedgerContinuity,
-    inspect_ledger,
-    load_policy,
-    load_runtime,
-    open_ledger,
-    rates_cover_documented_ceiling,
-)
 from customer_support_rag.knowledge.answering import (
     AnswerRequest,
     GroundedDraft,
@@ -32,33 +25,28 @@ from customer_support_rag.knowledge.reader import read_document
 from customer_support_rag.knowledge.retrieval import RetrievalHit
 from customer_support_rag.knowledge.storage import document_embedding_key
 from customer_support_rag.luna import (
+    DEFAULT_DEADLINE_SECONDS,
+    MAX_WIRE_BYTES,
     LunaError,
+    Usage,
     WireParts,
+    _post_live_once,
     build_luna_body,
-    generate_draft,
     network_transport,
-    permit_live_transport,
     wire_bytes,
     wire_composition,
 )
 
 QUESTION = "HP-A 耳機可以用水洗嗎？"
 REQUEST_ID = "hp-a-luna-natural-answer-one-shot-v1"
-SCOPE = "developer_smoke"
 CARE_PATH = "hp-a/headphone-care.md"
 PUBLISHED_DIGEST = "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"
 _CARE_ARTIFACT = "9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad"
-_ALWAYS_NOTES = (
-    "structural_allowance_1024_is_not_a_published_tokenizer_bound",
-    "read_only_snapshot_rechecked_inside_reserve",
-    "ultrafast_not_listed_for_gpt_6_luna",
-    "long_context_not_applied_below_272k",
-    "fedramp_endpoint_not_used",
-)
 
 __all__ = [
     "QUESTION",
     "REQUEST_ID",
+    "LiveCall",
     "LiveReadiness",
     "hp_a_check",
     "hp_a_once",
@@ -67,34 +55,29 @@ __all__ = [
 
 
 @dataclass(frozen=True)
+class LiveCall:
+    """One finished live response. ``stopped`` is a safe code, or None.
+
+    Usage is the provider's reported token counts. This object is not a ledger
+    row, and a stopped call does not block a later call.
+    """
+
+    draft: GroundedDraft | None
+    usage: Usage
+    stopped: str | None
+
+    def __post_init__(self) -> None:
+        if (self.stopped is None) == (self.draft is None):
+            raise LunaError("invalid_response")
+
+
+@dataclass(frozen=True)
 class LiveReadiness:
-    """Safe readiness. Codes and wire lengths only; no key, hash, or amount."""
+    """Key and wire report. It is not a send authorization."""
 
     key_present: bool
-    history_continuous: bool
-    original_debit_counted: bool
-    replay_blocked: bool
-    cap_unchanged: bool
-    no_pending: bool
-    one_request_fits: bool
-    pricing_bound_verified: bool
     failures: tuple[str, ...]
-    notes: tuple[str, ...]
     wire: WireParts | None = None
-
-    @property
-    def network_allowed(self) -> bool:
-        return (
-            self.key_present
-            and self.history_continuous
-            and self.original_debit_counted
-            and self.replay_blocked
-            and self.cap_unchanged
-            and self.no_pending
-            and self.one_request_fits
-            and self.pricing_bound_verified
-            and not self.failures
-        )
 
 
 def prepare_hp_a_request(knowledge: Path) -> AnswerRequest:
@@ -124,135 +107,62 @@ def prepare_hp_a_request(knowledge: Path) -> AnswerRequest:
 
 
 def hp_a_check(root: Path, *, knowledge: Path | None = None) -> LiveReadiness:
-    """Read the caller's root and return readiness. This never opens a socket."""
-    knowledge_root = _knowledge(knowledge)
+    """Read the key file and the wire. This never opens a ledger or a socket."""
     failures: list[str] = []
-    notes: list[str] = list(_ALWAYS_NOTES)
     wire: WireParts | None = None
-    body_hash: str | None = None
-    reserved: int | None = None
     try:
-        request = prepare_hp_a_request(knowledge_root)
-        encoded = wire_bytes(build_luna_body(request))
+        request = prepare_hp_a_request(_knowledge(knowledge))
         wire = wire_composition(request)
-        body_hash = hashlib.sha256(encoded).hexdigest()
-        reserved = wire.reserved_input_tokens
     except LunaError as exc:
         failures.append(exc.code)
     key_present, key_failures = _key_status(root / ".env")
     failures.extend(key_failures)
-    policy, policy_failures = _load_checked_policy(
-        root / "runtime" / "cloud-policy.json"
-    )
-    failures.extend(policy_failures)
-    if policy is not None and SCOPE not in policy.scopes:
-        failures.append("scope_not_enabled")
-    priced = policy is not None and rates_cover_documented_ceiling(policy)
-    if policy is not None and not priced:
-        failures.append("documented_rate_ceiling_uncovered")
-    ledger_path = root / "runtime" / "cloud-budget.sqlite3"
-    access_failures, access_notes = _ledger_access(ledger_path)
-    failures.extend(access_failures)
-    notes.extend(access_notes)
-    if policy is None or access_failures:
-        continuity = _false_continuity()
-    else:
-        try:
-            continuity = inspect_ledger(
-                ledger_path,
-                policy,
-                request_id=REQUEST_ID,
-                body_hash=body_hash,
-                input_tokens=reserved,
-            )
-        except BudgetError as exc:
-            continuity = _false_continuity(exc.code)
-    if wire is None:
-        continuity = LedgerContinuity(
-            history_continuous=continuity.history_continuous,
-            original_debit_counted=continuity.original_debit_counted,
-            replay_blocked=continuity.replay_blocked,
-            cap_unchanged=continuity.cap_unchanged,
-            no_pending=continuity.no_pending,
-            one_request_fits=False,
-            failures=continuity.failures,
-            notes=continuity.notes,
-        )
-    failures.extend(continuity.failures)
-    notes.extend(continuity.notes)
     return LiveReadiness(
         key_present=key_present,
-        history_continuous=continuity.history_continuous,
-        original_debit_counted=continuity.original_debit_counted,
-        replay_blocked=continuity.replay_blocked,
-        cap_unchanged=continuity.cap_unchanged,
-        no_pending=continuity.no_pending,
-        one_request_fits=continuity.one_request_fits,
-        pricing_bound_verified=priced,
         failures=_unique(failures),
-        notes=_unique(notes),
         wire=wire,
     )
 
 
-async def hp_a_once(root: Path, *, knowledge: Path | None = None) -> GroundedDraft:
-    """Send the one prepared request after a second read-only check.
+async def hp_a_once(
+    root: Path,
+    *,
+    knowledge: Path | None = None,
+    deadline: float = DEFAULT_DEADLINE_SECONDS,
+) -> LiveCall:
+    """Send the one prepared request once. The key is the only local admission.
 
-    A false check raises ``paid_blocked`` before the factory is built.
+    Policy, rates, token-cost proof, and the historical ledger are not read.
+    A 429, timeout, or other provider error stops this call and is not retried.
     """
-    if not hp_a_check(root, knowledge=knowledge).network_allowed:
-        raise LunaError("paid_blocked")
-    if not hp_a_check(root, knowledge=knowledge).network_allowed:
-        raise LunaError("paid_blocked")
-    env_path, policy_path, ledger_path = _private_paths(root)
-    key, key_failures = _read_key(env_path)
+    key, key_failures = _read_key(root / ".env")
     if key is None or key_failures:
         raise LunaError("paid_blocked")
-    try:
-        runtime = load_runtime(policy_path, key)
-    except BudgetError:
-        raise LunaError("paid_blocked") from None
     request = prepare_hp_a_request(_knowledge(knowledge))
+    encoded = wire_bytes(build_luna_body(request))
+    if len(encoded) > MAX_WIRE_BYTES:
+        raise LunaError("wire_body_exceeded")
     transport = network_transport()
     try:
-        ledger = open_ledger(ledger_path)
-        return await generate_draft(
+        draft, usage, stopped = await _post_live_once(
+            encoded,
             request,
-            request_id=REQUEST_ID,
-            runtime=runtime,
-            ledger=ledger,
+            api_key=key,
             transport=transport,
-            scope=SCOPE,
-            admission=permit_live_transport(),
+            request_id=REQUEST_ID,
+            deadline=deadline,
         )
     finally:
         await transport.aclose()
+    if usage is None:
+        raise LunaError("usage_missing")
+    return LiveCall(draft=draft, usage=usage, stopped=stopped)
 
 
 def _knowledge(knowledge: Path | None) -> Path:
     if knowledge is None:
         return Path(__file__).resolve().parents[2] / "knowledge"
     return knowledge
-
-
-def _private_paths(root: Path) -> tuple[Path, Path, Path]:
-    return (
-        root / ".env",
-        root / "runtime" / "cloud-policy.json",
-        root / "runtime" / "cloud-budget.sqlite3",
-    )
-
-
-def _load_checked_policy(path: Path):
-    code = _owner_file_code(path)
-    if code == "not_owner_only":
-        return None, ("policy_not_owner_only",)
-    if code is not None:
-        return None, ("policy_unavailable",)
-    try:
-        return load_policy(path), ()
-    except BudgetError as exc:
-        return None, (exc.code,)
 
 
 def _key_status(path: Path) -> tuple[bool, tuple[str, ...]]:
@@ -336,36 +246,6 @@ def _read_owner_text(path: Path) -> str:
             return handle.read()
     finally:
         os.close(descriptor)
-
-
-def _ledger_access(path: Path) -> tuple[tuple[str, ...], tuple[str, ...]]:
-    try:
-        info = os.lstat(path)
-        parent = os.lstat(path.parent)
-    except OSError:
-        return ("ledger_unavailable",), ()
-    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-        return ("ledger_unavailable",), ()
-    file_loose = bool(info.st_mode & 0o077)
-    parent_loose = bool(parent.st_mode & 0o077)
-    if file_loose and parent_loose:
-        return ("ledger_not_owner_only",), ()
-    if file_loose:
-        return (), ("ledger_mode_loose_inside_owner_only_directory",)
-    return (), ()
-
-
-def _false_continuity(*codes: str) -> LedgerContinuity:
-    return LedgerContinuity(
-        history_continuous=False,
-        original_debit_counted=False,
-        replay_blocked=False,
-        cap_unchanged=False,
-        no_pending=False,
-        one_request_fits=False,
-        failures=codes,
-        notes=(),
-    )
 
 
 def _unique(items: list[str]) -> tuple[str, ...]:

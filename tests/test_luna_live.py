@@ -1,4 +1,4 @@
-"""Read-only readiness and a socket-blocked one-shot. No live provider call."""
+"""Live entry tests. No real provider call and no historical ledger write."""
 
 from __future__ import annotations
 
@@ -6,27 +6,26 @@ import asyncio
 import hashlib
 import json
 import socket
-import sqlite3
+import ssl
 from pathlib import Path
 
 import httpx
 import pytest
 
+from customer_support_rag import luna
 from customer_support_rag.budget import (
-    OUTPUT_RESERVATION,
-    LunaPolicy,
     LunaRuntime,
     init_synthetic_ledger,
     load_policy,
-    rates_cover_documented_ceiling,
+    open_ledger,
 )
 from customer_support_rag.luna import (
-    WIRE_FUDGE,
+    MAX_WIRE_BYTES,
+    MODEL,
     LunaError,
     build_luna_body,
     generate_draft,
     network_transport,
-    permit_live_transport,
     responses_client,
     wire_bytes,
     wire_composition,
@@ -34,7 +33,6 @@ from customer_support_rag.luna import (
 from customer_support_rag.luna_live import (
     QUESTION,
     REQUEST_ID,
-    SCOPE,
     hp_a_check,
     hp_a_once,
     prepare_hp_a_request,
@@ -43,8 +41,7 @@ from customer_support_rag.luna_live import (
 KNOWLEDGE = Path(__file__).parents[1] / "knowledge"
 KEY = "synthetic-key-not-live"
 BODY_HASH = "e861e88a0dd3ed17a554d9de8091af8c3b680b5abd9db3a03c58e1aebbe502fe"
-FLOOR_INPUT = 275_000_000_000
-FLOOR_OUTPUT = 550_000_000_000
+ANSWER = "請用乾燥的軟布擦拭，耳機不可泡水，也別用溶劑清潔。"
 
 
 @pytest.fixture(autouse=True)
@@ -62,12 +59,12 @@ def _block_network(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def test_hp_a_wire_is_inside_the_old_ceiling() -> None:
+def test_hp_a_wire_is_one_fixed_body() -> None:
     request = prepare_hp_a_request(KNOWLEDGE)
     parts = wire_composition(request)
-    encoded = wire_bytes(build_luna_body(request))
+    body = build_luna_body(request)
+    encoded = wire_bytes(body)
     assert request.question == QUESTION
-    assert request.evidence[0].text
     assert (
         request.sources[0].hit.chunk.char_start,
         request.sources[0].hit.chunk.char_end,
@@ -77,476 +74,326 @@ def test_hp_a_wire_is_inside_the_old_ceiling() -> None:
     assert parts.schema_bytes == 398
     assert parts.framing_bytes == 409
     assert parts.total_bytes == 1829
-    assert parts.reserved_input_tokens == parts.total_bytes + WIRE_FUDGE == 2853
-    assert parts.ceiling_headroom_tokens == 731
-    assert parts.reserved_input_tokens + OUTPUT_RESERVATION <= 4096
+    assert parts.total_bytes <= MAX_WIRE_BYTES
+    assert body["max_output_tokens"] == 512
+    assert body["model"] == MODEL
+    assert body["store"] is False
+    assert body["tools"] == []
     assert hashlib.sha256(encoded).hexdigest() == BODY_HASH
 
 
-def test_floor_rates_cover_and_one_unit_less_does_not(tmp_path: Path) -> None:
-    covered = _policy(
-        tmp_path / "floor", input_rate_units=FLOOR_INPUT, output_rate_units=FLOOR_OUTPUT
-    )
-    assert rates_cover_documented_ceiling(covered) is True
-    short_input = _policy(
-        tmp_path / "short-input",
-        input_rate_units=FLOOR_INPUT - 1,
-        output_rate_units=FLOOR_OUTPUT,
-    )
-    short_output = _policy(
-        tmp_path / "short-output",
-        input_rate_units=FLOOR_INPUT,
-        output_rate_units=FLOOR_OUTPUT - 1,
-    )
-    extra_only = _policy(
-        tmp_path / "extra",
-        input_rate_units=1000,
-        output_rate_units=2000,
-        extra_units=2**59,
-    )
-    assert rates_cover_documented_ceiling(short_input) is False
-    assert rates_cover_documented_ceiling(short_output) is False
-    assert rates_cover_documented_ceiling(extra_only) is False
-    high = _policy(
-        tmp_path / "high",
-        input_rate_units=10**15,
-        output_rate_units=10**15,
-        cap_units=2**59,
-    )
-    assert rates_cover_documented_ceiling(high) is True
-
-
-def test_missing_key_and_bad_schema_do_not_open_network(
+def test_check_reports_the_key_without_opening_a_ledger(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _forbid_send(monkeypatch)
-    missing = tmp_path / "missing"
-    report = hp_a_check(missing, knowledge=KNOWLEDGE)
-    assert report.key_present is False
-    assert report.network_allowed is False
-    assert "key_missing" in report.failures
-    root = _ready(tmp_path / "schema")
-    connection = sqlite3.connect(root / "runtime" / "cloud-budget.sqlite3")
-    connection.execute("CREATE TABLE extra(id INTEGER)")
-    connection.commit()
-    connection.close()
-    broken = hp_a_check(root, knowledge=KNOWLEDGE)
-    assert broken.network_allowed is False
-    assert broken.history_continuous is False
-    assert "ledger_schema_incompatible" in broken.failures
-    with pytest.raises(LunaError) as blocked:
-        asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
-    assert blocked.value.code == "paid_blocked"
-
-
-def test_check_keeps_history_and_does_not_open_the_writer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    root = _ready(tmp_path)
-    before = _snapshot(root)
-    monkeypatch.setattr(
-        "customer_support_rag.luna_live.open_ledger",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("rw ledger")),
-    )
-    monkeypatch.setattr(
-        "customer_support_rag.luna_live.network_transport",
-        lambda: (_ for _ in ()).throw(AssertionError("network")),
-    )
+    _forbid_budget(monkeypatch)
+    root = _key_only(tmp_path)
     report = hp_a_check(root, knowledge=KNOWLEDGE)
-    assert report.network_allowed is True
-    assert report.pricing_bound_verified is True
     assert report.key_present is True
-    assert report.history_continuous is True
-    assert report.original_debit_counted is True
-    assert report.replay_blocked is True
-    assert report.cap_unchanged is True
-    assert report.no_pending is True
-    assert report.one_request_fits is True
-    assert (
-        "structural_allowance_1024_is_not_a_published_tokenizer_bound" in report.notes
-    )
-    assert (
-        "original_unknown_pricing_hash_differs_from_current_policy" not in report.notes
-    )
-    assert _snapshot(root) == before
-    states = _states(root)
-    assert [row["state"] for row in states] == ["settled", "unknown"]
-    assert states[1]["used_cost"] is None
+    assert report.failures == ()
+    assert report.wire is not None
+    assert report.wire.total_bytes == 1829
+    missing = hp_a_check(tmp_path / "empty", knowledge=KNOWLEDGE)
+    assert missing.key_present is False
+    assert "key_missing" in missing.failures
 
 
-def test_original_pricing_hash_difference_is_a_note_only(tmp_path: Path) -> None:
-    root = _ready(tmp_path, unknown_hash="ab" * 32)
-    report = hp_a_check(root, knowledge=KNOWLEDGE)
-    assert report.history_continuous is True
-    assert report.original_debit_counted is True
-    assert "original_unknown_pricing_hash_differs_from_current_policy" in report.notes
-    assert _states(root)[1]["pricing_hash"] == "ab" * 32
-
-
-def test_wrong_binding_pending_and_existing_id_block_send(
+def test_missing_key_does_not_build_the_factory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    _forbid_send(monkeypatch)
-    bound = _ready(tmp_path / "bound")
-    _execute(
-        bound,
-        "UPDATE budgets SET binding=?",
-        ("ab" * 32,),
-    )
-    binding = hp_a_check(bound, knowledge=KNOWLEDGE)
-    assert binding.history_continuous is False
-    assert "budget_binding_mismatch" in binding.failures
-    assert _states(bound)[1]["state"] == "unknown"
+    seen = {"factory": 0}
 
-    pending = _ready(tmp_path / "pending")
-    _insert_request(
-        pending,
-        id="still-sent",
-        budget="synthetic-budget",
-        body_hash="4" * 64,
-        owner="historical",
-        scope=SCOPE,
-        state="sent",
-        res_input=10,
-        res_output=OUTPUT_RESERVATION,
-        res_cost=1,
-        pricing_hash=_policy_at(pending).pricing_hash(),
-        requested_model="gpt-6-luna",
-        created=3.0,
-    )
-    waiting = hp_a_check(pending, knowledge=KNOWLEDGE)
-    assert waiting.no_pending is False
-    assert "pending_reservation" in waiting.failures
+    def factory() -> None:
+        seen["factory"] += 1
+        raise AssertionError("factory")
 
-    taken = _ready(tmp_path / "taken")
-    _insert_request(
-        taken,
-        id=REQUEST_ID,
-        budget="synthetic-budget",
-        body_hash="5" * 64,
-        owner="historical",
-        scope=SCOPE,
-        state="reserved",
-        res_input=10,
-        res_output=OUTPUT_RESERVATION,
-        res_cost=1,
-        pricing_hash=_policy_at(taken).pricing_hash(),
-        requested_model="gpt-6-luna",
-        created=4.0,
-    )
-    exists = hp_a_check(taken, knowledge=KNOWLEDGE)
-    assert "request_id_exists" in exists.failures
-    assert exists.network_allowed is False
+    monkeypatch.setattr("customer_support_rag.luna_live.network_transport", factory)
     with pytest.raises(LunaError) as blocked:
-        asyncio.run(hp_a_once(taken, knowledge=KNOWLEDGE))
+        asyncio.run(hp_a_once(tmp_path, knowledge=KNOWLEDGE))
     assert blocked.value.code == "paid_blocked"
-    assert any(
-        row["id"] == REQUEST_ID and row["state"] == "reserved" for row in _states(taken)
-    )
+    assert seen["factory"] == 0
+    assert not (tmp_path / "runtime" / "cloud-budget.sqlite3").exists()
 
 
-def test_replayed_body_stays_blocked_without_a_new_id(tmp_path: Path) -> None:
-    root = _ready(tmp_path)
-    policy = _policy_at(root)
-    _insert_request(
-        root,
-        id="same-body",
-        budget=policy.budget_id,
-        body_hash=BODY_HASH,
-        owner="historical",
-        scope=SCOPE,
-        state="settled",
-        res_input=10,
-        res_output=OUTPUT_RESERVATION,
-        res_cost=1,
-        used_input=1,
-        used_output=1,
-        used_cost=1,
-        pricing_hash=policy.pricing_hash(),
-        requested_model="gpt-6-luna",
-        created=5.0,
-    )
-    _insert_debit(root, "same-body", policy)
-    report = hp_a_check(root, knowledge=KNOWLEDGE)
-    assert report.replay_blocked is True
-    assert report.one_request_fits is False
-    assert "new_body_matches_debited_hash" in report.failures
-    assert report.network_allowed is False
+def test_live_call_does_not_read_policy_or_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_budget(monkeypatch)
+    root = _key_only(tmp_path)
+    (root / "runtime").mkdir()
+    (root / "runtime" / "cloud-policy.json").write_text("{", encoding="utf-8")
+    (root / "runtime" / "cloud-budget.sqlite3").write_bytes(b"not a database")
+    calls: list[httpx.Request] = []
+
+    async def handler(_self: object, request: httpx.Request) -> httpx.Response:
+        calls.append(request)
+        return httpx.Response(200, json=_envelope(_source_text(_source_id())))
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handler)
+    result = asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
+    assert result.stopped is None
+    assert result.draft is not None
+    assert result.draft.answer == ANSWER
+    assert (result.usage.input_tokens, result.usage.output_tokens) == (12, 8)
+    assert len(calls) == 1
+    assert calls[0].method == "POST"
+    assert calls[0].url.path == "/v1/responses"
+    assert calls[0].url.host == "api.openai.com"
+    assert calls[0].headers["x-client-request-id"] == REQUEST_ID
+    posted = json.loads(calls[0].content.decode())
+    assert posted["model"] == MODEL
+    assert posted["store"] is False
+    assert posted["tools"] == []
+    assert posted["max_output_tokens"] == 512
+    assert (root / "runtime" / "cloud-budget.sqlite3").read_bytes() == b"not a database"
 
 
-def test_low_rates_and_loose_permissions(tmp_path: Path) -> None:
-    low = _ready(
-        tmp_path / "low",
-        input_rate_units=1000,
-        output_rate_units=2000,
-        cap_units=10**9,
-    )
-    report = hp_a_check(low, knowledge=KNOWLEDGE)
-    assert report.pricing_bound_verified is False
-    assert "documented_rate_ceiling_uncovered" in report.failures
-    assert report.network_allowed is False
-
-    noted = _ready(tmp_path / "noted")
-    ledger = noted / "runtime" / "cloud-budget.sqlite3"
-    ledger.chmod(0o644)
-    noted.joinpath("runtime").chmod(0o700)
-    loose_note = hp_a_check(noted, knowledge=KNOWLEDGE)
-    assert loose_note.network_allowed is True
-    assert "ledger_mode_loose_inside_owner_only_directory" in loose_note.notes
-
-    exposed = _ready(tmp_path / "exposed")
-    exposed_ledger = exposed / "runtime" / "cloud-budget.sqlite3"
-    exposed_ledger.chmod(0o644)
-    exposed.joinpath("runtime").chmod(0o755)
-    blocked = hp_a_check(exposed, knowledge=KNOWLEDGE)
-    assert blocked.network_allowed is False
-    assert "ledger_not_owner_only" in blocked.failures
-
-
-def test_runtime_flag_and_raw_transport_cannot_pass(tmp_path: Path) -> None:
-    root = _ready(tmp_path)
-    policy = _policy_at(root)
+def test_public_factory_does_not_reserve(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = _offline_ledger(tmp_path)
+    policy = load_policy(root / "runtime" / "cloud-policy.json")
     runtime = LunaRuntime(policy, KEY, pricing_bound_verified=True)
-    from customer_support_rag.budget import open_ledger
-
     ledger = open_ledger(root / "runtime" / "cloud-budget.sqlite3")
-    request = prepare_hp_a_request(KNOWLEDGE)
-    raw = httpx.AsyncHTTPTransport(verify=True, trust_env=False, retries=0)
+    before = (root / "runtime" / "cloud-budget.sqlite3").read_bytes()
+    called = {"handler": 0}
+
+    async def handler(_self: object, _request: httpx.Request) -> httpx.Response:
+        called["handler"] += 1
+        raise AssertionError("handler")
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handler)
+    transport = network_transport()
     try:
         with pytest.raises(LunaError) as blocked:
             asyncio.run(
                 generate_draft(
-                    request,
-                    request_id="flag",
+                    prepare_hp_a_request(KNOWLEDGE),
+                    request_id="bypass",
                     runtime=runtime,
                     ledger=ledger,
-                    transport=raw,
-                    scope=SCOPE,
-                    admission=permit_live_transport(),
+                    transport=transport,
+                    scope="developer_smoke",
                 )
             )
         assert blocked.value.code == "paid_blocked"
-        factory = network_transport()
-        factory._luna_factory = object()
-        with pytest.raises(LunaError) as forged:
-            responses_client(factory, admission=permit_live_transport())
-        assert forged.value.code == "paid_blocked"
-        asyncio.run(factory.aclose())
+        with pytest.raises(LunaError) as client:
+            responses_client(transport)
+        assert client.value.code == "paid_blocked"
     finally:
-        asyncio.run(raw.aclose())
-    assert [row["state"] for row in _states(root)] == ["settled", "unknown"]
+        asyncio.run(transport.aclose())
+    assert called["handler"] == 0
+    assert (root / "runtime" / "cloud-budget.sqlite3").read_bytes() == before
+    assert not hasattr(luna, "permit_live_transport")
 
 
-def test_ready_once_keeps_one_unknown_and_does_not_post(
+@pytest.mark.parametrize(
+    ("payload", "code"),
+    [
+        (
+            {"error": {"code": "insufficient_quota", "type": "insufficient_quota"}},
+            "insufficient_quota",
+        ),
+        (
+            {
+                "error": {
+                    "code": "credit_balance_exhausted",
+                    "type": "insufficient_quota",
+                    "message": "do-not-leak",
+                }
+            },
+            "insufficient_quota",
+        ),
+        (
+            {
+                "error": {
+                    "code": "project_spend_limit_exceeded",
+                    "type": "insufficient_quota",
+                    "message": "do-not-leak",
+                }
+            },
+            "insufficient_quota",
+        ),
+        (
+            {"error": {"code": "rate_limit_exceeded", "type": "rate_limit_error"}},
+            "rate_limit",
+        ),
+        (
+            {
+                "error": {
+                    "code": "slow_down",
+                    "type": "rate_limit_error",
+                    "message": "do-not-leak",
+                }
+            },
+            "rate_limit",
+        ),
+        ({"error": {"type": "insufficient_quota"}}, "insufficient_quota"),
+        ({"error": {"code": "server_busy", "type": "tokens"}}, "provider_capacity"),
+        (None, "provider_capacity"),
+    ],
+)
+def test_429_stops_once_and_does_not_write_a_ledger(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, payload: object, code: str
+) -> None:
+    _forbid_budget(monkeypatch)
+    root = _key_only(tmp_path)
+    calls = {"n": 0}
+
+    async def handler(_self: object, _request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if payload is None:
+            return httpx.Response(429, headers={"retry-after": "30"})
+        return httpx.Response(429, json=payload, headers={"retry-after": "30"})
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handler)
+    with pytest.raises(LunaError) as stopped:
+        asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
+    assert stopped.value.code == code
+    assert "do-not-leak" not in str(stopped.value)
+    assert calls["n"] == 1
+    assert not (root / "runtime").exists()
+
+
+def test_timeout_does_not_block_a_later_call(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    root = _ready(tmp_path)
-    seen = {"inet": 0, "factory": 0}
-    real_socket = socket.socket
+    _forbid_budget(monkeypatch)
+    root = _key_only(tmp_path)
+    calls = {"n": 0}
 
-    def guarded(family: int = socket.AF_INET, *args: object, **kwargs: object):
-        if family == socket.AF_UNIX:
-            return real_socket(family, *args, **kwargs)
-        seen["inet"] += 1
-        raise OSError("blocked")
+    async def handler(_self: object, _request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        if calls["n"] == 1:
+            await asyncio.sleep(30)
+        return httpx.Response(200, json=_envelope(_source_text(_source_id())))
 
-    def one_address(*_args: object, **_kwargs: object):
-        return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("127.0.0.1", 443))]
-
-    monkeypatch.setattr(socket, "socket", guarded)
-    monkeypatch.setattr(socket, "getaddrinfo", one_address)
-    monkeypatch.setattr(
-        socket,
-        "create_connection",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(OSError("blocked")),
-    )
-    real_factory = network_transport
-
-    def factory():
-        seen["factory"] += 1
-        return real_factory()
-
-    monkeypatch.setattr("customer_support_rag.luna_live.network_transport", factory)
-    with pytest.raises(LunaError) as caught:
-        asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
-    assert caught.value.code == "provider_transport_error"
-    assert str(caught.value) == "provider_transport_error"
-    assert seen["factory"] == 1
-    assert seen["inet"] == 1
-    rows = _states(root)
-    original = next(row for row in rows if row["id"] == "original-unknown")
-    live = next(row for row in rows if row["id"] == REQUEST_ID)
-    assert original["state"] == "unknown"
-    assert original["used_cost"] is None
-    assert live["state"] == "unknown"
-    assert live["used_input"] is None
-    assert _debit_ids(root) == ["original-unknown"]
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handler)
+    with pytest.raises(LunaError) as first:
+        asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE, deadline=0.05))
+    assert first.value.code == "logical_timeout"
+    result = asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
+    assert result.stopped is None
+    assert result.draft is not None
+    assert calls["n"] == 2
+    assert not (root / "runtime").exists()
 
 
-def _forbid_send(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_quality_failure_keeps_usage_without_a_ledger_row(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_budget(monkeypatch)
+    root = _key_only(tmp_path)
+
+    async def handler(_self: object, _request: httpx.Request) -> httpx.Response:
+        text = json.dumps(
+            {
+                "status": "answer",
+                "answer": ANSWER,
+                "source_ids": ["missing-source"],
+                "reason": None,
+            }
+        )
+        return httpx.Response(200, json=_envelope(text))
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handler)
+    result = asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
+    assert result.draft is None
+    assert result.stopped == "unknown_citation"
+    assert result.usage.total_tokens == 20
+    assert not (root / "runtime").exists()
+
+
+def test_factory_uses_tls_without_proxy_retries_or_redirects() -> None:
+    transport = network_transport()
+    try:
+        pool = transport._pool
+        assert pool._retries == 0
+        assert type(pool).__name__ == "AsyncConnectionPool"
+        context = pool._ssl_context
+        assert isinstance(context, ssl.SSLContext)
+        assert context.verify_mode == ssl.CERT_REQUIRED
+        assert context.check_hostname is True
+        client = responses_client(
+            httpx.MockTransport(lambda _request: httpx.Response(204))
+        )
+        assert client.trust_env is False
+        assert client.follow_redirects is False
+        asyncio.run(client.aclose())
+    finally:
+        asyncio.run(transport.aclose())
+
+
+def _forbid_budget(monkeypatch: pytest.MonkeyPatch) -> None:
     def boom(*_args: object, **_kwargs: object) -> None:
-        raise AssertionError("send")
+        raise AssertionError("budget")
 
-    monkeypatch.setattr("customer_support_rag.luna_live.network_transport", boom)
-    monkeypatch.setattr("customer_support_rag.luna_live.open_ledger", boom)
-
-
-def _policy(
-    directory: Path, *, name: str = "policy.json", **overrides: object
-) -> LunaPolicy:
-    payload: dict[str, object] = {
-        "version": 1,
-        "model": "gpt-6-luna",
-        "budget_id": "synthetic-budget",
-        "cap_units": 2**59,
-        "input_rate_units": FLOOR_INPUT,
-        "output_rate_units": FLOOR_OUTPUT,
-        "extra_units": 0,
-        "pricing_revision": "gpt-6-luna-standard-2026-11-08-reviewed",
-        "pricing_expires_at": "2099-01-02T03:04:05Z",
-        "enabled_scopes": [SCOPE],
-        "enabled": True,
-    }
-    payload.update(overrides)
-    directory.mkdir(parents=True, exist_ok=True)
-    path = directory / name
-    path.write_text(json.dumps(payload), encoding="utf-8")
-    path.chmod(0o600)
-    return load_policy(path)
+    monkeypatch.setattr("customer_support_rag.budget.open_ledger", boom)
+    monkeypatch.setattr("customer_support_rag.budget.load_policy", boom)
+    monkeypatch.setattr("customer_support_rag.budget.load_runtime", boom)
 
 
-def _ready(root: Path, *, unknown_hash: str | None = None, **overrides: object) -> Path:
-    policy = _policy(root / "runtime", name="cloud-policy.json", **overrides)
-    if unknown_hash is None:
-        unknown_hash = policy.pricing_hash()
+def _key_only(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
     env = root / ".env"
     env.write_text(f'# local\nexport OPENAI_API_KEY="{KEY}"\n', encoding="utf-8")
     env.chmod(0o600)
-    ledger = root / "runtime" / "cloud-budget.sqlite3"
-    init_synthetic_ledger(ledger, policy)
-    root.joinpath("runtime").chmod(0o700)
-    _insert_request(
-        root,
-        id="historical-settled",
-        budget=policy.budget_id,
-        body_hash="1" * 64,
-        owner="historical",
-        scope=SCOPE,
-        state="settled",
-        res_input=20,
-        res_output=OUTPUT_RESERVATION,
-        res_cost=2,
-        used_input=4,
-        used_output=2,
-        used_cost=1,
-        pricing_hash=policy.pricing_hash(),
-        requested_model="gpt-6-luna",
-        created=1.0,
-    )
-    _insert_request(
-        root,
-        id="original-unknown",
-        budget=policy.budget_id,
-        body_hash="2" * 64,
-        owner="historical",
-        scope=SCOPE,
-        state="unknown",
-        res_input=30,
-        res_output=OUTPUT_RESERVATION,
-        res_cost=2,
-        pricing_hash=unknown_hash,
-        requested_model="gpt-6-luna",
-        created=2.0,
-    )
-    _insert_debit(root, "original-unknown", policy, pricing_hash=unknown_hash)
     return root
 
 
-def _insert_request(root: Path, **fields: object) -> None:
-    columns = ", ".join(fields)
-    marks = ", ".join("?" for _ in fields)
-    connection = sqlite3.connect(root / "runtime" / "cloud-budget.sqlite3")
-    try:
-        connection.execute(
-            f"INSERT INTO requests ({columns}) VALUES ({marks})", tuple(fields.values())
-        )
-        connection.commit()
-    finally:
-        connection.close()
+def _offline_ledger(root: Path) -> Path:
+    _key_only(root)
+    payload = {
+        "version": 1,
+        "model": "gpt-6-luna",
+        "budget_id": "synthetic-budget",
+        "cap_units": 20,
+        "input_rate_units": 2,
+        "output_rate_units": 2,
+        "extra_units": 0,
+        "pricing_revision": "gpt-6-luna-standard-2026-11-08-reviewed",
+        "pricing_expires_at": "2099-01-02T03:04:05Z",
+        "enabled_scopes": ["developer_smoke"],
+        "enabled": True,
+    }
+    runtime = root / "runtime"
+    runtime.mkdir()
+    policy = runtime / "cloud-policy.json"
+    policy.write_text(json.dumps(payload), encoding="utf-8")
+    policy.chmod(0o600)
+    init_synthetic_ledger(runtime / "cloud-budget.sqlite3", load_policy(policy))
+    return root
 
 
-def _insert_debit(
-    root: Path, request_id: str, policy: LunaPolicy, *, pricing_hash: str | None = None
-) -> None:
-    row = next(item for item in _states(root) if item["id"] == request_id)
-    connection = sqlite3.connect(root / "runtime" / "cloud-budget.sqlite3")
-    try:
-        connection.execute(
-            "INSERT INTO conservative_debits VALUES "
-            "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-            (
-                row["id"],
-                row["budget"],
-                row["body_hash"],
-                row["pricing_hash"] if pricing_hash is None else pricing_hash,
-                row["res_cost"],
-                row["res_input"],
-                row["res_output"],
-                "a" * 64,
-                "b" * 64,
-                policy.cap_fingerprint(),
-                1.0,
-                "{}",
-            ),
-        )
-        connection.commit()
-    finally:
-        connection.close()
+def _source_id() -> str:
+    request = prepare_hp_a_request(KNOWLEDGE)
+    return request.evidence[0].source_id
 
 
-def _states(root: Path) -> list[sqlite3.Row]:
-    connection = sqlite3.connect(
-        (root / "runtime" / "cloud-budget.sqlite3").absolute().as_uri() + "?mode=ro",
-        uri=True,
+def _envelope(text: str) -> dict[str, object]:
+    return {
+        "id": "resp_fixture",
+        "model": MODEL,
+        "status": "completed",
+        "service_tier": "default",
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "output_text", "text": text}],
+            }
+        ],
+        "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20},
+    }
+
+
+def _source_text(source_id: str) -> str:
+    return json.dumps(
+        {
+            "status": "answer",
+            "answer": ANSWER,
+            "source_ids": [source_id],
+            "reason": None,
+        },
+        ensure_ascii=False,
     )
-    connection.row_factory = sqlite3.Row
-    try:
-        return list(connection.execute("SELECT * FROM requests ORDER BY id"))
-    finally:
-        connection.close()
-
-
-def _debit_ids(root: Path) -> list[str]:
-    connection = sqlite3.connect(
-        (root / "runtime" / "cloud-budget.sqlite3").absolute().as_uri() + "?mode=ro",
-        uri=True,
-    )
-    try:
-        return [
-            row[0]
-            for row in connection.execute(
-                "SELECT id FROM conservative_debits ORDER BY id"
-            )
-        ]
-    finally:
-        connection.close()
-
-
-def _policy_at(root: Path) -> LunaPolicy:
-    return load_policy(root / "runtime" / "cloud-policy.json")
-
-
-def _snapshot(root: Path) -> tuple[bytes, bytes]:
-    return (
-        (root / ".env").read_bytes(),
-        (root / "runtime" / "cloud-budget.sqlite3").read_bytes(),
-    )
-
-
-def _execute(root: Path, sql: str, params: tuple[object, ...]) -> None:
-    connection = sqlite3.connect(root / "runtime" / "cloud-budget.sqlite3")
-    try:
-        connection.execute(sql, params)
-        connection.commit()
-    finally:
-        connection.close()

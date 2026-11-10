@@ -318,7 +318,7 @@ draft = await generate_draft(
 )
 ```
 
-`runtime`、`ledger`、`transport` 都要呼叫者傳入。這個套件不會自己讀 `.env`、開網路，或建立帳務檔。範例的 transport 必須是 HTTP mock；真的付費請求在費用上界核實前會被拒絕。`store=false` 只表示這次請求沒有要求 OpenAI 保存 response，不是零資料保留。請求 JSON 的 `stream` 仍是 false；回應則用 HTTP streaming 讀取，超過 64KiB 就停止並關閉。
+`runtime`、`ledger`、`transport` 都要呼叫者傳入。這個套件不會自己讀 `.env`、開網路，或建立帳務檔。範例的 transport 必須是 HTTP mock；這條離線路徑會預留並在失敗時保留 unknown，live 入口不走這裡。`store=false` 只表示這次請求沒有要求 OpenAI 保存 response，不是零資料保留。請求 JSON 的 `stream` 仍是 false；回應則用 HTTP streaming 讀取，超過 64KiB 就停止並關閉。
 
 `tool_usage` 省略或 null 不是工具費。文件記載的 `web_search` 與 `image_gen` 只有明確的 0 可以結算；非零、未知或壞掉的工具費項保留 unknown，不回草稿。policy 到期會在預留和送出前再查一次。已經送出的用量仍可 settle，不因之後到期而拒絕。`completed` 若同時帶非 null 的 `error` 或 `incomplete_details`，先記可用用量，但不回草稿。
 
@@ -326,17 +326,16 @@ draft = await generate_draft(
 
 `tests/test_luna.py` 與 `tests/test_budget_continuity.py` 用假 HTTP 和臨時的舊格式 ledger 驗這條路徑。通過不代表帳務餘額、模型品質或知識啟用已經核實。
 
-## 安全檢查（尚未 live）
+## Live 入口（尚未呼叫）
 
-`hp_a_check` 讀呼叫者傳入的專案根：`.env` 只取 `OPENAI_API_KEY`，policy 與 ledger 用該根目錄下的 `runtime/cloud-policy.json` 與 `runtime/cloud-budget.sqlite3`。它用真實 reader、chunker 與已發布的 digest 準備「HP-A 耳機可以用水洗嗎？」和原保養 chunk，不重新 embedding，也不開網路、不寫帳本。
+`hp_a_once` 是唯一的真送出入口。它只從呼叫者傳入的專案根讀 `.env` 的 `OPENAI_API_KEY`，用真實 reader、chunker 與已發布的 digest 準備「HP-A 耳機可以用水洗嗎？」和原保養 chunk。不重新 embedding。不讀 policy，不開舊 ledger，也不把費率、token 成本、預留或歷史 unknown 當作准入。`budget.py` 的預留與 unknown 只留在離線 `generate_draft`，不在這條 live 路徑上，也不會刪或改既有帳本。
 
 ```python
 from pathlib import Path
 
-from customer_support_rag.luna_live import hp_a_check
+from customer_support_rag.luna_live import hp_a_once
 
-report = hp_a_check(Path("."))
-report.network_allowed
+result = await hp_a_once(Path("."))
 ```
 
-`network_allowed` 只表示這次唯讀檢查的布林條件都成立。它不是已送出的 Luna 回答，也不能把 mock 草稿改標成 live。1024 是預留給 schema 與 framing 的結構 token 假設，不是官方 tokenizer 公布的常數；本變更沒有呼叫 token counting。真正的一次執行入口是 `hp_a_once`。本節沒有呼叫它。穩定請求 ID 是 `hp-a-luna-natural-answer-one-shot-v1`；那個 ID 已存在時會停，不另換一個 ID。
+本節沒有呼叫它。穩定請求 ID 是 `hp-a-luna-natural-answer-one-shot-v1`。一次呼叫最多一個 POST，不 retry、不 fallback。`max_output_tokens` 只限制這一次的輸出長度。收到 429 立刻停：provider code 屬於額度或 spend 時是 `insufficient_quota`，屬於速率時是 `rate_limit`；認不出的 429 是 `provider_capacity`，不把它當成超額，也不等候後再送。timeout 或其他錯誤同樣停止這一次，不寫 unknown 列去擋住下一次。`hp_a_check` 只報告 key 與 wire bytes，不是送出授權。公開的 `generate_draft` 只接受 mock transport。

@@ -1,9 +1,9 @@
 """Fixed gpt-6-luna adapter. Tests inject a mock transport and a tmp ledger.
 
 Importing this module does not read a key, open a database, or make a network
-call. A caller-built network transport is refused. The one-shot runner may
-pass the factory transport only after its own readiness check. ``store=false``
-does not mean zero data retention.
+call. ``generate_draft`` accepts only a mock transport and is the offline
+ledger path. The one-shot runner is the only live entry. ``store=false`` does
+not mean zero data retention.
 """
 
 from __future__ import annotations
@@ -42,10 +42,8 @@ ORIGIN = "https://api.openai.com"
 RESPONSES_PATH = "/v1/responses"
 MAX_WIRE_BYTES = 16 * 1024
 MAX_INPUT_TOKENS = TOTAL_RESERVATION - OUTPUT_RESERVATION
-# Not a published tokenizer constant. One byte of the serialized body counts as
-# one token, and this allowance is reserved for structural tokens the official
-# token-counting guide says may be absent from that text. The count API is not
-# called. A body that cannot fit under the old 4096 total is refused.
+# Offline ledger reservation candidate only. It is not a live token-cost gate
+# and the count API is not called. The live entry does not consult it.
 WIRE_FUDGE = 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 CONNECT_TIMEOUT_SECONDS = 2.0
@@ -121,13 +119,16 @@ class LunaError(Exception):
 
 
 _FACTORY = object()
-
-
-@dataclass(frozen=True)
-class LiveAdmission:
-    """Permit created only after a readiness check. A runtime flag is not one."""
-
-    _marker: object
+_QUOTA_CODES = frozenset(
+    {
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "organization_usage_limit_exceeded",
+    }
+)
+_RATE_CODES = frozenset({"rate_limit_exceeded", "rate_limit", "slow_down"})
 
 
 @dataclass(frozen=True)
@@ -167,18 +168,17 @@ def network_transport() -> httpx.AsyncHTTPTransport:
     return transport
 
 
-def responses_client(
-    transport: httpx.AsyncBaseTransport,
-    *,
-    admission: LiveAdmission | None = None,
-) -> httpx.AsyncClient:
-    """Build the fixed client around a mock or an admitted factory transport.
+def responses_client(transport: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
+    """Build the fixed client for a mock transport.
 
-    A caller-built network transport is refused. ``pricing_bound_verified`` is
-    not consulted here.
+    A factory or caller-built network transport is refused before any request.
     """
-    if not _transport_permitted(transport, admission):
+    if type(transport) is not httpx.MockTransport:
         raise LunaError("paid_blocked")
+    return _open_client(transport)
+
+
+def _open_client(transport: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url=ORIGIN,
         verify=True,
@@ -238,8 +238,8 @@ def wire_bytes(body: Mapping[str, object]) -> bytes:
 def input_reservation(encoded: bytes) -> int:
     """Reserve one token per serialized byte, plus the structural allowance.
 
-    The allowance is not a published tokenizer bound. A body that cannot fit
-    under the existing 4096 total is refused instead of truncated.
+    The allowance is only the offline candidate above. A body that cannot fit
+    under the historical total is refused instead of truncated.
     """
     if len(encoded) > MAX_WIRE_BYTES:
         raise LunaError("wire_body_exceeded")
@@ -358,15 +358,14 @@ async def generate_draft(
     transport: httpx.AsyncBaseTransport,
     scope: str,
     deadline: float = DEFAULT_DEADLINE_SECONDS,
-    admission: LiveAdmission | None = None,
 ) -> GroundedDraft:
-    """Reserve, send once through the injected transport, then resolve.
+    """Reserve on the offline ledger, send once through a mock, then resolve.
 
     Empty evidence returns the fixed handoff and does not reserve. Failures
     after a durable send keep the reservation. Nothing is retried. A network
-    transport also needs the permit from the one-shot runner.
+    transport is refused before reserve. The live entry does not call this.
     """
-    if not _transport_permitted(transport, admission):
+    if type(transport) is not httpx.MockTransport:
         raise LunaError("paid_blocked")
     if not isinstance(runtime, LunaRuntime) or not isinstance(ledger, Ledger):
         raise LunaError("runtime_unavailable")
@@ -401,7 +400,7 @@ async def generate_draft(
     started = time.monotonic()
     try:
         payload, response_id, request_header = await asyncio.wait_for(
-            _post(encoded, request_id, runtime, transport, admission), deadline
+            _post(encoded, request_id, runtime, transport), deadline
         )
     except TimeoutError:
         ledger.retain_unknown(request_id)
@@ -443,19 +442,6 @@ def _factory_transport(transport: object) -> bool:
         type(transport) is httpx.AsyncHTTPTransport
         and getattr(transport, "_luna_factory", None) is _FACTORY
     )
-
-
-def _transport_permitted(transport: object, admission: LiveAdmission | None) -> bool:
-    if type(transport) is httpx.MockTransport:
-        return True
-    return _factory_transport(transport) and (
-        isinstance(admission, LiveAdmission) and admission._marker is _FACTORY
-    )
-
-
-def permit_live_transport() -> LiveAdmission:
-    """Issue the transport permit. The one-shot runner calls this after checks."""
-    return LiveAdmission(_FACTORY)
 
 
 def _require_request(request: AnswerRequest) -> None:
@@ -565,23 +551,72 @@ async def _post(
     request_id: str,
     runtime: LunaRuntime,
     transport: httpx.AsyncBaseTransport,
-    admission: LiveAdmission | None,
 ) -> tuple[Mapping[str, object], str | None, str | None]:
+    body, status_code, request_header = await _exchange(
+        encoded, request_id, runtime.api_key, transport
+    )
+    if status_code != 200:
+        raise LunaError(_provider_status_code(status_code, body))
+    return _completed_payload(body, runtime.api_key, request_header)
+
+
+async def _post_live_once(
+    encoded: bytes,
+    request: AnswerRequest,
+    *,
+    api_key: str,
+    transport: httpx.AsyncBaseTransport,
+    request_id: str,
+    deadline: float,
+) -> tuple[GroundedDraft | None, Usage | None, str | None]:
+    """Post one live body. This does not reserve or write a ledger."""
+    if not _factory_transport(transport):
+        raise LunaError("paid_blocked")
+    _require_deadline(deadline)
+    try:
+        body, status_code, _request_header = await asyncio.wait_for(
+            _exchange(encoded, request_id, api_key, transport), deadline
+        )
+    except TimeoutError:
+        raise LunaError("logical_timeout") from None
+    if status_code != 200:
+        raise LunaError(_provider_status_code(status_code, body))
+    payload, _response_id, _request_header = _completed_payload(
+        body, api_key, _request_header
+    )
+    return _live_outcome(payload, request)
+
+
+def _require_deadline(deadline: float) -> None:
+    if (
+        type(deadline) not in (int, float)
+        or not math.isfinite(deadline)
+        or deadline <= 0
+    ):
+        raise LunaError("runtime_unavailable")
+
+
+async def _exchange(
+    encoded: bytes,
+    request_id: str,
+    api_key: str,
+    transport: httpx.AsyncBaseTransport,
+) -> tuple[bytes, int, str | None]:
     headers = {
-        "Authorization": f"Bearer {runtime.api_key}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "X-Client-Request-Id": request_id,
     }
     try:
-        async with responses_client(transport, admission=admission) as client:
+        async with _open_client(transport) as client:
             # stream=True bounds the HTTP read. The JSON body still has stream false.
             async with client.stream(
                 "POST", RESPONSES_PATH, content=encoded, headers=headers
             ) as response:
                 body = await _read_bounded(response)
                 status_code = response.status_code
-                request_header = _safe_id(
-                    response.headers.get("x-request-id"), _REQUEST_ID, runtime
+                request_header = _public_id(
+                    response.headers.get("x-request-id"), _REQUEST_ID, api_key
                 )
     except LunaError:
         raise
@@ -589,23 +624,95 @@ async def _post(
         raise LunaError("provider_transport_error") from None
     except httpx.TransportError:
         raise LunaError("provider_transport_error") from None
-    if status_code in (401, 403):
-        raise LunaError("provider_authentication_or_access_unavailable")
-    if status_code == 404:
-        raise LunaError("provider_model_or_endpoint_unavailable")
-    if status_code == 429:
-        raise LunaError("provider_capacity")
-    if status_code != 200:
-        raise LunaError("provider_service_unavailable")
+    return body, status_code, request_header
+
+
+def _completed_payload(
+    body: bytes, api_key: str, request_header: str | None
+) -> tuple[Mapping[str, object], str | None, str | None]:
     try:
         payload = _json_object(body.decode("utf-8"))
     except UnicodeError:
         raise LunaError("invalid_response") from None
     return (
         payload,
-        _safe_id(_text(payload.get("id")), _RESPONSE_ID, runtime),
+        _public_id(_text(payload.get("id")), _RESPONSE_ID, api_key),
         request_header,
     )
+
+
+def _provider_status_code(status_code: int, body: bytes) -> str:
+    if status_code in (401, 403):
+        return "provider_authentication_or_access_unavailable"
+    if status_code == 404:
+        return "provider_model_or_endpoint_unavailable"
+    if status_code == 429:
+        return _limit_code(body)
+    return "provider_service_unavailable"
+
+
+def _limit_code(body: bytes) -> str:
+    """Map a 429 body to a safe code. An unrecognized 429 is not quota."""
+    error = _error_object(body)
+    if error is None:
+        return "provider_capacity"
+    code = error.get("code")
+    kind = error.get("type")
+    if isinstance(code, str) and code in _QUOTA_CODES:
+        return "insufficient_quota"
+    if isinstance(code, str) and code in _RATE_CODES:
+        return "rate_limit"
+    if kind == "insufficient_quota":
+        return "insufficient_quota"
+    if kind == "rate_limit_error":
+        return "rate_limit"
+    return "provider_capacity"
+
+
+def _error_object(body: bytes) -> Mapping[str, object] | None:
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    return error
+
+
+def _live_outcome(
+    payload: Mapping[str, object], request: AnswerRequest
+) -> tuple[GroundedDraft | None, Usage | None, str | None]:
+    if payload.get("model") != MODEL:
+        raise LunaError("unverified_returned_model")
+    if payload.get("service_tier") != "default":
+        raise LunaError("unverified_service_tier")
+    status = payload.get("status")
+    if status not in _TERMINAL:
+        raise LunaError("unknown_response_terminal_state")
+    usage = parse_usage(payload)
+    _reject_unpriced_tool_fee(payload)
+    if _contradicts_terminal(str(status), payload):
+        return None, usage, "contradictory_response"
+    if status != "completed":
+        return None, usage, f"provider_{status}"
+    try:
+        draft = parse_luna_output(payload, request)
+    except LunaError as exc:
+        return None, usage, exc.code
+    return draft, usage, None
+
+
+def _public_id(value: object, pattern: re.Pattern[str], secret: str) -> str | None:
+    if (
+        not isinstance(value, str)
+        or secret in value
+        or pattern.fullmatch(value) is None
+    ):
+        return None
+    return value
 
 
 async def _read_bounded(response: httpx.Response) -> bytes:
@@ -752,18 +859,6 @@ def _retain_quietly(ledger: Ledger, request_id: str) -> None:
         ledger.retain_unknown(request_id)
     except BudgetError:
         return
-
-
-def _safe_id(
-    value: object, pattern: re.Pattern[str], runtime: LunaRuntime
-) -> str | None:
-    if (
-        not isinstance(value, str)
-        or runtime.api_key in value
-        or pattern.fullmatch(value) is None
-    ):
-        return None
-    return value
 
 
 def _text(value: object) -> str | None:
