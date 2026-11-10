@@ -228,7 +228,7 @@ ExactCosineIndex.from_store(
 
 模型看得到的資料是一段 JSON，只有 `prompt_revision`（`grounded-draft-v1`）、`product_id`、`question` 與 `evidence[{source_id, text}]`。固定 policy 放在 request 上，不放進這段 JSON，所以文件或問句裡的 role、URL、HTML 只能是資料。整段 UTF-8 最多 16KiB，超過整批拒絕、不截斷。raw score、offsets、body hash 與本機 hit map 不進 JSON；source id 本身帶有 artifact key 與原 index。這不是 provider 的完整 request body。
 
-`prepare_answer` 是把 evidence 對上本機 hit 的 factory。公開 constructor 與 `model_copy` 仍須讓 evidence 原文、source id、`product_id` 和該 hit 的正文與商品一致。不一致時，建立、複製、`model_data_json`、`resolve_draft` 與空證據 handoff 都整筆拒絕，不改寫 payload，也不回部分 draft。
+`prepare_answer` 是把 evidence 對上本機 hit 的 factory。公開 constructor 與 `model_copy` 仍須讓 evidence 原文、source id、`product_id` 和該 hit 的正文與商品一致，而且同一個 source id 只能出現一次。不一致或重複時，建立、複製、`model_data_json`、`resolve_draft` 與空證據 handoff 都整筆拒絕，不改寫 payload，也不回部分 draft。
 
 `resolve_draft(request, payload)` 收已經解碼的 object。strict Pydantic、`extra=forbid`，不修 JSON、不轉型、不重問生成器。`answer` 要有非空文字、最多 2,000 字元、`reason` 是 null，以及 1 到 4 個不重複的本次 source id。`handoff` 要 `answer` 是 null、`source_ids` 是空的，`reason` 是 `no_evidence`、`conflicting_evidence` 或 `refund_request`。不合契約拋 `DraftValidationError`，沒有部分回答或部分引用。空 hits 用 `handoff_without_evidence`，reason 是 `no_evidence`，不呼叫 fake；若把空 evidence 解成 answer，仍然拒絕。
 

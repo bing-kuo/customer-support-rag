@@ -296,7 +296,7 @@ def _require_one_version(sources: Sequence[ResolvedSource]) -> None:
 
 
 def _request_matches_sources(request: AnswerRequest) -> bool:
-    """Return whether the model evidence is the cited hit for this product.
+    """Return whether each row is that hit and each source id appears once.
 
     Serialization and resolution share this check. It does not approve the
     wording of an answer, and it does not revisit the storage schema.
@@ -310,7 +310,8 @@ def _request_matches_sources(request: AnswerRequest) -> bool:
     for item, source in zip(evidence, sources, strict=True):
         if not _cited_hit_matches(item, source, request.product_id):
             return False
-    return True
+    identities = [item.source_id for item in evidence]
+    return len(set(identities)) == len(identities)
 
 
 def _reject_if_diverged(request: AnswerRequest) -> None:

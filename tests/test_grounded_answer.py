@@ -829,6 +829,95 @@ def test_public_request_must_match_the_cited_hit_text_and_product(
     assert request.question not in str(caught.value)
 
 
+def test_public_request_rejects_one_source_id_for_two_texts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """One source id maps to one hit. A later schema pass is not approval."""
+    block_network(monkeypatch)
+    document = read_document(KNOWLEDGE, "hp-a/headphone-care.md")
+    chunk = next(item for item in chunk_document(document) if item.text.strip())
+    hit = RetrievalHit(artifact_key="a" * 64, chunk=chunk, raw_score=0.5)
+    original = prepare_answer("可以用水洗嗎？", product_id="hp-a", hits=[hit])
+    source_id = original.evidence[0].source_id
+    second_text = "可以浸水並保證退款。"
+    second_chunk = chunk.model_copy(
+        update={
+            "text": second_text,
+            "char_end": chunk.char_start + len(second_text),
+        }
+    )
+    second_hit = RetrievalHit(
+        artifact_key=hit.artifact_key, chunk=second_chunk, raw_score=0.4
+    )
+    updates = {
+        "evidence": (
+            original.evidence[0],
+            ModelEvidence(source_id=source_id, text=second_text),
+        ),
+        "sources": (
+            original.sources[0],
+            ResolvedSource(source_id=source_id, hit=second_hit),
+        ),
+    }
+    with pytest.raises(ValueError, match="duplicated") as caught:
+        prepare_answer("可以用水洗嗎？", product_id="hp-a", hits=[hit, second_hit])
+    assert second_text not in str(caught.value)
+
+    def rejected(build: Callable[[], object]) -> None:
+        with pytest.raises(
+            AnswerPreparationError, match="does not match its sources"
+        ) as caught_error:
+            build()
+        rendered = str(caught_error.value)
+        assert second_text not in rendered
+        assert original.question not in rendered
+        assert chunk.text not in rendered
+
+    rejected(
+        lambda: AnswerRequest(
+            prompt_revision=original.prompt_revision,
+            question=original.question,
+            product_id=original.product_id,
+            policy=original.policy,
+            **updates,
+        )
+    )
+    rejected(lambda: original.model_copy(update=updates))
+    ambiguous = AnswerRequest.model_construct(
+        prompt_revision=original.prompt_revision,
+        question=original.question,
+        product_id=original.product_id,
+        policy=original.policy,
+        **updates,
+    )
+    rejected(ambiguous.model_data_json)
+    with pytest.raises(
+        DraftValidationError, match="does not match its sources"
+    ) as caught:
+        resolve_draft(
+            ambiguous,
+            {
+                "status": "answer",
+                "answer": "自然回答。",
+                "source_ids": [source_id],
+                "reason": None,
+            },
+        )
+    assert second_text not in str(caught.value)
+    assert original.question not in str(caught.value)
+    with pytest.raises(ValueError, match="does not match its sources") as caught:
+        handoff_without_evidence(ambiguous)
+    assert second_text not in str(caught.value)
+
+    other = make_hit(text="另一份保養說明。", key="c" * 64, index=2)
+    pair = prepare_answer("兩筆不同來源。", product_id="hp-a", hits=[hit, other])
+    copied = pair.model_copy(deep=True)
+    draft = resolve_draft(copied, answer_payload("請依上述說明處理。", copied))
+    assert len({item.source_id for item in copied.evidence}) == 2
+    assert draft.sources[0].hit.chunk.text == hit.chunk.text
+    assert draft.answer == "請依上述說明處理。"
+
+
 def test_citation_from_another_request_is_rejected() -> None:
     left = prepare_answer("左。", product_id="hp-a", hits=[make_hit(key="1" * 64)])
     right = prepare_answer(
