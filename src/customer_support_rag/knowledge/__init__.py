@@ -1,5 +1,16 @@
-"""Knowledge document parsing, chunking, local embedding, storage, and ranking."""
+"""Knowledge document parsing, chunking, embedding, ranking, and drafts."""
 
+from customer_support_rag.knowledge.answering import (
+    GROUNDED_POLICY,
+    PROMPT_REVISION,
+    AnswerPreparationError,
+    AnswerRequest,
+    DraftValidationError,
+    GroundedDraft,
+    handoff_without_evidence,
+    prepare_answer,
+    resolve_draft,
+)
 from customer_support_rag.knowledge.chunker import chunk_document
 from customer_support_rag.knowledge.embedding import (
     EMBEDDING_DIMENSIONS,
@@ -38,16 +49,22 @@ from customer_support_rag.knowledge.storage import (
 __all__ = [
     "EMBEDDING_DIMENSIONS",
     "EMBEDDING_MODEL",
+    "GROUNDED_POLICY",
     "MAX_CHUNKS_PER_REQUEST",
     "MAX_EMBED_TEXT_CHARS",
     "OLLAMA_EMBED_URL",
     "OLLAMA_TAGS_URL",
+    "PROMPT_REVISION",
     "QUERY_PROFILE",
     "EmbeddedChunk",
     "EmbeddedQuery",
+    "AnswerPreparationError",
+    "AnswerRequest",
+    "DraftValidationError",
     "EmbeddingError",
     "EmbeddingStore",
     "ExactCosineIndex",
+    "GroundedDraft",
     "KnowledgeChunk",
     "KnowledgeDocument",
     "KnowledgeMetadata",
@@ -59,7 +76,10 @@ __all__ = [
     "StoredEmbeddingDocument",
     "chunk_document",
     "document_embedding_key",
+    "handoff_without_evidence",
     "parse_document",
+    "prepare_answer",
     "query_embedding_input",
     "read_document",
+    "resolve_draft",
 ]

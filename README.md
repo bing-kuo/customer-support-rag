@@ -42,3 +42,5 @@ GitHub Actions 會使用 `uv.lock` 安裝依賴，在 Python 3.12 與 3.13 執�
 目前包含最小 FastAPI app、健康檢查端點，以及以 TOML front matter 標記的少量合成知識文件範例（見 [`knowledge/README.md`](knowledge/README.md)）。文件讀取成功不等於人工審查、核准或啟用於線上 RAG。
 
 本機 embedding 只做同步 adapter：既有 chunk 的原文送到固定的本機 Ollama 位址。呼叫者可以再把一份文件的來源與向量放進自己指定的 SQLite 檔，之後用同一個 key 讀回；store 不會自己呼叫模型。問句向量與離線 exact cosine 也在同一份說明。呼叫方式、HP-A mock 範例與保存格式見 [`knowledge/README.md`](knowledge/README.md)。這個 README 的範例沒有在本變更中對 Ollama 執行。
+
+離線回答草稿把 caller 已經選好的 hits 收成有界 evidence request，再解析一份假的自然回答。固定 policy 與模型看得到的 JSON 資料分開。HP-A mock 串接、來源對照與無證據 handoff 在 [`knowledge/README.md`](knowledge/README.md)。那是 mock 草稿，沒有呼叫 Luna，也還沒有核准啟用。
