@@ -28,4 +28,6 @@ def read_document(root: str | Path, relative_path: str | Path) -> KnowledgeDocum
         raise ValueError("Document path escapes the knowledge root.") from exc
     if not resolved.is_file():
         raise ValueError("Document path must identify a regular file.")
-    return parse_document(resolved.read_text(encoding="utf-8"))
+    with resolved.open("r", encoding="utf-8", newline="") as document_file:
+        text = document_file.read()
+    return parse_document(text)

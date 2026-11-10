@@ -38,6 +38,20 @@ def test_reads_current_synthetic_examples(
     assert document.body.strip()
 
 
+@pytest.mark.parametrize("newline", ["\n", "\r\n", "\r"])
+def test_reader_preserves_body_newlines(tmp_path: Path, newline: str) -> None:
+    source = tmp_path / "document.md"
+    closing_marker = VALID.rfind("\n+++\n") + len("\n+++\n")
+    source_text = VALID[:closing_marker] + VALID[closing_marker:].replace("\n", newline)
+    expected_body = f"{newline}Body.{newline}"
+    with source.open("w", encoding="utf-8", newline="") as source_file:
+        source_file.write(source_text)
+
+    document = read_document(tmp_path, source.name)
+
+    assert document.body == expected_body
+
+
 @pytest.mark.parametrize(
     "text",
     [
