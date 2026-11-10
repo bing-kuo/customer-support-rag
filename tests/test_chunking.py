@@ -9,6 +9,7 @@ from customer_support_rag.knowledge import (
     KnowledgeMetadata,
     chunk_document,
 )
+from customer_support_rag.knowledge import chunker as chunker_module
 
 
 def document(body: str) -> KnowledgeDocument:
@@ -103,6 +104,33 @@ def test_paragraph_detection_does_not_treat_one_crlf_as_a_blank_line() -> None:
 
     assert_exact_partition(body, chunks, 8)
     assert chunks[0].char_end == 7
+
+
+def test_candidate_searches_are_bounded_to_one_chunk_window(monkeypatch) -> None:
+    class TrackingPattern:
+        def __init__(self, pattern) -> None:
+            self.pattern = pattern
+            self.search_spans: list[int] = []
+
+        def finditer(self, text: str, *bounds):
+            if len(bounds) == 2:
+                start, end = bounds
+                self.search_spans.append(end - start)
+            return self.pattern.finditer(text, *bounds)
+
+    newline = TrackingPattern(chunker_module._NEWLINE)
+    paragraph = TrackingPattern(chunker_module._PARAGRAPH_END)
+    monkeypatch.setattr(chunker_module, "_NEWLINE", newline)
+    monkeypatch.setattr(chunker_module, "_PARAGRAPH_END", paragraph)
+    body = "a" * 4096
+
+    chunks = chunker_module.chunk_document(document(body), max_chars=32)
+
+    assert_exact_partition(body, chunks, 32)
+    assert len(chunks) == 128
+    search_spans = newline.search_spans + paragraph.search_spans
+    assert search_spans
+    assert max(search_spans) <= 33
 
 
 @pytest.mark.parametrize(

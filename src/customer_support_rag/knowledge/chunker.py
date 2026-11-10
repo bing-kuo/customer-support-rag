@@ -94,9 +94,10 @@ def _safe_cut(text: str, start: int, end: int) -> int:
 def _candidate_ends(
     pattern: re.Pattern[str], text: str, start: int, limit: int
 ) -> list[int]:
-    """Return complete regex boundaries that fit within the chunk limit."""
+    """Return boundaries within one chunk, with lookahead to keep CRLF intact."""
     ends: list[int] = []
-    for match in pattern.finditer(text, start):
+    search_end = min(limit + 1, len(text))
+    for match in pattern.finditer(text, start, search_end):
         if match.end() > limit:
             break
         ends.append(match.end())
