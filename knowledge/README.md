@@ -318,7 +318,9 @@ draft = await generate_draft(
 )
 ```
 
-`runtime`、`ledger`、`transport` 都要呼叫者傳入。這個套件不會自己讀 `.env`、開網路，或建立帳務檔。範例的 transport 必須是 HTTP mock；真的付費請求在費用上界核實前會被拒絕。`store=false` 只表示這次請求沒有要求 OpenAI 保存 response，不是零資料保留。
+`runtime`、`ledger`、`transport` 都要呼叫者傳入。這個套件不會自己讀 `.env`、開網路，或建立帳務檔。範例的 transport 必須是 HTTP mock；真的付費請求在費用上界核實前會被拒絕。`store=false` 只表示這次請求沒有要求 OpenAI 保存 response，不是零資料保留。請求 JSON 的 `stream` 仍是 false；回應則用 HTTP streaming 讀取，超過 64KiB 就停止並關閉。
+
+`tool_usage` 省略或 null 不是工具費。文件記載的 `web_search` 與 `image_gen` 只有明確的 0 可以結算；非零、未知或壞掉的工具費項保留 unknown，不回草稿。policy 到期會在預留和送出前再查一次。已經送出的用量仍可 settle，不因之後到期而拒絕。`completed` 若同時帶非 null 的 `error` 或 `incomplete_details`，先記可用用量，但不回草稿。
 
 沒有 hits 時不預留、不送 HTTP，直接是 `no_evidence`。保養文件不能支持退款承諾時，草稿應是 `refund_request`，不承諾金額或已處理。若回傳的 id 合法，但內容寫成「可以全額退款，我們已經處理完成。」，schema 仍可能通過，這是語意失敗，不是安全回答。異味或冒煙的案例必須留下停止使用、停止充電、聯絡人工；語意等價可以，不要求逐字相同。
 

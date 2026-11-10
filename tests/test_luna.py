@@ -6,6 +6,7 @@ import asyncio
 import json
 import socket
 import sqlite3
+from datetime import UTC, datetime
 from pathlib import Path
 
 import httpx
@@ -41,6 +42,7 @@ from customer_support_rag.knowledge.retrieval import ExactCosineIndex, Retrieval
 from customer_support_rag.knowledge.storage import EmbeddingStore
 from customer_support_rag.luna import (
     DRAFT_SCHEMA,
+    MAX_RESPONSE_BYTES,
     MODEL,
     LunaError,
     build_luna_body,
@@ -829,6 +831,190 @@ def test_loader_ignores_environment_and_a_neighbor_file(
     assert runtime.api_key == KEY
     assert runtime.pricing_bound_verified is False
     assert neighbor.read_bytes() == b"untouched"
+
+
+class _CountingStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self._chunks = chunks
+        self.pulled = 0
+        self.closed = False
+
+    async def __aiter__(self):
+        for chunk in self._chunks:
+            self.pulled += 1
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+def test_response_read_stops_at_the_byte_limit(tmp_path: Path) -> None:
+    request = _product_request(
+        "hp-a/headphone-care.md", "HP-A 耳機可以用水洗嗎？", "hp-a"
+    )
+    chunks = [b"x" * 1024 for _ in range(128)]
+    open_stream = _CountingStream(chunks)
+    spy = Spy(httpx.Response(200, stream=open_stream))
+    path, caught = run_draft(tmp_path / "open", request, spy, "resp-open")
+    assert isinstance(caught, LunaError)
+    assert caught.code == "unbounded_response"
+    assert open_stream.closed is True
+    assert 0 < open_stream.pulled < 128
+    assert open_stream.pulled * 1024 > MAX_RESPONSE_BYTES
+    assert len(spy.calls) == 1
+    assert json.loads(spy.calls[0].content)["stream"] is False
+    assert states(path)[0]["state"] == "unknown"
+
+    declared = _CountingStream(chunks)
+    limited = Spy(
+        httpx.Response(
+            200,
+            headers={"Content-Length": str(MAX_RESPONSE_BYTES + 1)},
+            stream=declared,
+        )
+    )
+    path, caught = run_draft(tmp_path / "declared", request, limited, "resp-declared")
+    assert isinstance(caught, LunaError)
+    assert caught.code == "unbounded_response"
+    assert declared.pulled == 0
+    assert declared.closed is True
+    assert states(path)[0]["state"] == "unknown"
+
+
+def test_tool_fee_zero_settles_and_unknown_fee_does_not(tmp_path: Path) -> None:
+    request = _product_request(
+        "hp-a/headphone-care.md", "HP-A 耳機可以用水洗嗎？", "hp-a"
+    )
+    text = answer_text(HP_A_ANSWER, request.evidence[0].source_id)
+    zero_image = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "cached_tokens": 0,
+        "input_tokens_details": {"image_tokens": 0, "text_tokens": 0},
+    }
+    for name, extra in (
+        ("web-zero", {"tool_usage": {"web_search": {"num_requests": 0}}}),
+        ("image-zero", {"tool_usage": {"image_gen": zero_image}}),
+        ("null-usage", {"tool_usage": None}),
+    ):
+        spy = Spy(httpx.Response(200, json=envelope(text, extra=extra)))
+        path, draft = run_draft(tmp_path / name, request, spy, f"tool-{name}")
+        assert draft.answer == HP_A_ANSWER
+        assert states(path)[0]["state"] == "settled"
+    for name, extra in (
+        ("web-one", {"tool_usage": {"web_search": {"num_requests": 1}}}),
+        ("other-family", {"tool_usage": {"file_search": {"num_requests": 0}}}),
+        ("bad-count", {"tool_usage": {"web_search": {"num_requests": True}}}),
+        (
+            "unknown-cache",
+            {
+                "tool_usage": {
+                    "image_gen": {
+                        "input_tokens": 0,
+                        "output_tokens": 0,
+                        "total_tokens": 0,
+                        "input_tokens_details": {"image_tokens": 0, "text_tokens": 0},
+                    }
+                }
+            },
+        ),
+    ):
+        spy = Spy(httpx.Response(200, json=envelope(text, extra=extra)))
+        path, caught = run_draft(tmp_path / name, request, spy, f"tool-{name}")
+        assert isinstance(caught, LunaError)
+        assert caught.code == "unknown_billing_component"
+        assert states(path)[0]["state"] == "unknown"
+        assert states(path)[0]["used_cost"] is None
+
+
+def test_completed_error_settles_without_returning_a_draft(tmp_path: Path) -> None:
+    request = _product_request(
+        "hp-a/headphone-care.md", "HP-A 耳機可以用水洗嗎？", "hp-a"
+    )
+    text = answer_text(HP_A_ANSWER, request.evidence[0].source_id)
+    for name, extra in (
+        ("error", {"error": {"code": "server_error", "message": "synthetic"}}),
+        ("details", {"incomplete_details": {"reason": "max_output_tokens"}}),
+    ):
+        spy = Spy(httpx.Response(200, json=envelope(text, extra=extra)))
+        path, caught = run_draft(tmp_path / name, request, spy, f"conflict-{name}")
+        assert isinstance(caught, LunaError)
+        assert caught.code == "contradictory_response"
+        assert "synthetic" not in str(caught)
+        assert states(path)[0]["state"] == "settled"
+        assert states(path)[0]["used_cost"] is not None
+    clear = Spy(
+        httpx.Response(
+            200,
+            json=envelope(text, extra={"error": None, "incomplete_details": None}),
+        )
+    )
+    path, draft = run_draft(tmp_path / "nulls", request, clear, "conflict-null")
+    assert draft.answer == HP_A_ANSWER
+    assert states(path)[0]["state"] == "settled"
+
+
+def test_expiry_before_send_releases_without_http(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    request = _product_request(
+        "hp-a/headphone-care.md", "HP-A 耳機可以用水洗嗎？", "hp-a"
+    )
+    runtime = write_runtime(tmp_path)
+    path, ledger = new_ledger(tmp_path, runtime)
+    spy = Spy(httpx.Response(500))
+    original = ledger.reserve
+
+    def reserve_then_expire(*args: object, **kwargs: object) -> None:
+        original(*args, **kwargs)
+        monkeypatch.setattr(
+            "customer_support_rag.budget._now",
+            lambda: datetime.max.replace(tzinfo=UTC),
+        )
+
+    monkeypatch.setattr(ledger, "reserve", reserve_then_expire)
+    with pytest.raises(BudgetError) as expired:
+        asyncio.run(
+            generate_draft(
+                request,
+                request_id="expire-before-send",
+                runtime=runtime,
+                ledger=ledger,
+                transport=spy.transport,
+                scope=SCOPE,
+                deadline=1,
+            )
+        )
+    assert expired.value.code == "policy_invalid"
+    assert spy.calls == []
+    assert states(path)[0]["state"] == "released"
+
+
+@pytest.mark.parametrize("deadline", [float("inf"), float("nan"), 0, -1])
+def test_deadline_is_rejected_before_reserve(tmp_path: Path, deadline: float) -> None:
+    request = _product_request(
+        "hp-a/headphone-care.md", "HP-A 耳機可以用水洗嗎？", "hp-a"
+    )
+    spy = Spy(httpx.Response(500))
+    runtime = write_runtime(tmp_path)
+    path, _ledger = new_ledger(tmp_path, runtime)
+    before = path.read_bytes()
+    with pytest.raises(LunaError) as rejected:
+        asyncio.run(
+            generate_draft(
+                request,
+                request_id="bad-deadline",
+                runtime=runtime,
+                ledger=_ledger,
+                transport=spy.transport,
+                scope=SCOPE,
+                deadline=deadline,
+            )
+        )
+    assert rejected.value.code == "runtime_unavailable"
+    assert spy.calls == []
+    assert path.read_bytes() == before
 
 
 def _product_request(relative: str, question: str, product: str):

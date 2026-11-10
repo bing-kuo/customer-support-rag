@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import math
 import re
 import time
 from collections.abc import Mapping
@@ -59,6 +60,11 @@ _INPUT_DETAILS = frozenset(
     {"cached_tokens", "cache_write_tokens", "cache_write_tokens_details"}
 )
 _TTL = frozenset({"ttl_30m_tokens", "ttl_12h_tokens"})
+_TOOL_FAMILIES = frozenset({"image_gen", "web_search"})
+_IMAGE_GEN_COUNTS = frozenset(
+    {"input_tokens", "output_tokens", "total_tokens", "cached_tokens"}
+)
+_IMAGE_GEN_OPTIONAL = frozenset({"cached_tokens_details", "output_tokens_details"})
 DRAFT_SCHEMA = {
     "type": "object",
     "additionalProperties": False,
@@ -277,7 +283,11 @@ async def generate_draft(
         raise LunaError("paid_blocked")
     if not isinstance(runtime, LunaRuntime) or not isinstance(ledger, Ledger):
         raise LunaError("runtime_unavailable")
-    if type(deadline) not in (int, float) or not deadline > 0:
+    if (
+        type(deadline) not in (int, float)
+        or not math.isfinite(deadline)
+        or deadline <= 0
+    ):
         raise LunaError("runtime_unavailable")
     if not isinstance(request, AnswerRequest):
         raise LunaError("policy_rejected")
@@ -296,6 +306,7 @@ async def generate_draft(
         runtime.api_key,
     )
     try:
+        ledger.require_admission(runtime.policy)
         ledger.mark_sent(request_id)
     except BudgetError:
         ledger.release(request_id)
@@ -441,26 +452,28 @@ async def _post(
     }
     try:
         async with responses_client(transport) as client:
-            response = await client.post(
-                RESPONSES_PATH, content=encoded, headers=headers
-            )
-            body = await _read_bounded(response)
+            # stream=True bounds the HTTP read. The JSON body still has stream false.
+            async with client.stream(
+                "POST", RESPONSES_PATH, content=encoded, headers=headers
+            ) as response:
+                body = await _read_bounded(response)
+                status_code = response.status_code
+                request_header = _safe_id(
+                    response.headers.get("x-request-id"), _REQUEST_ID, runtime
+                )
     except LunaError:
         raise
     except httpx.TimeoutException:
         raise LunaError("provider_transport_error") from None
     except httpx.TransportError:
         raise LunaError("provider_transport_error") from None
-    request_header = _safe_id(
-        response.headers.get("x-request-id"), _REQUEST_ID, runtime
-    )
-    if response.status_code in (401, 403):
+    if status_code in (401, 403):
         raise LunaError("provider_authentication_or_access_unavailable")
-    if response.status_code == 404:
+    if status_code == 404:
         raise LunaError("provider_model_or_endpoint_unavailable")
-    if response.status_code == 429:
+    if status_code == 429:
         raise LunaError("provider_capacity")
-    if response.status_code != 200:
+    if status_code != 200:
         raise LunaError("provider_service_unavailable")
     try:
         payload = _json_object(body.decode("utf-8"))
@@ -474,6 +487,7 @@ async def _post(
 
 
 async def _read_bounded(response: httpx.Response) -> bytes:
+    """Stop pulling once the body exceeds 64KiB. The caller must not pre-read it."""
     declared = response.headers.get("content-length")
     if declared is not None and (
         not declared.isdigit() or int(declared) > MAX_RESPONSE_BYTES
@@ -487,6 +501,79 @@ async def _read_bounded(response: httpx.Response) -> bytes:
             raise LunaError("unbounded_response")
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+def _reject_unpriced_tool_fee(payload: Mapping[str, object]) -> None:
+    """Accept only omitted, null, or documented zero tool usage.
+
+    ``tool_usage`` is separate from base ``usage``. A zero count is not a new
+    fee. A nonzero, unknown, or badly shaped tool fee keeps the reservation.
+    """
+    if "tool_usage" not in payload or payload["tool_usage"] is None:
+        return
+    raw = payload["tool_usage"]
+    if not isinstance(raw, dict) or set(raw) - _TOOL_FAMILIES:
+        raise LunaError("unknown_billing_component")
+    for name, value in raw.items():
+        if name == "web_search":
+            _zero_web_search(value)
+        else:
+            _zero_image_gen(value)
+
+
+def _exact_zero(value: object) -> None:
+    if type(value) is not int or value != 0:
+        raise LunaError("unknown_billing_component")
+
+
+def _zero_web_search(value: object) -> None:
+    if not isinstance(value, dict) or set(value) != {"num_requests"}:
+        raise LunaError("unknown_billing_component")
+    _exact_zero(value["num_requests"])
+
+
+def _zero_image_gen(value: object) -> None:
+    if not isinstance(value, dict):
+        raise LunaError("unknown_billing_component")
+    required = _IMAGE_GEN_COUNTS | {"input_tokens_details"}
+    if set(value) - (required | _IMAGE_GEN_OPTIONAL) or not required <= set(value):
+        raise LunaError("unknown_billing_component")
+    for key in _IMAGE_GEN_COUNTS:
+        _exact_zero(value[key])
+    details = value["input_tokens_details"]
+    if not isinstance(details, dict) or set(details) != {"image_tokens", "text_tokens"}:
+        raise LunaError("unknown_billing_component")
+    _exact_zero(details["image_tokens"])
+    _exact_zero(details["text_tokens"])
+    cached = value.get("cached_tokens_details")
+    if cached is not None:
+        if not isinstance(cached, dict) or set(cached) != {
+            "cached_image_tokens",
+            "cached_text_tokens",
+        }:
+            raise LunaError("unknown_billing_component")
+        _exact_zero(cached["cached_image_tokens"])
+        _exact_zero(cached["cached_text_tokens"])
+    outgoing = value.get("output_tokens_details")
+    if outgoing is not None:
+        if not isinstance(outgoing, dict) or set(outgoing) != {
+            "image_tokens",
+            "text_tokens",
+        }:
+            raise LunaError("unknown_billing_component")
+        _exact_zero(outgoing["image_tokens"])
+        _exact_zero(outgoing["text_tokens"])
+
+
+def _contradicts_terminal(status: str, payload: Mapping[str, object]) -> bool:
+    """Reject a completed body that also carries an error or incomplete details."""
+    error = payload.get("error", None)
+    details = payload.get("incomplete_details", None)
+    if status == "completed":
+        return error is not None or details is not None
+    if error is not None and status not in {"failed", "cancelled"}:
+        return True
+    return details is not None and status != "incomplete"
 
 
 def _account(
@@ -511,6 +598,7 @@ def _account(
         raise LunaError("unknown_response_terminal_state")
     try:
         usage = parse_usage(payload)
+        _reject_unpriced_tool_fee(payload)
     except LunaError:
         ledger.retain_unknown(request_id)
         raise
@@ -530,6 +618,8 @@ def _account(
     except BudgetError:
         _retain_quietly(ledger, request_id)
         raise
+    if _contradicts_terminal(status, payload):
+        raise LunaError("contradictory_response")
     if status != "completed":
         raise LunaError(f"provider_{status}")
     return parse_luna_output(payload, request)

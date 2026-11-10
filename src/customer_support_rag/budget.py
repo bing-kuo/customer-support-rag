@@ -283,7 +283,7 @@ def load_policy(path: Path) -> LunaPolicy:
     ):
         raise BudgetError("policy_invalid")
     expires = _aware(raw["pricing_expires_at"])
-    if datetime.now(UTC) >= expires:
+    if _now() >= expires:
         raise BudgetError("policy_invalid")
     return LunaPolicy(
         budget_id=budget_id,
@@ -380,13 +380,7 @@ class Ledger:
         )
         cost = policy.reservation_cost(input_tokens, output_tokens)
         with self._transaction() as db:
-            guard = db.execute(
-                "SELECT cap_fingerprint FROM policy_guard WHERE singleton=1"
-            ).fetchone()
-            if guard is None:
-                raise BudgetError("cap_binding_missing")
-            if guard[0] != policy.cap_fingerprint():
-                raise BudgetError("cap_change_requires_authorization")
+            self._require_current_binding(db, policy)
             old = db.execute(
                 "SELECT body_hash, state FROM requests WHERE id=?", (request_id,)
             ).fetchone()
@@ -403,17 +397,6 @@ class Ledger:
                 (self.owner,),
             ).fetchone():
                 raise BudgetError("unreconciled_or_foreign_reservation")
-            if db.execute(
-                "SELECT 1 FROM budgets WHERE id!=?", (policy.budget_id,)
-            ).fetchone():
-                raise BudgetError("budget_identity_change_requires_reconciliation")
-            binding = db.execute(
-                "SELECT binding FROM budgets WHERE id=?", (policy.budget_id,)
-            ).fetchone()
-            if binding is None:
-                raise BudgetError("budget_binding_missing")
-            if binding[0] != policy.binding():
-                raise BudgetError("budget_configuration_changed")
             used = db.execute(
                 "SELECT count(*), "
                 "coalesce(sum(coalesce(used_input, res_input)), 0), "
@@ -459,6 +442,37 @@ class Ledger:
                 ),
             )
             _event(db, request_id, "reserved")
+
+    def require_admission(self, policy: LunaPolicy) -> None:
+        """Recheck the current clock and the original binding without reserving."""
+        if not isinstance(policy, LunaPolicy):
+            raise BudgetError("budget_unavailable")
+        with self._transaction() as db:
+            self._require_current_binding(db, policy)
+
+    def _require_current_binding(
+        self, db: sqlite3.Connection, policy: LunaPolicy
+    ) -> None:
+        if _now() >= policy.pricing_expires_at:
+            raise BudgetError("policy_invalid")
+        guard = db.execute(
+            "SELECT cap_fingerprint FROM policy_guard WHERE singleton=1"
+        ).fetchone()
+        if guard is None:
+            raise BudgetError("cap_binding_missing")
+        if guard[0] != policy.cap_fingerprint():
+            raise BudgetError("cap_change_requires_authorization")
+        if db.execute(
+            "SELECT 1 FROM budgets WHERE id!=?", (policy.budget_id,)
+        ).fetchone():
+            raise BudgetError("budget_identity_change_requires_reconciliation")
+        binding = db.execute(
+            "SELECT binding FROM budgets WHERE id=?", (policy.budget_id,)
+        ).fetchone()
+        if binding is None:
+            raise BudgetError("budget_binding_missing")
+        if binding[0] != policy.binding():
+            raise BudgetError("budget_configuration_changed")
 
     def mark_sent(self, request_id: str) -> None:
         """Durably mark one owned reservation sent, before any transport call."""
@@ -611,6 +625,11 @@ class Ledger:
             or input_tokens + output_tokens > TOTAL_RESERVATION
         ):
             raise BudgetError("budget_unavailable")
+
+
+def _now() -> datetime:
+    """Admission clock. Tests may replace it. It does not read a ledger."""
+    return datetime.now(UTC)
 
 
 def _event(connection: sqlite3.Connection, request_id: str, name: str) -> None:

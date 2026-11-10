@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import threading
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -418,3 +419,51 @@ def test_unsent_release_drops_the_reservation(tmp_path: Path) -> None:
     assert {row["id"]: row["state"] for row in request_rows(path)}[
         "twice"
     ] == "reserved"
+
+
+def test_expiry_blocks_a_new_reservation_but_not_settle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    policy = policy_at(tmp_path, cap_units=10**9)
+    path = tmp_path / "ledger.sqlite"
+    init_synthetic_ledger(path, policy)
+    ledger = open_ledger(path)
+    ledger.reserve(
+        policy,
+        "sent-before-expiry",
+        "a" * 64,
+        100,
+        OUTPUT_RESERVATION,
+        "developer_smoke",
+        KEY,
+    )
+    ledger.mark_sent("sent-before-expiry")
+    monkeypatch.setattr(
+        "customer_support_rag.budget._now",
+        lambda: datetime(2100, 1, 1, tzinfo=UTC),
+    )
+    ledger.settle(
+        policy,
+        "sent-before-expiry",
+        input_tokens=4,
+        output_tokens=4,
+        cached_tokens=None,
+        reasoning_tokens=None,
+        returned_model="gpt-6-luna",
+        provider_request_id=None,
+        provider_response_id=None,
+        latency_seconds=0.0,
+    )
+    assert request_rows(path)[0]["state"] == "settled"
+    with pytest.raises(BudgetError) as expired:
+        ledger.reserve(
+            policy,
+            "after-expiry",
+            "b" * 64,
+            100,
+            OUTPUT_RESERVATION,
+            "developer_smoke",
+            KEY,
+        )
+    assert expired.value.code == "policy_invalid"
+    assert [row["id"] for row in request_rows(path)] == ["sent-before-expiry"]
