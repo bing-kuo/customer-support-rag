@@ -122,16 +122,6 @@ def block_network(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(socket, "create_connection", blocked)
 
 
-class ReadStore:
-    def __init__(self, store: EmbeddingStore) -> None:
-        self.store = store
-        self.keys: list[str] = []
-
-    def get_document(self, key: str):
-        self.keys.append(key)
-        return self.store.get_document(key)
-
-
 def saved_rows(path: Path) -> list[tuple[str, str]]:
     connection = sqlite3.connect(path)
     try:
@@ -399,6 +389,7 @@ def test_reopened_store_ranks_hp_a_and_filters_hp_b(
 ) -> None:
     hp_a = read_document(KNOWLEDGE, "hp-a/headphone-care.md")
     hp_b = read_document(KNOWLEDGE, "hp-b/connection-troubleshooting.md")
+    hidden = document("# Hidden\n\nsecret-marker\n", document_id="hidden")
     path = tmp_path / "UNIQUE_PATH_MARKER.sqlite"
     with EmbeddingStore(path) as store:
         assert (
@@ -413,6 +404,9 @@ def test_reopened_store_ranks_hp_a_and_filters_hp_b(
             )
             == HP_B_ARTIFACT
         )
+        hidden_key = store.put_document(
+            hidden, embed_eligible(hidden, {0: axis(0, 9.0)}), model_digest=DIGEST
+        )
     before = path.read_bytes()
     block_network(monkeypatch)
     requests: list[httpx.Request] = []
@@ -425,23 +419,22 @@ def test_reopened_store_ranks_hp_a_and_filters_hp_b(
         return embed(axis(0, 1.0))
 
     with EmbeddingStore(path) as store:
-        reader = ReadStore(store)
         index = ExactCosineIndex.from_store(
-            reader,
+            store,
             artifact_keys=(HP_B_ARTIFACT, HP_A_ARTIFACT),
             expected_model_digest=DIGEST,
         )
-        assert reader.keys == [HP_B_ARTIFACT, HP_A_ARTIFACT]
-        loaded = len(reader.keys)
-        with OllamaEmbeddingAdapter(httpx.MockTransport(handler)) as adapter:
-            query = adapter.embed_query(QUESTION, expected_model_digest=DIGEST)
-        hits = index.search(query, product_id="hp-a")
-        again = index.search(query, product_id="hp-a", top_k=5)
-        other = index.search(query, product_id="hp-b", top_k=1)
-        assert len(reader.keys) == loaded
+    with OllamaEmbeddingAdapter(httpx.MockTransport(handler)) as adapter:
+        query = adapter.embed_query(QUESTION, expected_model_digest=DIGEST)
+    hits = index.search(query, product_id="hp-a")
+    again = index.search(query, product_id="hp-a", top_k=5)
+    other = index.search(query, product_id="hp-b", top_k=1)
+    with EmbeddingStore(path) as store:
         stored = store.get_document(HP_A_ARTIFACT)
         assert stored is not None
         assert stored.embedded_chunks[0].vector[0] == 2.0
+    assert hidden_key not in [item.artifact_key for item in hits]
+    assert all("secret-marker" not in item.chunk.text for item in hits)
 
     assert path.read_bytes() == before
     assert [request.url.path for request in requests] == [
@@ -592,17 +585,23 @@ def test_empty_product_returns_no_hits_and_keeps_negative_scores(
         [f"{index:064x}" for index in range(1001)],
     ],
 )
-def test_invalid_keys_do_not_read_the_store(keys: object) -> None:
-    class Boom:
-        def get_document(self, key: str) -> None:
-            raise AssertionError(key)
-
+def test_invalid_keys_do_not_read_the_store(tmp_path: Path, keys: object) -> None:
+    path = tmp_path / "invalid-keys.sqlite"
+    source = document("# A\n\naa\n", document_id="kept")
+    with EmbeddingStore(path) as store:
+        store.put_document(
+            source, embed_eligible(source, {0: axis(0, 1.0)}), model_digest=DIGEST
+        )
+    before = saved_rows(path)
+    closed = EmbeddingStore(path)
+    closed.close()
     with pytest.raises(ValueError):
         ExactCosineIndex.from_store(
-            Boom(),
-            artifact_keys=keys,
-            expected_model_digest=DIGEST,  # type: ignore[arg-type]
+            closed,
+            artifact_keys=keys,  # type: ignore[arg-type]
+            expected_model_digest=DIGEST,
         )
+    assert saved_rows(path) == before
 
 
 def test_missing_or_incompatible_documents_fail_without_partial_hits(
@@ -639,42 +638,63 @@ def test_missing_or_incompatible_documents_fail_without_partial_hits(
     assert DIGEST not in str(incompatible.value)
 
 
-@pytest.mark.parametrize(
-    "update",
-    [
-        {"input_profile": "other"},
-        {"chunking_profile": "other"},
-        {"embedding_model": "other"},
-        {"dimensions": 512},
-        {"model_digest": "c" * 64},
-    ],
-)
-def test_changed_encoder_settings_reject_the_whole_index(
-    tmp_path: Path, update: dict[str, object]
+def test_missing_key_fails_before_query_embedding(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    source = document("# A\n\naa\n", document_id="profile")
-    path = tmp_path / "profile.sqlite"
+    block_network(monkeypatch)
+    source = document("# A\n\nUNIQUE_BODY_MARKER\n", document_id="present")
+    path = tmp_path / "missing-before-embed.sqlite"
     with EmbeddingStore(path) as store:
         key = store.put_document(
             source, embed_eligible(source, {0: axis(0, 1.0)}), model_digest=DIGEST
         )
-
-    class Changed:
-        def __init__(self, inner: EmbeddingStore) -> None:
-            self.inner = inner
-
-        def get_document(self, artifact_key: str):
-            loaded = self.inner.get_document(artifact_key)
-            assert loaded is not None
-            return loaded.model_copy(update=update)
-
+    before = path.read_bytes()
     with EmbeddingStore(path) as store:
-        with pytest.raises(RetrievalError, match="not compatible"):
+        with pytest.raises(
+            RetrievalError, match="Required embedding document is missing"
+        ):
             ExactCosineIndex.from_store(
-                Changed(store),
-                artifact_keys=[key],
+                store,
+                artifact_keys=(key, "d" * 64),
                 expected_model_digest=DIGEST,
             )
+    assert path.read_bytes() == before
+
+
+def test_different_legal_max_chars_stay_in_one_index(tmp_path: Path) -> None:
+    short = document("aa", document_id="short")
+    wide = document("# B\n\nbb\n", document_id="wide-limit")
+    path = tmp_path / "max-chars.sqlite"
+    with EmbeddingStore(path) as store:
+        short_key = store.put_document(
+            short,
+            embed_eligible(short, {0: axis(0, 2.0)}, max_chars=2),
+            model_digest=DIGEST,
+            max_chars=2,
+        )
+        wide_key = store.put_document(
+            wide, embed_eligible(wide, {0: axis(0, 2.0)}), model_digest=DIGEST
+        )
+        loaded_short = store.get_document(short_key)
+        loaded_wide = store.get_document(wide_key)
+        assert loaded_short is not None and loaded_wide is not None
+        assert loaded_short.max_chars == 2
+        assert loaded_wide.max_chars == 1200
+        index = ExactCosineIndex.from_store(
+            store,
+            artifact_keys=(wide_key, short_key),
+            expected_model_digest=DIGEST,
+        )
+    query = EmbeddedQuery(
+        vector=axis(0, 1.0),
+        model=EMBEDDING_MODEL,
+        model_digest=DIGEST,
+        dimensions=EMBEDDING_DIMENSIONS,
+        query_profile=QUERY_PROFILE,
+    )
+    hits = index.search(query, product_id="hp-a", top_k=5)
+    assert [hit.artifact_key for hit in hits] == sorted([short_key, wide_key])
+    assert all(hit.raw_score == 1.0 for hit in hits)
 
 
 def test_corrupt_payload_stays_a_storage_error(tmp_path: Path) -> None:

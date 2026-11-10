@@ -23,13 +23,13 @@ from customer_support_rag.knowledge.models import KnowledgeChunk
 from customer_support_rag.knowledge.storage import (
     CHUNKING_PROFILE,
     INPUT_PROFILE,
+    EmbeddingStore,
     StoredEmbeddingDocument,
 )
 
 _MAX_KEYS = 1000
 _MAX_ELIGIBLE_CHUNKS = 1000
 _MAX_TOP_K = 10
-_MAX_STORED_CHARS = 1200
 _PRODUCTS = frozenset({"hp-a", "hp-b"})
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -72,7 +72,7 @@ class ExactCosineIndex:
     @classmethod
     def from_store(
         cls,
-        store: object,
+        store: EmbeddingStore,
         *,
         artifact_keys: Sequence[str],
         expected_model_digest: str,
@@ -80,18 +80,11 @@ class ExactCosineIndex:
         """Load the named documents and prepare normalized vector copies."""
         keys = _require_keys(artifact_keys)
         digest = _require_digest(expected_model_digest)
-        getter = getattr(store, "get_document", None)
-        if not callable(getter):
-            raise TypeError("store must provide get_document")
         documents: list[StoredEmbeddingDocument] = []
         for key in keys:
-            loaded = getter(key)
+            loaded = store.get_document(key)
             if loaded is None:
                 raise RetrievalError("Required embedding document is missing.")
-            if not isinstance(loaded, StoredEmbeddingDocument):
-                raise RetrievalError(
-                    "Embedding document is not compatible with this index."
-                )
             _require_compatible(loaded, digest)
             documents.append(loaded)
         rows, vectors = _eligible(documents)
@@ -189,9 +182,6 @@ def _require_compatible(document: StoredEmbeddingDocument, digest: str) -> None:
         or document.dimensions != EMBEDDING_DIMENSIONS
         or document.input_profile != INPUT_PROFILE
         or document.chunking_profile != CHUNKING_PROFILE
-        or isinstance(document.max_chars, bool)
-        or not isinstance(document.max_chars, int)
-        or not 2 <= document.max_chars <= _MAX_STORED_CHARS
     ):
         raise RetrievalError("Embedding document is not compatible with this index.")
 
