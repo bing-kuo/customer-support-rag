@@ -1,8 +1,9 @@
 """Fixed gpt-6-luna adapter. Tests inject a mock transport and a tmp ledger.
 
 Importing this module does not read a key, open a database, or make a network
-call. A real transport is refused: the same-day fee ceiling is not verified.
-``store=false`` does not mean zero data retention.
+call. A caller-built network transport is refused. The one-shot runner may
+pass the factory transport only after its own readiness check. ``store=false``
+does not mean zero data retention.
 """
 
 from __future__ import annotations
@@ -40,7 +41,12 @@ MODEL = "gpt-6-luna"
 ORIGIN = "https://api.openai.com"
 RESPONSES_PATH = "/v1/responses"
 MAX_WIRE_BYTES = 16 * 1024
-WIRE_FUDGE = 256
+MAX_INPUT_TOKENS = TOTAL_RESERVATION - OUTPUT_RESERVATION
+# Not a published tokenizer constant. One byte of the serialized body counts as
+# one token, and this allowance is reserved for structural tokens the official
+# token-counting guide says may be absent from that text. The count API is not
+# called. A body that cannot fit under the old 4096 total is refused.
+WIRE_FUDGE = 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 CONNECT_TIMEOUT_SECONDS = 2.0
 DEFAULT_DEADLINE_SECONDS = 60.0
@@ -94,11 +100,15 @@ __all__ = [
     "MODEL",
     "LunaError",
     "Usage",
+    "WireParts",
     "build_luna_body",
     "generate_draft",
+    "network_transport",
     "parse_luna_output",
     "parse_usage",
     "responses_client",
+    "wire_composition",
+    "wire_bytes",
 ]
 
 
@@ -108,6 +118,29 @@ class LunaError(Exception):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+_FACTORY = object()
+
+
+@dataclass(frozen=True)
+class LiveAdmission:
+    """Permit created only after a readiness check. A runtime flag is not one."""
+
+    _marker: object
+
+
+@dataclass(frozen=True)
+class WireParts:
+    """Byte lengths of one serialized body. Lengths are not token certificates."""
+
+    policy_bytes: int
+    data_bytes: int
+    schema_bytes: int
+    framing_bytes: int
+    total_bytes: int
+    reserved_input_tokens: int
+    ceiling_headroom_tokens: int
 
 
 @dataclass(frozen=True)
@@ -124,13 +157,27 @@ class Usage:
     reasoning_tokens: int | None
 
 
-def responses_client(transport: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
-    """Build the fixed client around an injected transport.
+def network_transport() -> httpx.AsyncHTTPTransport:
+    """Build the one TLS transport. Tests may replace this; callers do not."""
+    transport = httpx.AsyncHTTPTransport(verify=True, trust_env=False, retries=0)
+    pool = transport._pool
+    if pool._retries != 0 or type(pool).__name__ != "AsyncConnectionPool":
+        raise LunaError("provider_transport_error")
+    transport._luna_factory = _FACTORY
+    return transport
 
-    Only ``httpx.MockTransport`` is accepted. A network transport stays blocked
-    until a later dispatch verifies the fee ceiling.
+
+def responses_client(
+    transport: httpx.AsyncBaseTransport,
+    *,
+    admission: LiveAdmission | None = None,
+) -> httpx.AsyncClient:
+    """Build the fixed client around a mock or an admitted factory transport.
+
+    A caller-built network transport is refused. ``pricing_bound_verified`` is
+    not consulted here.
     """
-    if not isinstance(transport, httpx.MockTransport):
+    if not _transport_permitted(transport, admission):
         raise LunaError("paid_blocked")
     return httpx.AsyncClient(
         base_url=ORIGIN,
@@ -189,17 +236,55 @@ def wire_bytes(body: Mapping[str, object]) -> bytes:
 
 
 def input_reservation(encoded: bytes) -> int:
-    """Return the offline byte candidate, or refuse a body past the old cap.
+    """Reserve one token per serialized byte, plus the structural allowance.
 
-    ``len(body) + 256`` is not a proven provider token count. A body that
-    cannot fit under the existing 4096 total is refused instead of truncated.
+    The allowance is not a published tokenizer bound. A body that cannot fit
+    under the existing 4096 total is refused instead of truncated.
     """
     if len(encoded) > MAX_WIRE_BYTES:
         raise LunaError("wire_body_exceeded")
     candidate = len(encoded) + WIRE_FUDGE
-    if candidate + OUTPUT_RESERVATION > TOTAL_RESERVATION:
+    if candidate > MAX_INPUT_TOKENS:
         raise LunaError("input_bound_exceeded")
     return candidate
+
+
+def wire_composition(request: AnswerRequest) -> WireParts:
+    """Split one body into policy, model data, schema, and framing.
+
+    ``data_bytes`` is the model-visible JSON before it is placed in a JSON
+    string. ``framing_bytes`` is the rest of the wire, including object syntax
+    and the extra bytes that string escaping adds. The token reservation uses
+    the whole wire plus the structural allowance, not the visible pieces alone.
+    """
+    _require_request(request)
+    encoded = wire_bytes(build_luna_body(request))
+    policy = GROUNDED_POLICY.encode()
+    data = request.model_data_json().encode()
+    schema = json.dumps(
+        DRAFT_SCHEMA,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    escaped = json.dumps(request.model_data_json(), ensure_ascii=False).encode()
+    spans = (_span(encoded, policy), _span(encoded, schema), _span(encoded, escaped))
+    if len(escaped) < len(data) + 2 or _overlaps(spans):
+        raise LunaError("wire_composition_invalid")
+    framing = len(encoded) - (len(policy) + len(data) + len(schema))
+    if framing < 0:
+        raise LunaError("wire_composition_invalid")
+    reserved = input_reservation(encoded)
+    return WireParts(
+        policy_bytes=len(policy),
+        data_bytes=len(data),
+        schema_bytes=len(schema),
+        framing_bytes=framing,
+        total_bytes=len(encoded),
+        reserved_input_tokens=reserved,
+        ceiling_headroom_tokens=MAX_INPUT_TOKENS - reserved,
+    )
 
 
 def parse_usage(raw: Mapping[str, object]) -> Usage:
@@ -273,13 +358,15 @@ async def generate_draft(
     transport: httpx.AsyncBaseTransport,
     scope: str,
     deadline: float = DEFAULT_DEADLINE_SECONDS,
+    admission: LiveAdmission | None = None,
 ) -> GroundedDraft:
     """Reserve, send once through the injected transport, then resolve.
 
     Empty evidence returns the fixed handoff and does not reserve. Failures
-    after a durable send keep the reservation. Nothing is retried.
+    after a durable send keep the reservation. Nothing is retried. A network
+    transport also needs the permit from the one-shot runner.
     """
-    if not isinstance(transport, httpx.MockTransport):
+    if not _transport_permitted(transport, admission):
         raise LunaError("paid_blocked")
     if not isinstance(runtime, LunaRuntime) or not isinstance(ledger, Ledger):
         raise LunaError("runtime_unavailable")
@@ -314,7 +401,7 @@ async def generate_draft(
     started = time.monotonic()
     try:
         payload, response_id, request_header = await asyncio.wait_for(
-            _post(encoded, request_id, runtime, transport), deadline
+            _post(encoded, request_id, runtime, transport, admission), deadline
         )
     except TimeoutError:
         ledger.retain_unknown(request_id)
@@ -335,6 +422,40 @@ async def generate_draft(
         request_header,
         time.monotonic() - started,
     )
+
+
+def _span(haystack: bytes, needle: bytes) -> tuple[int, int]:
+    start = haystack.find(needle)
+    if start < 0 or haystack.find(needle, start + 1) != -1:
+        raise LunaError("wire_composition_invalid")
+    return start, start + len(needle)
+
+
+def _overlaps(spans: tuple[tuple[int, int], ...]) -> bool:
+    ordered = sorted(spans)
+    return any(
+        left[1] > right[0] for left, right in zip(ordered, ordered[1:], strict=False)
+    )
+
+
+def _factory_transport(transport: object) -> bool:
+    return (
+        type(transport) is httpx.AsyncHTTPTransport
+        and getattr(transport, "_luna_factory", None) is _FACTORY
+    )
+
+
+def _transport_permitted(transport: object, admission: LiveAdmission | None) -> bool:
+    if type(transport) is httpx.MockTransport:
+        return True
+    return _factory_transport(transport) and (
+        isinstance(admission, LiveAdmission) and admission._marker is _FACTORY
+    )
+
+
+def permit_live_transport() -> LiveAdmission:
+    """Issue the transport permit. The one-shot runner calls this after checks."""
+    return LiveAdmission(_FACTORY)
 
 
 def _require_request(request: AnswerRequest) -> None:
@@ -444,6 +565,7 @@ async def _post(
     request_id: str,
     runtime: LunaRuntime,
     transport: httpx.AsyncBaseTransport,
+    admission: LiveAdmission | None,
 ) -> tuple[Mapping[str, object], str | None, str | None]:
     headers = {
         "Authorization": f"Bearer {runtime.api_key}",
@@ -451,7 +573,7 @@ async def _post(
         "X-Client-Request-Id": request_id,
     }
     try:
-        async with responses_client(transport) as client:
+        async with responses_client(transport, admission=admission) as client:
             # stream=True bounds the HTTP read. The JSON body still has stream false.
             async with client.stream(
                 "POST", RESPONSES_PATH, content=encoded, headers=headers

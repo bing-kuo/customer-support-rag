@@ -325,3 +325,18 @@ draft = await generate_draft(
 沒有 hits 時不預留、不送 HTTP，直接是 `no_evidence`。保養文件不能支持退款承諾時，草稿應是 `refund_request`，不承諾金額或已處理。若回傳的 id 合法，但內容寫成「可以全額退款，我們已經處理完成。」，schema 仍可能通過，這是語意失敗，不是安全回答。異味或冒煙的案例必須留下停止使用、停止充電、聯絡人工；語意等價可以，不要求逐字相同。
 
 `tests/test_luna.py` 與 `tests/test_budget_continuity.py` 用假 HTTP 和臨時的舊格式 ledger 驗這條路徑。通過不代表帳務餘額、模型品質或知識啟用已經核實。
+
+## 安全檢查（尚未 live）
+
+`hp_a_check` 讀呼叫者傳入的專案根：`.env` 只取 `OPENAI_API_KEY`，policy 與 ledger 用該根目錄下的 `runtime/cloud-policy.json` 與 `runtime/cloud-budget.sqlite3`。它用真實 reader、chunker 與已發布的 digest 準備「HP-A 耳機可以用水洗嗎？」和原保養 chunk，不重新 embedding，也不開網路、不寫帳本。
+
+```python
+from pathlib import Path
+
+from customer_support_rag.luna_live import hp_a_check
+
+report = hp_a_check(Path("."))
+report.network_allowed
+```
+
+`network_allowed` 只表示這次唯讀檢查的布林條件都成立。它不是已送出的 Luna 回答，也不能把 mock 草稿改標成 live。1024 是預留給 schema 與 framing 的結構 token 假設，不是官方 tokenizer 公布的常數；本變更沒有呼叫 token counting。真正的一次執行入口是 `hp_a_once`。本節沒有呼叫它。穩定請求 ID 是 `hp-a-luna-natural-answer-one-shot-v1`；那個 ID 已存在時會停，不另換一個 ID。
