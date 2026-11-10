@@ -1,0 +1,7 @@
+This project's own code is MIT licensed. Third-party dependencies keep their own licenses.
+
+NumPy 2.3.5 is a runtime dependency used for exact float64 cosine ranking. NumPy
+is Copyright (c) 2005-2025, NumPy Developers, and is distributed under the
+BSD 3-Clause License. This project's MIT license does not relicense NumPy.
+NumPy's distribution may include additional third-party notices; those notices
+stay with NumPy.
