@@ -292,3 +292,36 @@ handoff = handoff_without_evidence(empty)
 ```
 
 `hits` 必須是上面那個 search 的結果，而且 `top_k=4`。`draft.sources` 帶回原 index 1、offsets `[1, 71)` 的 `RetrievalHit`。`tests/test_grounded_answer.py` 用真實 reader、chunker、臨時 SQLite 與 mock 向量核對這一次串接；fake 是測試裡的固定 payload。本節沒有呼叫 Ollama、OpenAI 或 Luna。
+
+## Luna mock：同一題的 HTTP 草稿
+
+下一個例子仍是「HP-A 耳機可以用水洗嗎？」。來源原文、模型看得到的資料、mock 自然草稿是三件不同的東西。
+
+| 項目 | 內容 |
+| --- | --- |
+| 來源原文 | 上一節那筆 index 1、`[1, 71)` 的保養 chunk |
+| 送給模型的資料 | 問題、商品、這次的 source id 與完整原文，加上固定 policy 與 strict schema |
+| mock 自然草稿 | `請用乾燥的軟布擦拭，耳機不可泡水，也別用溶劑清潔。` |
+
+草稿保留乾布、不可泡水、不用溶劑。它不是把 chunk 貼回來，也不是 Luna 的實測輸出。本機再用原本的 hit 把 source id 解回 index、offsets 與原文。模型不回版本或 offsets。
+
+```python
+from customer_support_rag.luna import generate_draft
+
+draft = await generate_draft(
+    request,
+    request_id="hp-a-wash",
+    runtime=runtime,
+    ledger=ledger,
+    transport=mock_transport,
+    scope="developer_smoke",
+)
+```
+
+`runtime`、`ledger`、`transport` 都要呼叫者傳入。這個套件不會自己讀 `.env`、開網路，或建立帳務檔。範例的 transport 必須是 HTTP mock；真的付費請求在費用上界核實前會被拒絕。`store=false` 只表示這次請求沒有要求 OpenAI 保存 response，不是零資料保留。請求 JSON 的 `stream` 仍是 false；回應則用 HTTP streaming 讀取，超過 64KiB 就停止並關閉。
+
+`tool_usage` 省略或 null 不是工具費。文件記載的 `web_search` 與 `image_gen` 只有明確的 0 可以結算；非零、未知或壞掉的工具費項保留 unknown，不回草稿。policy 到期會在預留和送出前再查一次。已經送出的用量仍可 settle，不因之後到期而拒絕。`completed` 若同時帶非 null 的 `error` 或 `incomplete_details`，先記可用用量，但不回草稿。
+
+沒有 hits 時不預留、不送 HTTP，直接是 `no_evidence`。保養文件不能支持退款承諾時，草稿應是 `refund_request`，不承諾金額或已處理。若回傳的 id 合法，但內容寫成「可以全額退款，我們已經處理完成。」，schema 仍可能通過，這是語意失敗，不是安全回答。異味或冒煙的案例必須留下停止使用、停止充電、聯絡人工；語意等價可以，不要求逐字相同。
+
+`tests/test_luna.py` 與 `tests/test_budget_continuity.py` 用假 HTTP 和臨時的舊格式 ledger 驗這條路徑。通過不代表帳務餘額、模型品質或知識啟用已經核實。
