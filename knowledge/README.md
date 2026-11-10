@@ -64,3 +64,94 @@ with OllamaEmbeddingAdapter() as adapter:
 ```
 
 只有這一個 eligible input，所以只會有一筆 1024 維結果，來源 index 仍是 1。Mock 測試只檢查組裝、數量與來源，不使用或展示 Ollama 的真實向量。空白 chunk 被略過時，結果數可以少於原 chunks。等長回應若被 provider 重排，shape 檢查看不出來；live 核對尚未執行。
+
+## 持久保存
+
+`EmbeddingStore` 把一份文件的來源、chunk 位置與向量放進呼叫者指定的 SQLite 檔。它不呼叫 adapter、不掃資料夾、也不重算向量。路徑的 parent 必須已經存在；建議用 `.data/`，這個目錄已在 `.gitignore`，不要提交 DB 或 journal。
+
+新的空檔才會建立 schema。`PRAGMA user_version` 必須是 1，而且只能有這一張表：
+
+```sql
+CREATE TABLE embedding_documents (
+    artifact_key TEXT PRIMARY KEY,
+    payload_json TEXT NOT NULL
+);
+```
+
+`payload_json` 是一段 canonical JSON：`ensure_ascii=False`、`sort_keys=True`、`separators=(",", ":")`、`allow_nan=False`。下面的縮排範例只給人讀，向量用說明文字代替，不是資料庫裡的內容，也不能拿來算 key。
+
+```json
+{
+  "format_version": 1,
+  "source": {
+    "metadata": {
+      "document_id": "hp-a-care",
+      "product_id": "hp-a",
+      "title": "HP-A 耳機日常保養",
+      "version": "1",
+      "synthetic": true
+    },
+    "body": "<完整原正文，含開頭 LF>",
+    "body_sha256": "223243a3ba9c40840746b1b2ee66e40b970a8fefd1324bb586930a381f9f4e59"
+  },
+  "embedding": {
+    "model": "qwen3-embedding:0.6b",
+    "model_digest": "<64 位小寫 hex>",
+    "dimensions": 1024,
+    "input_profile": "chunk-text-v1"
+  },
+  "chunking": {"profile": "heading-char-v1", "max_chars": 1200},
+  "chunks": [
+    {
+      "index": 0,
+      "char_start": 0,
+      "char_end": 1,
+      "heading_path": [],
+      "vector": null
+    },
+    {
+      "index": 1,
+      "char_start": 1,
+      "char_end": 71,
+      "heading_path": ["日常保養"],
+      "vector": "<資料庫裡是完整 1024 個 JSON number，這裡省略>"
+    }
+  ]
+}
+```
+
+沒有 approval、active、ready 或 published 欄位。空白 chunk 的 `vector` 是 JSON null；其餘是完整 1024 個有限且平方和大於 0 的數字。chunk 原文用 `source.body[char_start:char_end]` 還原，不另外存一份正文。
+
+`artifact_key` 是 identity 的 canonical JSON UTF-8 SHA-256。identity 含 `format_version`、五欄 metadata、`body_sha256`、整個 embedding 設定與整個 chunking 設定，不含向量、也不含正文本身。這是內容識別，不是核准或簽章。精確 key 在 `tests/test_embedding_storage.py`。
+
+呼叫者在推論前用同一份文件和已知 digest 計算 key。digest 由呼叫端提供，store 不查 Ollama。下面的 digest 是先前 live 觀察到的 tag digest；本範例沒有重新查詢或執行模型。向量是 `(1 + index) / 1024` 的 mock，不是 live 前綴補零。
+
+```python
+from customer_support_rag.knowledge import (
+    EmbeddedChunk,
+    EmbeddingStore,
+    chunk_document,
+    document_embedding_key,
+    read_document,
+)
+
+document = read_document("knowledge", "hp-a/headphone-care.md")
+digest = "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"
+chunks = chunk_document(document)
+embeddings = [
+    EmbeddedChunk(
+        chunk=chunk,
+        vector=tuple((1 + index) / 1024 for index in range(1024)),
+    )
+    for index, chunk in enumerate(chunks)
+    if chunk.text.strip()
+]
+key = document_embedding_key(document, model_digest=digest)
+with EmbeddingStore(".data/embeddings.sqlite") as store:
+    stored_key = store.put_document(document, embeddings, model_digest=digest)
+
+with EmbeddingStore(".data/embeddings.sqlite") as store:
+    loaded = store.get_document(stored_key)
+```
+
+正文必須有非空白內容，metadata 必須能再通過合成資料與 `hp-a` / `hp-b` 檢查；`model_copy` 繞過驗證時，key 與 put 會在 transaction 前拒絕。驗證在記憶體做完才進入 `BEGIN IMMEDIATE`。SQLite lock timeout 是 5 秒，失敗不重試。commit 成功才回傳 key。寫入失敗會 rollback，舊列保持不變。同 key 且 canonical payload 完全相同時不新增列；同 key 但向量不同時拋 `StorageConflictError`，舊值保留。沒有自動 latest、刪除或 active pointer。`get_document` 找不到 key 才回 `None`；列存在但內容不合契約時拋 `StorageError`，不把它當成 miss，也不修復或重算。讀回時 `format_version` 與 `dimensions` 必須是精確整數。get 成功只表示這筆技術保存可讀，不表示文件已核准，也不能當作檢索或問答結果。

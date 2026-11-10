@@ -41,4 +41,4 @@ GitHub Actions 會使用 `uv.lock` 安裝依賴，在 Python 3.12 與 3.13 執�
 
 目前包含最小 FastAPI app、健康檢查端點，以及以 TOML front matter 標記的少量合成知識文件範例（見 [`knowledge/README.md`](knowledge/README.md)）。文件讀取成功不等於人工審查、核准或啟用於線上 RAG。
 
-本機 embedding 只做同步 adapter：既有 chunk 的原文送到固定的本機 Ollama 位址，結果留在記憶體。呼叫方式、HP-A mock 範例與尚未 live 驗證的範圍見 [`knowledge/README.md`](knowledge/README.md)。這個 README 的範例沒有在本變更中對 Ollama 執行。
+本機 embedding 只做同步 adapter：既有 chunk 的原文送到固定的本機 Ollama 位址。呼叫者可以再把一份文件的來源與向量放進自己指定的 SQLite 檔，之後用同一個 key 讀回；store 不會自己呼叫模型。呼叫方式、HP-A mock 範例、保存格式與尚未完成的檢索見 [`knowledge/README.md`](knowledge/README.md)。這個 README 的範例沒有在本變更中對 Ollama 執行。
