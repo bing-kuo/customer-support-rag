@@ -13,6 +13,7 @@ authors = [{ name = "Acornsight" }]
 dependencies = [
     "fastapi==0.162.2",
     "httpx==0.28.1",
+    "numpy==2.3.5",
     "pydantic==2.14.3",
     "starlette==0.50.0",
     "uvicorn==0.54.0",
