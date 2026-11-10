@@ -5,8 +5,9 @@ import re
 
 from customer_support_rag.knowledge.models import KnowledgeChunk, KnowledgeDocument
 
-_NEWLINE = re.compile(r"\r\n|\r|\n")
-_PARAGRAPH_END = re.compile(r"(?:[ \t]*(?:\r\n|\r|\n)){2,}")
+_LINE_BREAK = r"\r\n|(?<!\r)\n|\r(?!\n)"
+_NEWLINE = re.compile(_LINE_BREAK)
+_PARAGRAPH_END = re.compile(rf"(?:[ \t]*(?:{_LINE_BREAK})){{2,}}")
 _ATX = re.compile(r"^( {0,3})(#{1,6})(?:[ \t]+(.*)|[ \t]*)$")
 _OPEN_FENCE = re.compile(r"^ {0,3}(`{3,}|~{3,})(.*)$")
 
@@ -26,6 +27,8 @@ def _line_ranges(text: str) -> list[tuple[int, int, str]]:
 
 def _heading_label(match: re.Match[str]) -> str:
     label = (match.group(3) or "").strip(" \t")
+    if re.fullmatch(r"#+[ \t]*", label):
+        return ""
     label = re.sub(r"[ \t]+#+[ \t]*$", "", label).strip(" \t")
     return label
 
@@ -77,10 +80,27 @@ def _sections(text: str) -> list[tuple[int, int, tuple[str, ...]]]:
 
 
 def _safe_hard_end(text: str, start: int, limit: int) -> int:
-    end = min(start + limit, len(text))
+    end = _safe_cut(text, start, min(start + limit, len(text)))
+    return end
+
+
+def _safe_cut(text: str, start: int, end: int) -> int:
+    """Move any candidate cut before the LF when it would split a CRLF pair."""
     if end < len(text) and end > start and text[end - 1 : end + 1] == "\r\n":
         end -= 1
     return end
+
+
+def _candidate_ends(
+    pattern: re.Pattern[str], text: str, start: int, limit: int
+) -> list[int]:
+    """Return complete regex boundaries that fit within the chunk limit."""
+    ends: list[int] = []
+    for match in pattern.finditer(text, start):
+        if match.end() > limit:
+            break
+        ends.append(match.end())
+    return ends
 
 
 def _split_section(
@@ -94,21 +114,16 @@ def _split_section(
             result.append((cursor, end))
             break
         limit = cursor + max_chars
-        window = text[cursor:limit]
-        paragraph_ends = [match.end() for match in _PARAGRAPH_END.finditer(window)]
+        paragraph_ends = _candidate_ends(_PARAGRAPH_END, text, cursor, limit)
         if paragraph_ends:
-            next_cursor = cursor + paragraph_ends[-1]
+            next_cursor = paragraph_ends[-1]
         else:
-            line_ends = [match.end() for match in _NEWLINE.finditer(window)]
+            line_ends = _candidate_ends(_NEWLINE, text, cursor, limit)
             if line_ends:
-                next_cursor = cursor + line_ends[-1]
-                if (
-                    next_cursor < end
-                    and text[next_cursor - 1 : next_cursor + 1] == "\r\n"
-                ):
-                    next_cursor -= 1
+                next_cursor = line_ends[-1]
             else:
                 next_cursor = _safe_hard_end(text, cursor, max_chars)
+        next_cursor = _safe_cut(text, cursor, next_cursor)
         if next_cursor <= cursor:
             next_cursor = _safe_hard_end(text, cursor, max_chars)
         result.append((cursor, next_cursor))

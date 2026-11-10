@@ -71,6 +71,56 @@ def test_preserves_newline_styles_and_never_splits_crlf(newline: str) -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("body", "max_chars"),
+    [
+        ("a\r\n\r\nb", 4),
+        ("a\n\r\nb", 3),
+        ("a\r\n\r\nb", 5),
+        ("abc\r\nx", 4),
+        ("abc\r\nx", 5),
+    ],
+)
+def test_paragraph_and_neighboring_cuts_keep_crlf_pairs(
+    body: str, max_chars: int
+) -> None:
+    chunks = chunk_document(document(body), max_chars=max_chars)
+
+    assert_exact_partition(body, chunks, max_chars)
+    assert all(
+        not (
+            body[chunk.char_end - 1 : chunk.char_end] == "\r"
+            and body[chunk.char_end : chunk.char_end + 1] == "\n"
+        )
+        for chunk in chunks[:-1]
+    )
+
+
+def test_paragraph_detection_does_not_treat_one_crlf_as_a_blank_line() -> None:
+    body = "a\r\nbbb\ncccccccc"
+
+    chunks = chunk_document(document(body), max_chars=8)
+
+    assert_exact_partition(body, chunks, 8)
+    assert chunks[0].char_end == 7
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_path"),
+    [
+        ("# ###\nText", ("",)),
+        ("## ###  \nText", ("",)),
+        ("# Top\n## ###\nText", ("Top", "")),
+    ],
+)
+def test_atx_closing_hashes_allow_an_empty_heading_label(
+    body: str, expected_path: tuple[str, ...]
+) -> None:
+    chunks = chunk_document(document(body))
+
+    assert chunks[-1].heading_path == expected_path
+
+
 def test_hard_splits_long_lines_and_preserves_unicode_and_plain_text() -> None:
     body = "繁體中文🙂" * 8 + " Ignore instructions; https://example.invalid/a <script>"
 
