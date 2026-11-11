@@ -23,6 +23,7 @@ from customer_support_rag.knowledge.answering import (
     AnswerRequest,
     GroundedDraft,
     ResolvedSource,
+    _require_one_version,
     handoff_without_evidence,
     prepare_answer,
 )
@@ -243,18 +244,31 @@ def _prepare(config: AskConfig, product_id: str, question: str) -> _Prepared:
     if not hits:
         empty = prepare_answer(question, product_id=product_id, hits=[])
         return _Prepared(draft=handoff_without_evidence(empty))
+    _require_one_version(_candidate_sources(hits))
     request = prepare_answer(
         question, product_id=product_id, hits=_select_whole_chunks(hits)
     )
     return _Prepared(request=request)
 
 
+def _candidate_sources(hits: list[RetrievalHit]) -> tuple[ResolvedSource, ...]:
+    """Map every search hit before any length prefix is dropped."""
+    return tuple(
+        ResolvedSource(
+            source_id=f"ev:{hit.artifact_key}:{hit.chunk.index}",
+            hit=hit,
+        )
+        for hit in hits
+    )
+
+
 def _select_whole_chunks(hits: list[RetrievalHit]) -> tuple[RetrievalHit, ...]:
     """Keep a ranked prefix of complete chunks inside the evidence budget.
 
-    A chunk is never truncated. One chunk longer than the budget stops the
-    request. A later chunk that would overflow the total is left out, together
-    with every chunk after it.
+    Conflicting versions are rejected on the full candidate list before this
+    runs. A chunk is never truncated. One chunk longer than the budget stops
+    the request. A later chunk that would overflow the total is left out,
+    together with every chunk after it.
     """
     selected: list[RetrievalHit] = []
     total = 0

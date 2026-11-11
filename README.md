@@ -57,7 +57,7 @@ uv run --locked uvicorn customer_support_rag.api:app --host 127.0.0.1 --port 800
 
 `CUSTOMER_SUPPORT_RAG_DATABASE` 必須是已經存在的 SQLite。這個程序只讀開啟它，缺檔時不會自己建立，也不會寫 schema。預設載入的 artifact keys 是 HP-A care `9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad` 與 HP-B connection `18812b328a8e3614c4c83a849c2bfcd108e695453c8eaf9d57cf87200cefafae`，digest 固定為 `ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d`。key 仍只讀這個 key root 的 `.env` 裡既有的 `OPENAI_API_KEY`。請不要把真的 `.env` 或資料庫提交進 git。
 
-一次成功的呼叫會對本機 Ollama 做問句 embedding（前後各核一次 digest），再用 exact cosine 在該商品的既有向量裡取最多四個整段 chunk。證據合計超過 1200 字時留下排序在前、仍放得進界線的完整 chunk，不截斷原文。單一 chunk 超過界線或同一文件版本衝突會停下來。沒有該商品的候選時直接 `no_evidence`，不呼叫 Luna。有候選才送一次 Luna。cosine 只用來排序，沒有相似度門檻，也不能當成拒答或退款決定。
+一次成功的呼叫會對本機 Ollama 做問句 embedding（前後各核一次 digest），再用 exact cosine 在該商品的既有向量裡取最多四個整段 chunk。證據合計超過 1200 字時留下排序在前、仍放得進界線的完整 chunk，不截斷原文。長度選取之前先看這次全部候選：同一文件有兩個版本就停，不送 Luna。單一 chunk 超過界線也會停。沒有該商品的候選時直接 `no_evidence`，不呼叫 Luna。有候選才送一次 Luna。cosine 只用來排序，沒有相似度門檻，也不能當成拒答或退款決定。
 
 本機範例：
 

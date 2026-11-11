@@ -204,6 +204,43 @@ def test_invalid_input_stops_before_retrieval_key_and_model(
     assert client.post("/ask", data={"product_id": "hp-a"}).status_code == 422
 
 
+def test_json_integer_past_the_conversion_limit_is_invalid_request(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _forbid_work(monkeypatch)
+    client = TestClient(create_app(None), raise_server_exceptions=False)
+    digits = b"9" * 5000
+    body = b'{"product_id":"hp-a","question":' + digits + b"}"
+    assert len(body) < MAX_BODY_BYTES
+    response = client.post(
+        "/ask",
+        content=body,
+        headers={"content-type": "application/json"},
+    )
+    assert response.status_code == 422
+    payload = response.json()
+    assert payload["code"] == "invalid_request"
+    assert payload["request_id"].startswith("ask-")
+    assert digits not in response.content
+    assert "Internal Server Error" not in response.text
+
+
+def test_unrelated_parser_value_error_stays_a_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _forbid_work(monkeypatch)
+
+    def broken_loads(*_args: object, **_kwargs: object) -> object:
+        raise ValueError("parser bug")
+
+    monkeypatch.setattr("customer_support_rag.api.json.loads", broken_loads)
+    client = TestClient(create_app(None), raise_server_exceptions=False)
+    response = client.post("/ask", json=_body())
+    assert response.status_code == 500
+    assert "invalid_request" not in response.text
+    assert "parser bug" not in response.text
+
+
 def test_body_over_16kib_is_rejected_without_trusting_content_length(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -603,6 +640,38 @@ def test_whole_chunks_stop_on_budget_conflict_or_one_oversize_source(
     assert len(posted) == 1
 
 
+def test_version_conflict_is_rejected_before_the_length_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "wide-conflict.sqlite"
+    left = _version_document("1", "a" * 700)
+    right = _version_document("2", "b" * 700)
+    left_chunks = _same_basis(left)
+    right_chunks = _same_basis(right)
+    assert sum(len(item.chunk.text) for item in left_chunks + right_chunks) > 1200
+    _put_many(path, [(left, left_chunks), (right, right_chunks)])
+    calls = {"luna": 0}
+
+    def ollama(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return _tags()
+        return _embed(axis(0, 1.0))
+
+    async def no_luna(_self: object, _request: httpx.Request) -> httpx.Response:
+        calls["luna"] += 1
+        raise AssertionError("luna")
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", no_luna)
+    client = _client(tmp_path, path, embedding=ollama, artifact_keys=_keys(path))
+    stopped = client.post("/ask", json=_body("hp-a", "哪一版比較長？"))
+    assert stopped.status_code == 503
+    assert stopped.json()["code"] == "evidence_unavailable"
+    assert calls["luna"] == 0
+    assert "a" * 40 not in stopped.text
+    assert "b" * 40 not in stopped.text
+    assert "version" not in stopped.text
+
+
 def test_health_and_docs_do_not_read_the_key_or_ask(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -717,6 +786,14 @@ def _put_many(
     with EmbeddingStore(path) as store:
         for document, chunks in items:
             store.put_document(document, chunks, model_digest=PUBLISHED_DIGEST)
+
+
+def _same_basis(document: KnowledgeDocument) -> list[EmbeddedChunk]:
+    return [
+        EmbeddedChunk(chunk=chunk, vector=axis(0, 1.0))
+        for chunk in chunk_document(document)
+        if chunk.text.strip()
+    ]
 
 
 def _vectors_by_index(document: KnowledgeDocument) -> list[EmbeddedChunk]:

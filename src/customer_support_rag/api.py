@@ -124,6 +124,10 @@ async def _parse_ask(request: Request) -> tuple[str, str]:
         payload = json.loads(raw.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         raise AskFailure(422, "invalid_request") from None
+    except ValueError as exc:
+        if not _integer_conversion_limit(exc):
+            raise
+        raise AskFailure(422, "invalid_request") from None
     try:
         parsed = _AskInput.model_validate(payload)
     except ValidationError:
@@ -164,6 +168,15 @@ def _json_content_type(value: str | None) -> bool:
     if value is None:
         return False
     return value.split(";", 1)[0].strip().lower() == "application/json"
+
+
+def _integer_conversion_limit(exc: ValueError) -> bool:
+    """True only for CPython's digit limit while decoding a JSON number.
+
+    Other ``ValueError`` values stay uncaught so a parser bug is not reported
+    as a client input error.
+    """
+    return type(exc) is ValueError and "integer string conversion" in str(exc)
 
 
 def _utf8(value: str) -> bool:
