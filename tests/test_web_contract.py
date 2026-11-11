@@ -30,7 +30,12 @@ def test_default_app_serves_repository_index_and_named_assets() -> None:
     assert script.headers["content-type"].startswith("text/javascript")
     assert script.content == (WEB / "assets" / "app.js").read_bytes()
     assert b'fetch("/ask"' in script.content
-    assert b'"product_id"' in script.content
+    assert b"product_id: productId" in script.content
+    assert b"body_too_large" in script.content
+    assert "請縮短後再試".encode() in script.content
+    assert b"payload.answer.trim().length > 0" in script.content
+    assert b"payload.sources.length > 0" in script.content
+    assert b"validSource" in script.content
     assert b"localStorage" not in script.content
     assert b"innerHTML" not in script.content
 
