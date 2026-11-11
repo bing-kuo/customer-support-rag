@@ -1,0 +1,83 @@
+<!doctype html>
+<html lang="zh-Hant">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#f6f7f5">
+    <title>客服問答草稿｜本機 PoC</title>
+    <link rel="stylesheet" href="/assets/style.css">
+    <script src="/assets/app.js" defer></script>
+  </head>
+  <body>
+    <header class="topbar">
+      <a class="wordmark" href="/" aria-label="客服問答草稿首頁">
+        <span class="mark" aria-hidden="true">問</span>
+        <span>客服工作台 <span class="wordmark-sub">／本機 PoC</span></span>
+      </a>
+      <span class="local-label"><span class="status-dot" aria-hidden="true"></span>僅供本機操作</span>
+    </header>
+
+    <main>
+      <section class="intro" aria-labelledby="page-title">
+        <p class="eyebrow">合成耳機資料・單次回答草稿</p>
+        <h1 id="page-title">先看清楚問題，<br class="mobile-break">再整理有根據的回覆。</h1>
+        <p class="intro-copy">選擇商品並輸入顧客問題。系統會嘗試整理回答、原文依據，或建議轉由專人處理。</p>
+      </section>
+
+      <section class="workspace" aria-label="建立客服問答">
+        <form id="ask-form" class="question-card">
+          <div class="section-heading">
+            <span class="step-number">01</span>
+            <div><h2>整理顧客問題</h2><p>請勿輸入真實個人資料。</p></div>
+          </div>
+
+          <label for="product">商品</label>
+          <select id="product" name="product_id">
+            <option value="hp-a">HP-A｜無線耳機</option>
+            <option value="hp-b">HP-B｜無線耳機</option>
+          </select>
+
+          <div class="label-row">
+            <label for="question">顧客問題</label>
+            <span id="character-count" class="character-count">0 / 1000</span>
+          </div>
+          <textarea id="question" name="question" rows="5" placeholder="例如：HP-A 耳機可以用水洗嗎？" aria-describedby="question-help character-count" required></textarea>
+          <p id="question-help" class="field-help">最多 1000 字。送出後只會詢問一次，不會自動重試。</p>
+
+          <button id="submit-button" class="submit-button" type="submit">
+            <span class="button-label">整理回答</span><span class="button-arrow" aria-hidden="true">→</span>
+          </button>
+          <p class="privacy-note"><span aria-hidden="true">⌁</span>問題只用於這次請求，不會保存在瀏覽器。</p>
+        </form>
+
+        <section id="result" class="result-card" aria-labelledby="result-title" aria-live="polite" aria-busy="false">
+          <div class="section-heading result-heading">
+            <span class="step-number step-muted">02</span>
+            <div><h2 id="result-title">回答整理結果</h2><p id="result-caption">送出問題後，結果會顯示在這裡。</p></div>
+          </div>
+          <div id="result-content" class="result-content">
+            <div class="empty-state" aria-hidden="true">
+              <span class="empty-icon">✳</span>
+              <p>一份清楚的回答，<br>從可靠的原文依據開始。</p>
+            </div>
+          </div>
+        </section>
+      </section>
+
+      <footer class="page-footer">
+        <span>展示資料為合成內容</span><span aria-hidden="true">·</span><span>模型回答是草稿，請人工確認後再使用</span>
+      </footer>
+    </main>
+
+    <dialog id="source-dialog" aria-labelledby="source-dialog-title">
+      <div class="dialog-header">
+        <div><p class="eyebrow">引用原文</p><h2 id="source-dialog-title">來源內容</h2></div>
+        <button id="close-dialog" class="icon-button" type="button" aria-label="關閉引用原文">×</button>
+      </div>
+      <dl id="source-metadata" class="source-metadata"></dl>
+      <div class="source-text-wrap"><p class="source-text-label">原文片段</p><p id="source-text" class="source-text"></p></div>
+      <div class="dialog-actions"><button id="dialog-done" class="secondary-button" type="button">看完了</button></div>
+    </dialog>
+    <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  </body>
+</html>
