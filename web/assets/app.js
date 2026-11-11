@@ -15,6 +15,7 @@
   const toast = document.querySelector("#toast");
   const safeCodes = {
     invalid_request: "問題格式不符合要求，請檢查內容後再試。",
+    body_too_large: "這次問題內容過長，請縮短後再試。",
     request_too_large: "這次請求內容過長，請縮短問題後再試。",
     ask_not_configured: "問答服務目前尚未設定完成。",
     dependency_unavailable: "問答服務暫時無法使用。",
