@@ -60,7 +60,10 @@ def origin_is_same(origin: str, scheme: str, host_header: str) -> bool:
     """
     if origin.lower() == "null":
         return False
-    parsed = urlparse(origin)
+    try:
+        parsed = urlparse(origin)
+    except ValueError:
+        return False
     if parsed.scheme.lower() not in {"http", "https"}:
         return False
     if parsed.username is not None or parsed.password is not None:

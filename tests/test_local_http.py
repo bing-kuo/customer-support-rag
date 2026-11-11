@@ -8,6 +8,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from customer_support_rag.api import create_app
+from customer_support_rag.local_http import host_is_trusted, origin_is_same
 
 ASK = {"product_id": "hp-a", "question": "HP-A 耳機可以用水洗嗎？"}
 
@@ -60,6 +61,46 @@ def test_forwarded_host_does_not_widen_trust(tmp_path: Path) -> None:
     assert allowed.text == "<!doctype html><title>fixture</title>"
 
 
+def test_malformed_ipv6_origin_is_invalid_request_not_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _forbid_work(monkeypatch)
+    client = TestClient(
+        create_app(None),
+        base_url="http://127.0.0.1",
+        raise_server_exceptions=False,
+    )
+    for origin in ("http://[", "http://[bad]"):
+        response = client.post("/ask", json=ASK, headers={"origin": origin})
+        assert response.status_code == 422
+        payload = response.json()
+        assert payload["code"] == "invalid_request"
+        assert payload["request_id"].startswith("ask-")
+        assert response.headers["content-type"].startswith("application/json")
+        assert "Internal Server Error" not in response.text
+        assert origin not in response.text
+
+
+def test_unrelated_origin_parser_error_stays_a_server_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _forbid_work(monkeypatch)
+
+    def broken(_value: str, *_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("parser bug")
+
+    monkeypatch.setattr("customer_support_rag.local_http.urlparse", broken)
+    client = TestClient(
+        create_app(None),
+        base_url="http://127.0.0.1",
+        raise_server_exceptions=False,
+    )
+    response = client.post("/ask", json=ASK, headers={"origin": "http://127.0.0.1"})
+    assert response.status_code == 500
+    assert "invalid_request" not in response.text
+    assert "parser bug" not in response.text
+
+
 def test_null_and_cross_origin_ask_are_rejected_without_work(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -99,6 +140,13 @@ def test_matching_origin_reaches_ask_without_wildcard_cors(
 def test_localhost_host_is_accepted_for_health() -> None:
     client = TestClient(create_app(None), base_url="http://localhost")
     assert client.get("/health").status_code == 200
+
+
+def test_matching_ipv6_loopback_origin_is_trusted() -> None:
+    assert host_is_trusted("[::1]")
+    assert origin_is_same("http://[::1]", "http", "[::1]")
+    assert not origin_is_same("http://[", "http", "127.0.0.1")
+    assert not origin_is_same("http://[bad]", "http", "127.0.0.1")
 
 
 def test_request_cannot_choose_the_web_root(tmp_path: Path) -> None:
