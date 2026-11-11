@@ -173,6 +173,46 @@ def test_ask_joins_stored_retrieval_to_one_mock_luna_call(
     assert not (tmp_path / "runtime").exists()
 
 
+def test_same_origin_localhost_ui_can_ask_once_with_mock(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = _save_products(tmp_path)
+    calls = {"luna": 0}
+
+    def ollama(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return _tags()
+        return _embed(axis(0, 1.0))
+
+    async def luna(_self: object, request: httpx.Request) -> httpx.Response:
+        calls["luna"] += 1
+        data = _model_data(request)
+        payload = _envelope(_draft(ANSWER, data["evidence"][0]["source_id"]))
+        return httpx.Response(200, json=payload)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", luna)
+    client = _client(tmp_path, path, embedding=ollama)
+    response = client.post(
+        "/ask",
+        json=_body(),
+        headers={"origin": "http://127.0.0.1"},
+    )
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "answer"
+    assert body["answer"] == ANSWER
+    assert body["sources"][0]["text"]
+    assert calls["luna"] == 1
+    again = client.post(
+        "/ask",
+        json=_body(),
+        headers={"origin": "http://127.0.0.1"},
+    )
+    assert again.status_code == 200
+    assert calls["luna"] == 2
+    assert again.json()["request_id"] != body["request_id"]
+
+
 def test_invalid_input_stops_before_retrieval_key_and_model(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -208,7 +248,9 @@ def test_json_integer_past_the_conversion_limit_is_invalid_request(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _forbid_work(monkeypatch)
-    client = TestClient(create_app(None), raise_server_exceptions=False)
+    client = TestClient(
+        create_app(None), base_url="http://127.0.0.1", raise_server_exceptions=False
+    )
     digits = b"9" * 5000
     body = b'{"product_id":"hp-a","question":' + digits + b"}"
     assert len(body) < MAX_BODY_BYTES
@@ -234,7 +276,9 @@ def test_unrelated_parser_value_error_stays_a_server_error(
         raise ValueError("parser bug")
 
     monkeypatch.setattr("customer_support_rag.api.json.loads", broken_loads)
-    client = TestClient(create_app(None), raise_server_exceptions=False)
+    client = TestClient(
+        create_app(None), base_url="http://127.0.0.1", raise_server_exceptions=False
+    )
     response = client.post("/ask", json=_body())
     assert response.status_code == 500
     assert "invalid_request" not in response.text
@@ -690,9 +734,15 @@ def test_health_and_docs_do_not_read_the_key_or_ask(
         "customer_support_rag.ask.EmbeddingStore.open_readonly", open_readonly
     )
     monkeypatch.setattr("customer_support_rag.luna_live.network_transport", factory)
-    client = TestClient(create_app(None))
+    client = TestClient(create_app(None), base_url="http://127.0.0.1")
     assert client.get("/health").status_code == 200
     assert client.get("/docs").status_code == 200
+    missing_home = client.get("/")
+    assert missing_home.status_code == 404
+    assert missing_home.headers["content-type"].startswith("application/json")
+    missing_asset = client.get("/assets/style.css")
+    assert missing_asset.status_code == 404
+    assert missing_asset.headers["content-type"].startswith("application/json")
     docs = client.get("/openapi.json")
     assert docs.status_code == 200
     schema = docs.json()
@@ -744,7 +794,7 @@ def _client(
         key_root=root,
         embedding_transport=transport,
     )
-    return TestClient(create_app(config))
+    return TestClient(create_app(config), base_url="http://127.0.0.1")
 
 
 def _unused_embedding(_request: httpx.Request) -> httpx.Response:
