@@ -107,11 +107,7 @@ def test_assets_directory_symlink_is_not_followed(tmp_path: Path) -> None:
 def test_default_web_root_is_the_repository_web_directory() -> None:
     located = default_web_root()
     assert located.name == "web"
-    assert (
-        located.parent.name == "local-demo-integration"
-        or (located.parent / "src" / "customer_support_rag").is_dir()
-    )
-    assert not located.exists()
+    assert (located.parent / "src" / "customer_support_rag").is_dir()
 
 
 def _web_tree(tmp_path: Path) -> Path:

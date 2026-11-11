@@ -737,12 +737,15 @@ def test_health_and_docs_do_not_read_the_key_or_ask(
     client = TestClient(create_app(None), base_url="http://127.0.0.1")
     assert client.get("/health").status_code == 200
     assert client.get("/docs").status_code == 200
-    missing_home = client.get("/")
-    assert missing_home.status_code == 404
-    assert missing_home.headers["content-type"].startswith("application/json")
-    missing_asset = client.get("/assets/style.css")
-    assert missing_asset.status_code == 404
-    assert missing_asset.headers["content-type"].startswith("application/json")
+    home = client.get("/")
+    assert home.status_code == 200
+    assert home.headers["content-type"].startswith("text/html")
+    css = client.get("/assets/style.css")
+    assert css.status_code == 200
+    assert css.headers["content-type"].startswith("text/css")
+    script = client.get("/assets/app.js")
+    assert script.status_code == 200
+    assert script.headers["content-type"].startswith("text/javascript")
     docs = client.get("/openapi.json")
     assert docs.status_code == 200
     schema = docs.json()

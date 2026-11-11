@@ -39,7 +39,9 @@ uv run --locked uvicorn customer_support_rag.api:app --host 127.0.0.1 --port 800
 
 ## 本機頁面
 
-同一 FastAPI 程序在 `GET /` 供應 repository 根目錄的 `web/index.html`，固定資產為 `GET /assets/style.css` 與 `GET /assets/app.js`。程式用套件位置定位 `web/`，請求不能指定 web 根目錄或 key 根目錄。沒有 `web/`、檔案不是一般檔、或名稱不在上述清單時回 JSON 404。未知路徑與未知 POST 維持 JSON／HTTP 錯誤，不會 fallback 成 HTML 首頁。暫時測試用的 web tree 不是產品 UI；目前 repository 還沒有 `web/`，這不是已完成的畫面。
+同一 FastAPI 程序在 `GET /` 供應 repository 根目錄的 `web/index.html`，固定資產為 `GET /assets/style.css` 與 `GET /assets/app.js`。啟動後以瀏覽器開啟 `http://127.0.0.1:8000/`。程式用套件位置定位 `web/`，請求不能指定 web 根目錄或 key 根目錄。檔案不是一般檔、或名稱不在上述清單時回 JSON 404。未知路徑與未知 POST 維持 JSON／HTTP 錯誤，不會 fallback 成 HTML 首頁。暫時測試用的 web tree 不是產品 UI。
+
+目前頁面是合成耳機 PoC 的單次問答草稿：選 `hp-a`／`hp-b`、送一次 `POST /ask`、以純文字顯示回答或轉人工摘要。這還沒有通過 agent-browser 的最終畫面／鍵盤／窄版驗收，不能當成 P1 完成或 live 問答。
 
 `POST /ask` 的 Host 必須是 loopback（`127.0.0.1`、`localhost`、`::1`，可含 port）。沒有 Origin 的 CLI 可以送一次。瀏覽器若帶 Origin，必須與該次請求的 scheme、host、port 相同。`Origin: null` 與非同源會被拒絕，回應仍是固定 code 與 `request_id`。沒有 wildcard CORS。Host／Origin 被拒絕時不會讀 key 或呼叫模型。`GET /`、`GET /assets/*`、`GET /health` 與 `GET /docs` 也不讀 key、不開資料庫、不送問句。
 
