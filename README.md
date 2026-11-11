@@ -32,10 +32,18 @@ uv run --locked pytest
 ## 啟動 API
 
 ```sh
-uv run --locked uvicorn customer_support_rag.api:app --host 127.0.0.1 --port 8000
+uv run --locked uvicorn customer_support_rag.api:app --host 127.0.0.1 --port 8000 --no-proxy-headers
 ```
 
-`GET http://127.0.0.1:8000/health` 回傳服務狀態、應用程式名稱與版本。這個端點只回報 API 程序狀態，不檢查模型、知識庫或儲存服務。`GET /docs` 同樣不讀 key、不開資料庫、也不送問句。
+本機啟動必須綁 `127.0.0.1`。`--no-proxy-headers` 避免 `X-Forwarded-Host` 改寫 Host。`GET http://127.0.0.1:8000/health` 回傳服務狀態、應用程式名稱與版本。這個端點只回報 API 程序狀態，不檢查模型、知識庫或儲存服務。`GET /docs` 同樣不讀 key、不開資料庫、也不送問句。
+
+## 本機頁面
+
+同一 FastAPI 程序在 `GET /` 供應 repository 根目錄的 `web/index.html`，固定資產為 `GET /assets/style.css` 與 `GET /assets/app.js`。啟動後以瀏覽器開啟 `http://127.0.0.1:8000/`。程式用套件位置定位 `web/`，請求不能指定 web 根目錄或 key 根目錄。檔案不是一般檔、或名稱不在上述清單時回 JSON 404。未知路徑與未知 POST 維持 JSON／HTTP 錯誤，不會 fallback 成 HTML 首頁。暫時測試用的 web tree 不是產品 UI。
+
+目前頁面是合成耳機 PoC 的單次問答草稿：選 `hp-a`／`hp-b`、送一次 `POST /ask`、以純文字顯示回答或轉人工摘要。這還沒有通過 agent-browser 的最終畫面／鍵盤／窄版驗收，不能當成 P1 完成或 live 問答。
+
+`POST /ask` 的 Host 必須是 loopback（`127.0.0.1`、`localhost`、`::1`，可含 port）。沒有 Origin 的 CLI 可以送一次。瀏覽器若帶 Origin，必須與該次請求的 scheme、host、port 相同。`Origin: null` 與非同源會被拒絕，回應仍是固定 code 與 `request_id`。沒有 wildcard CORS。Host／Origin 被拒絕時不會讀 key 或呼叫模型。`GET /`、`GET /assets/*`、`GET /health` 與 `GET /docs` 也不讀 key、不開資料庫、不送問句。
 
 ## 單次問答
 
@@ -52,7 +60,7 @@ uv run --locked uvicorn customer_support_rag.api:app --host 127.0.0.1 --port 800
 ```sh
 export CUSTOMER_SUPPORT_RAG_DATABASE=.data/embeddings.sqlite
 export CUSTOMER_SUPPORT_RAG_KEY_ROOT=.
-uv run --locked uvicorn customer_support_rag.api:app --host 127.0.0.1 --port 8000
+uv run --locked uvicorn customer_support_rag.api:app --host 127.0.0.1 --port 8000 --no-proxy-headers
 ```
 
 `CUSTOMER_SUPPORT_RAG_DATABASE` 必須是已經存在的 SQLite。這個程序只讀開啟它，缺檔時不會自己建立，也不會寫 schema。預設載入的 artifact keys 是 HP-A care `9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad` 與 HP-B connection `18812b328a8e3614c4c83a849c2bfcd108e695453c8eaf9d57cf87200cefafae`，digest 固定為 `ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d`。key 仍只讀這個 key root 的 `.env` 裡既有的 `OPENAI_API_KEY`。請不要把真的 `.env` 或資料庫提交進 git。

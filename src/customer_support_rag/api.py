@@ -1,17 +1,21 @@
 """HTTP API application.
 
 Importing this module does not read an API key, open a database, or send a
-question. ``GET /health`` and ``GET /docs`` stay local. ``POST /ask`` is the
-only route that can retrieve or call Luna, and only after the body is valid.
+question. ``GET /health``, ``GET /docs``, ``GET /``, and ``GET /assets/*`` stay
+local. ``POST /ask`` is the only route that can retrieve or call Luna, and only
+after the body is valid and the Host/Origin checks pass.
 """
 
 import json
 import uuid
+from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Literal
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, ConfigDict, ValidationError
+from starlette.responses import Response
 
 from customer_support_rag import __version__
 from customer_support_rag.ask import (
@@ -20,6 +24,18 @@ from customer_support_rag.ask import (
     AskResponse,
     answer_ask,
     config_from_environment,
+)
+from customer_support_rag.local_http import (
+    forwarded_host_present,
+    host_is_trusted,
+    origin_is_same,
+)
+from customer_support_rag.web_pages import (
+    INDEX_CONTENT_TYPE,
+    NOSNIFF,
+    asset_file,
+    default_web_root,
+    index_file,
 )
 
 APPLICATION_NAME = "customer-support-rag"
@@ -58,13 +74,40 @@ class _AskInput(BaseModel):
 
 def create_app(
     config: AskConfig | None | _FromEnvironment = _FROM_ENVIRONMENT,
+    *,
+    web_root: Path | None = None,
+    extra_hosts: tuple[str, ...] = (),
 ) -> FastAPI:
-    """Build the app. The default reads process config and does not open it."""
+    """Build the app. The default reads process config and does not open it.
+
+    Production Host checks accept loopback only. ``extra_hosts`` is for an
+    explicit testserver configuration. ``web_root`` is process config; a
+    request cannot replace it.
+    """
     selected = (
         config_from_environment() if isinstance(config, _FromEnvironment) else config
     )
+    pages = default_web_root() if web_root is None else web_root
     application = FastAPI(title=APPLICATION_NAME)
     application.state.ask_config = selected
+    application.state.web_root = pages
+    application.state.extra_hosts = extra_hosts
+
+    @application.middleware("http")
+    async def guard_local_http(
+        request: Request, call_next: Callable[[Request], Awaitable[Response]]
+    ) -> Response:
+        if forwarded_host_present(request.headers) or not host_is_trusted(
+            request.headers.get("host"), request.app.state.extra_hosts
+        ):
+            return _rejected(request)
+        if request.method == "POST" and request.url.path == "/ask":
+            origin = request.headers.get("origin")
+            host_header = request.headers.get("host", "")
+            scheme = str(request.scope.get("scheme", "http"))
+            if origin is not None and not origin_is_same(origin, scheme, host_header):
+                return _rejected(request)
+        return await call_next(request)
 
     @application.get("/health", response_model=HealthResponse)
     def get_health() -> HealthResponse:
@@ -73,6 +116,21 @@ def create_app(
             application=APPLICATION_NAME,
             version=__version__,
         )
+
+    @application.get("/", include_in_schema=False)
+    def get_home() -> Response:
+        path = index_file(request_web_root(application))
+        if path is None:
+            return _missing()
+        return FileResponse(path, media_type=INDEX_CONTENT_TYPE, headers=NOSNIFF)
+
+    @application.get("/assets/{name}", include_in_schema=False)
+    def get_asset(name: str) -> Response:
+        found = asset_file(request_web_root(application), name)
+        if found is None:
+            return _missing()
+        path, content_type = found
+        return FileResponse(path, media_type=content_type, headers=NOSNIFF)
 
     @application.post(
         "/ask",
@@ -114,6 +172,27 @@ def create_app(
 
 
 app = create_app()
+
+
+def request_web_root(application: FastAPI) -> Path:
+    """Process web root stored at startup. Requests cannot replace this path."""
+    return Path(application.state.web_root)
+
+
+def _rejected(request: Request) -> JSONResponse:
+    request_id = (
+        f"ask-{uuid.uuid4().hex}"
+        if request.url.path == "/ask"
+        else f"req-{uuid.uuid4().hex}"
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"code": "invalid_request", "request_id": request_id},
+    )
+
+
+def _missing() -> JSONResponse:
+    return JSONResponse(status_code=404, content={"detail": "Not Found"})
 
 
 async def _parse_ask(request: Request) -> tuple[str, str]:
