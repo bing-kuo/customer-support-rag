@@ -102,6 +102,8 @@ class EmbeddingStore:
 
     ``isolation_level=None`` makes the transaction explicit on Python 3.12 and
     3.13. Writes use ``BEGIN IMMEDIATE`` and do not retry a locked database.
+    ``open_readonly`` refuses a missing file and does not create or migrate a
+    schema. The saved payload format is unchanged.
     """
 
     def __init__(self, path: str | Path) -> None:
@@ -135,6 +137,52 @@ class EmbeddingStore:
 
     def __exit__(self, *exc: object) -> None:
         self.close()
+
+    @classmethod
+    def open_readonly(cls, path: str | Path) -> "EmbeddingStore":
+        """Open an existing database without creating a file or writing schema.
+
+        A missing file, a directory, or an unsupported schema raises
+        :class:`StorageError`. This does not insert a row or change
+        ``user_version``.
+        """
+        database = _database_path(path)
+        if not database.is_file():
+            raise StorageError("Embedding store could not open the database.")
+        store = cls.__new__(cls)
+        try:
+            store._connection = sqlite3.connect(
+                f"{database.resolve().as_uri()}?mode=ro",
+                uri=True,
+                isolation_level=None,
+                timeout=_LOCK_TIMEOUT_SECONDS,
+            )
+            store._connection.execute("PRAGMA query_only = ON")
+            store._connection.execute("PRAGMA busy_timeout = 5000")
+            store._require_readable_schema()
+        except StorageError:
+            store._close_failed_open()
+            raise
+        except sqlite3.Error:
+            store._close_failed_open()
+            raise StorageError("Embedding store could not open the database.") from None
+        return store
+
+    def _require_readable_schema(self) -> None:
+        try:
+            version = _user_version(self._connection)
+            objects = _schema_objects(self._connection)
+            readable = (
+                version == FORMAT_VERSION
+                and objects == [("table", "embedding_documents")]
+                and _table_matches(self._connection)
+            )
+        except _Rejected:
+            raise StorageError("Unsupported database schema.") from None
+        except sqlite3.Error:
+            raise StorageError("Embedding store could not open the database.") from None
+        if not readable:
+            raise StorageError("Unsupported database schema.")
 
     def put_document(
         self,

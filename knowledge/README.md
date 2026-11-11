@@ -328,7 +328,7 @@ draft = await generate_draft(
 
 ## Live 入口
 
-`hp_a_once` 是唯一的真送出入口。它只從呼叫者傳入的專案根讀 `.env` 的 `OPENAI_API_KEY`，用真實 reader、chunker 與已發布的 digest 準備「HP-A 耳機可以用水洗嗎？」和原保養 chunk。不重新 embedding。不讀 policy，不開舊 ledger，也不把費率、token 成本、預留或歷史 unknown 當作准入。`budget.py` 的預留與 unknown 只留在離線 `generate_draft`，不在這條 live 路徑上，也不會刪或改既有帳本。離線路徑仍會因未知計費欄位拒絕並保留 unknown。live 路徑把回答解析和計費形狀分開：認不出的欄位只留下安全名稱與 code，usage 維持未識別，不填 0，也不擋一份已通過模型、狀態、refusal 與來源檢查的回答。
+`hp_a_once` 是固定單題的真送出入口。`POST /ask` 在檢索到候選後，改走同一個 `post_prepared_answer`：同一套 key-only transport 與 parser，請求 ID 由該次 HTTP 呼叫產生。`hp_a_once` 仍只從呼叫者傳入的專案根讀 `.env` 的 `OPENAI_API_KEY`，用真實 reader、chunker 與已發布的 digest 準備「HP-A 耳機可以用水洗嗎？」和原保養 chunk。不重新 embedding。兩條路徑都不讀 policy，不開舊 ledger，也不把費率、token 成本、預留或歷史 unknown 當作准入。`budget.py` 的預留與 unknown 只留在離線 `generate_draft`，不在這條 live 路徑上，也不會刪或改既有帳本。離線路徑仍會因未知計費欄位拒絕並保留 unknown。live 路徑把回答解析和計費形狀分開：認不出的欄位只留下安全名稱與 code，usage 維持未識別，不填 0，也不擋一份已通過模型、狀態、refusal 與來源檢查的回答。
 
 ```python
 from pathlib import Path
