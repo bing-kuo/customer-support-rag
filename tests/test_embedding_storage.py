@@ -535,6 +535,36 @@ def test_missing_parent_directory_creates_nothing(tmp_path: Path) -> None:
     assert not path.parent.exists()
 
 
+def test_readonly_open_does_not_create_or_rewrite(tmp_path: Path) -> None:
+    missing = tmp_path / "missing.sqlite"
+    with pytest.raises(StorageError, match="could not open"):
+        EmbeddingStore.open_readonly(missing)
+    assert not missing.exists()
+
+    path = tmp_path / "embeddings.sqlite"
+    source = read_document(KNOWLEDGE, "hp-a/headphone-care.md")
+    with EmbeddingStore(path) as store:
+        key = store.put_document(
+            source,
+            embed_eligible(chunk_document(source)),
+            model_digest=MODEL_DIGEST,
+        )
+    before = path.read_bytes()
+    names = sorted(item.name for item in tmp_path.iterdir())
+    with EmbeddingStore.open_readonly(path) as store:
+        loaded = store.get_document(key)
+        with pytest.raises(StorageError):
+            store.put_document(
+                source,
+                embed_eligible(chunk_document(source), 2.0),
+                model_digest=MODEL_DIGEST,
+            )
+    assert loaded is not None
+    assert loaded.artifact_key == HP_A_ARTIFACT
+    assert path.read_bytes() == before
+    assert sorted(item.name for item in tmp_path.iterdir()) == names
+
+
 def test_closed_store_cannot_read(tmp_path: Path) -> None:
     store = EmbeddingStore(tmp_path / "embeddings.sqlite")
     store.close()

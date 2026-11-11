@@ -51,6 +51,7 @@ __all__ = [
     "LiveReadiness",
     "hp_a_check",
     "hp_a_once",
+    "post_prepared_answer",
     "prepare_hp_a_request",
 ]
 
@@ -133,22 +134,33 @@ def hp_a_check(root: Path, *, knowledge: Path | None = None) -> LiveReadiness:
     )
 
 
-async def hp_a_once(
+async def post_prepared_answer(
     root: Path,
+    request: AnswerRequest,
     *,
-    knowledge: Path | None = None,
+    request_id: str,
     deadline: float = DEFAULT_DEADLINE_SECONDS,
 ) -> LiveCall:
-    """Send the one prepared request once. The key is the only local admission.
+    """Send one prepared request once. The key is the only local admission.
 
-    Policy, rates, token-cost proof, and the historical ledger are not read.
-    A 429, timeout, or other provider error stops this call and is not retried.
-    A billing-shape miss keeps a parsed answer and leaves usage unidentified.
+    ``hp_a_once`` and the single-question API share this sender, transport, and
+    parser. Policy, rates, token-cost proof, and the historical ledger are not
+    read. A 429, timeout, or other provider error stops this call and is not
+    retried. A billing-shape miss keeps a parsed answer and leaves usage
+    unidentified. The request id is the caller's; this function does not reuse
+    a previous id or claim exactly-once delivery.
     """
+    if not isinstance(request, AnswerRequest):
+        raise LunaError("policy_rejected")
+    if (
+        not isinstance(request_id, str)
+        or not request_id.strip()
+        or len(request_id) > 200
+    ):
+        raise LunaError("policy_rejected")
     key, key_failures = _read_key(root / ".env")
     if key is None or key_failures:
         raise LunaError("paid_blocked")
-    request = prepare_hp_a_request(_knowledge(knowledge))
     encoded = wire_bytes(build_luna_body(request))
     if len(encoded) > MAX_WIRE_BYTES:
         raise LunaError("wire_body_exceeded")
@@ -159,7 +171,7 @@ async def hp_a_once(
             request,
             api_key=key,
             transport=transport,
-            request_id=REQUEST_ID,
+            request_id=request_id,
             deadline=deadline,
         )
     finally:
@@ -170,6 +182,29 @@ async def hp_a_once(
         stopped=stopped,
         usage_code=note.code,
         usage_fields=note.fields,
+    )
+
+
+async def hp_a_once(
+    root: Path,
+    *,
+    knowledge: Path | None = None,
+    deadline: float = DEFAULT_DEADLINE_SECONDS,
+) -> LiveCall:
+    """Send the one prepared HP-A request once.
+
+    The key is checked before evidence is prepared, then
+    :func:`post_prepared_answer` reads it again and posts at most once.
+    """
+    key, key_failures = _read_key(root / ".env")
+    if key is None or key_failures:
+        raise LunaError("paid_blocked")
+    request = prepare_hp_a_request(_knowledge(knowledge))
+    return await post_prepared_answer(
+        root,
+        request,
+        request_id=REQUEST_ID,
+        deadline=deadline,
     )
 
 
