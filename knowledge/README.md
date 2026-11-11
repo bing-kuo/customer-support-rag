@@ -326,9 +326,9 @@ draft = await generate_draft(
 
 `tests/test_luna.py` 與 `tests/test_budget_continuity.py` 用假 HTTP 和臨時的舊格式 ledger 驗這條路徑。通過不代表帳務餘額、模型品質或知識啟用已經核實。
 
-## Live 入口（尚未呼叫）
+## Live 入口
 
-`hp_a_once` 是唯一的真送出入口。它只從呼叫者傳入的專案根讀 `.env` 的 `OPENAI_API_KEY`，用真實 reader、chunker 與已發布的 digest 準備「HP-A 耳機可以用水洗嗎？」和原保養 chunk。不重新 embedding。不讀 policy，不開舊 ledger，也不把費率、token 成本、預留或歷史 unknown 當作准入。`budget.py` 的預留與 unknown 只留在離線 `generate_draft`，不在這條 live 路徑上，也不會刪或改既有帳本。
+`hp_a_once` 是唯一的真送出入口。它只從呼叫者傳入的專案根讀 `.env` 的 `OPENAI_API_KEY`，用真實 reader、chunker 與已發布的 digest 準備「HP-A 耳機可以用水洗嗎？」和原保養 chunk。不重新 embedding。不讀 policy，不開舊 ledger，也不把費率、token 成本、預留或歷史 unknown 當作准入。`budget.py` 的預留與 unknown 只留在離線 `generate_draft`，不在這條 live 路徑上，也不會刪或改既有帳本。離線路徑仍會因未知計費欄位拒絕並保留 unknown。live 路徑把回答解析和計費形狀分開：認不出的欄位只留下安全名稱與 code，usage 維持未識別，不填 0，也不擋一份已通過模型、狀態、refusal 與來源檢查的回答。
 
 ```python
 from pathlib import Path
@@ -338,4 +338,4 @@ from customer_support_rag.luna_live import hp_a_once
 result = await hp_a_once(Path("."))
 ```
 
-本節沒有呼叫它。穩定請求 ID 是 `hp-a-luna-natural-answer-one-shot-v1`。一次呼叫最多一個 POST，不 retry、不 fallback。`max_output_tokens` 只限制這一次的輸出長度。收到 429 立刻停：provider code 屬於額度或 spend 時是 `insufficient_quota`，屬於速率時是 `rate_limit`；認不出的 429 是 `provider_capacity`，不把它當成超額，也不等候後再送。timeout 或其他錯誤同樣停止這一次，不寫 unknown 列去擋住下一次。`hp_a_check` 只報告 key 與 wire bytes，不是送出授權。公開的 `generate_draft` 只接受 mock transport。
+穩定請求 ID 是 `hp-a-luna-natural-answer-one-shot-v1`。一次呼叫最多一個 POST，不 retry、不 fallback。2026-11-11 的一次 POST 停在 `unknown_billing_component`，原始回應沒有保存，自然回答不可從那次回復。本節的範例沒有再呼叫。`max_output_tokens` 只限制這一次的輸出長度。收到 429 立刻停：provider code 屬於額度或 spend 時是 `insufficient_quota`，屬於速率時是 `rate_limit`；認不出的 429 是 `provider_capacity`，不把它當成超額，也不等候後再送。timeout 或其他錯誤同樣停止這一次，不寫 unknown 列去擋住下一次。`hp_a_check` 只報告 key 與 wire bytes，不是送出授權。公開的 `generate_draft` 只接受 mock transport。

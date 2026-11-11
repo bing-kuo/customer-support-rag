@@ -568,7 +568,7 @@ async def _post_live_once(
     transport: httpx.AsyncBaseTransport,
     request_id: str,
     deadline: float,
-) -> tuple[GroundedDraft | None, Usage | None, str | None]:
+) -> tuple[GroundedDraft | None, _UsageNote, str | None]:
     """Post one live body. This does not reserve or write a ledger."""
     if not _factory_transport(transport):
         raise LunaError("paid_blocked")
@@ -682,9 +682,121 @@ def _error_object(body: bytes) -> Mapping[str, object] | None:
     return error
 
 
+_USAGE_OBSERVATION_CODES = frozenset(
+    {
+        "unknown_billing_component",
+        "usage_missing",
+        "usage_shape_invalid",
+        "usage_totals_invalid",
+        "known_usage_extension_invalid",
+    }
+)
+_SAFE_FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,64}")
+
+
+@dataclass(frozen=True)
+class _UsageNote:
+    """Recognized counts, or a safe incomplete record.
+
+    ``usage is None`` means the counts were not identified. It is not zero.
+    ``fields`` are dotted names only. Values are never copied. A key that is
+    not a short identifier becomes ``unlisted_field``.
+    """
+
+    usage: Usage | None
+    code: str | None
+    fields: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (self.usage is None) == (self.code is None):
+            raise LunaError("invalid_response")
+        if self.code is None and self.fields:
+            raise LunaError("invalid_response")
+
+
+def _safe_field(prefix: str, key: object) -> str:
+    if isinstance(key, str) and _SAFE_FIELD.fullmatch(key):
+        return f"{prefix}.{key}"
+    return f"{prefix}.unlisted_field"
+
+
+def _extra_fields(value: object, allowed: frozenset[str], prefix: str) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    return [_safe_field(prefix, key) for key in value if key not in allowed]
+
+
+def _billing_gaps(payload: Mapping[str, object]) -> tuple[str, ...]:
+    """Name billing keys outside the pinned sets. This stores no values."""
+    found: list[str] = []
+    usage = payload.get("usage")
+    found.extend(_extra_fields(usage, _USAGE_TOP, "usage"))
+    if isinstance(usage, dict):
+        incoming = usage.get("input_tokens_details")
+        found.extend(
+            _extra_fields(incoming, _INPUT_DETAILS, "usage.input_tokens_details")
+        )
+        if isinstance(incoming, dict):
+            found.extend(
+                _extra_fields(
+                    incoming.get("cache_write_tokens_details"),
+                    _TTL,
+                    "usage.input_tokens_details.cache_write_tokens_details",
+                )
+            )
+        found.extend(
+            _extra_fields(
+                usage.get("output_tokens_details"),
+                frozenset({"reasoning_tokens"}),
+                "usage.output_tokens_details",
+            )
+        )
+    tool = payload.get("tool_usage")
+    if "tool_usage" in payload and tool is not None and not isinstance(tool, dict):
+        found.append("tool_usage")
+    if isinstance(tool, dict):
+        found.extend(_extra_fields(tool, _TOOL_FAMILIES, "tool_usage"))
+        web = tool.get("web_search")
+        if isinstance(web, dict):
+            found.extend(
+                _extra_fields(web, frozenset({"num_requests"}), "tool_usage.web_search")
+            )
+            if web.get("num_requests") not in (None, 0):
+                found.append("tool_usage.web_search.num_requests")
+        image = tool.get("image_gen")
+        if isinstance(image, dict):
+            allowed = _IMAGE_GEN_COUNTS | _IMAGE_GEN_OPTIONAL
+            found.extend(_extra_fields(image, allowed, "tool_usage.image_gen"))
+            if not _IMAGE_GEN_COUNTS <= set(image):
+                found.append("tool_usage.image_gen")
+            for key in _IMAGE_GEN_COUNTS:
+                if image.get(key) not in (None, 0):
+                    found.append(f"tool_usage.image_gen.{key}")
+    return tuple(sorted(dict.fromkeys(found)))
+
+
+def _observe_live_usage(payload: Mapping[str, object]) -> _UsageNote:
+    """Read usage for a live answer. A billing-shape miss does not raise.
+
+    The offline ledger path still calls ``parse_usage`` directly and keeps
+    its strict rejection. This note never fills missing counts with zero.
+    """
+    try:
+        usage = parse_usage(payload)
+        _reject_unpriced_tool_fee(payload)
+    except LunaError as exc:
+        if exc.code not in _USAGE_OBSERVATION_CODES:
+            raise
+        fields = (
+            _billing_gaps(payload) if exc.code == "unknown_billing_component" else ()
+        )
+        return _UsageNote(None, exc.code, fields)
+    return _UsageNote(usage, None, ())
+
+
 def _live_outcome(
     payload: Mapping[str, object], request: AnswerRequest
-) -> tuple[GroundedDraft | None, Usage | None, str | None]:
+) -> tuple[GroundedDraft | None, _UsageNote, str | None]:
     if payload.get("model") != MODEL:
         raise LunaError("unverified_returned_model")
     if payload.get("service_tier") != "default":
@@ -692,17 +804,16 @@ def _live_outcome(
     status = payload.get("status")
     if status not in _TERMINAL:
         raise LunaError("unknown_response_terminal_state")
-    usage = parse_usage(payload)
-    _reject_unpriced_tool_fee(payload)
+    note = _observe_live_usage(payload)
     if _contradicts_terminal(str(status), payload):
-        return None, usage, "contradictory_response"
+        return None, note, "contradictory_response"
     if status != "completed":
-        return None, usage, f"provider_{status}"
+        return None, note, f"provider_{status}"
     try:
         draft = parse_luna_output(payload, request)
     except LunaError as exc:
-        return None, usage, exc.code
-    return draft, usage, None
+        return None, note, exc.code
+    return draft, note, None
 
 
 def _public_id(value: object, pattern: re.Pattern[str], secret: str) -> str | None:

@@ -133,6 +133,9 @@ def test_live_call_does_not_read_policy_or_ledger(
     assert result.stopped is None
     assert result.draft is not None
     assert result.draft.answer == ANSWER
+    assert result.usage is not None
+    assert result.usage_code is None
+    assert result.usage_fields == ()
     assert (result.usage.input_tokens, result.usage.output_tokens) == (12, 8)
     assert len(calls) == 1
     assert calls[0].method == "POST"
@@ -274,6 +277,8 @@ def test_timeout_does_not_block_a_later_call(
     result = asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
     assert result.stopped is None
     assert result.draft is not None
+    assert result.usage is not None
+    assert result.usage_code is None
     assert calls["n"] == 2
     assert not (root / "runtime").exists()
 
@@ -299,8 +304,153 @@ def test_quality_failure_keeps_usage_without_a_ledger_row(
     result = asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
     assert result.draft is None
     assert result.stopped == "unknown_citation"
+    assert result.usage is not None
+    assert result.usage_code is None
     assert result.usage.total_tokens == 20
     assert not (root / "runtime").exists()
+
+
+def test_unknown_billing_field_keeps_the_answer_and_hides_the_value(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_budget(monkeypatch)
+    root = _key_only(tmp_path)
+    calls = {"n": 0}
+
+    async def handler(_self: object, _request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        payload = _envelope(_source_text(_source_id()))
+        usage = dict(payload["usage"])
+        usage["priority_processing"] = "do-not-leak"
+        usage["sk-secret"] = "do-not-leak"
+        payload["usage"] = usage
+        payload["tool_usage"] = {"audio_gen": {"seconds": 3}}
+        return httpx.Response(200, json=payload)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handler)
+    result = asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
+    assert calls["n"] == 1
+    assert result.stopped is None
+    assert result.draft is not None
+    assert result.draft.answer == ANSWER
+    source = result.draft.sources[0].hit.chunk
+    assert source.index == 1
+    assert (source.char_start, source.char_end) == (1, 71)
+    assert "乾燥柔軟的布" in source.text
+    assert "浸入水中" in source.text
+    assert "溶劑" in source.text
+    assert result.usage is None
+    assert result.usage_code == "unknown_billing_component"
+    assert result.usage_fields == (
+        "tool_usage.audio_gen",
+        "usage.priority_processing",
+        "usage.unlisted_field",
+    )
+    visible = repr(result)
+    assert "do-not-leak" not in visible
+    assert "sk-secret" not in visible
+    assert not (root / "runtime").exists()
+
+
+def test_unknown_billing_field_still_rejects_a_bad_citation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_budget(monkeypatch)
+    root = _key_only(tmp_path)
+    calls = {"n": 0}
+
+    async def handler(_self: object, _request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        text = json.dumps(
+            {
+                "status": "answer",
+                "answer": ANSWER,
+                "source_ids": ["missing-source"],
+                "reason": None,
+            }
+        )
+        payload = _envelope(text)
+        usage = dict(payload["usage"])
+        usage["priority_processing"] = "do-not-leak"
+        payload["usage"] = usage
+        return httpx.Response(200, json=payload)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handler)
+    result = asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
+    assert calls["n"] == 1
+    assert result.draft is None
+    assert result.stopped == "unknown_citation"
+    assert result.usage is None
+    assert result.usage_code == "unknown_billing_component"
+    assert result.usage_fields == ("usage.priority_processing",)
+    assert "do-not-leak" not in repr(result)
+    assert not (root / "runtime").exists()
+
+
+def test_429_answer_body_is_not_returned_or_retried(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_budget(monkeypatch)
+    root = _key_only(tmp_path)
+    calls = {"n": 0}
+
+    async def handler(_self: object, _request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        return httpx.Response(
+            429,
+            json={
+                "error": {
+                    "code": "rate_limit_exceeded",
+                    "type": "rate_limit_error",
+                    "message": "do-not-leak",
+                },
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": ANSWER}],
+                    }
+                ],
+            },
+            headers={"retry-after": "30"},
+        )
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handler)
+    with pytest.raises(LunaError) as stopped:
+        asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
+    assert stopped.value.code == "rate_limit"
+    assert calls["n"] == 1
+    assert "do-not-leak" not in str(stopped.value)
+    assert ANSWER not in str(stopped.value)
+
+
+def test_refusal_still_stops_without_returning_the_answer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _forbid_budget(monkeypatch)
+    root = _key_only(tmp_path)
+    calls = {"n": 0}
+
+    async def handler(_self: object, _request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        payload = _envelope("")
+        payload["output"] = [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [{"type": "refusal", "refusal": "no"}],
+            }
+        ]
+        return httpx.Response(200, json=payload)
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", handler)
+    result = asyncio.run(hp_a_once(root, knowledge=KNOWLEDGE))
+    assert calls["n"] == 1
+    assert result.draft is None
+    assert result.stopped == "output_refusal"
+    assert result.usage is not None
+    assert result.usage_code is None
+    assert result.usage.total_tokens == 20
 
 
 def test_factory_uses_tls_without_proxy_retries_or_redirects() -> None:

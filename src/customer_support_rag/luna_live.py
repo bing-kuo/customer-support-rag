@@ -4,8 +4,9 @@ Importing this module does not read a key, open a ledger, or make a network
 call. ``hp_a_check`` reports the key and the wire bytes. It does not authorize
 a send. ``hp_a_once`` is the only live entry: it reads the key again, posts
 at most once, and does not open the historical ledger or a policy file.
-A stopped call does not write an unknown row. This module does not record a
-live answer.
+A stopped call does not write an unknown row. An unrecognized billing field
+does not discard a parsed answer and does not invent token counts. This
+module does not record a live answer.
 """
 
 from __future__ import annotations
@@ -58,16 +59,24 @@ __all__ = [
 class LiveCall:
     """One finished live response. ``stopped`` is a safe code, or None.
 
-    Usage is the provider's reported token counts. This object is not a ledger
-    row, and a stopped call does not block a later call.
+    ``usage`` is present only when the known billing shape matched. ``None``
+    means the counts were not identified, not that they were zero.
+    ``usage_code`` and ``usage_fields`` name that gap. Fields are safe names,
+    never values. This object is not a ledger row.
     """
 
     draft: GroundedDraft | None
-    usage: Usage
+    usage: Usage | None
     stopped: str | None
+    usage_code: str | None = None
+    usage_fields: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         if (self.stopped is None) == (self.draft is None):
+            raise LunaError("invalid_response")
+        if (self.usage is None) == (self.usage_code is None):
+            raise LunaError("invalid_response")
+        if self.usage_code is None and self.usage_fields:
             raise LunaError("invalid_response")
 
 
@@ -134,6 +143,7 @@ async def hp_a_once(
 
     Policy, rates, token-cost proof, and the historical ledger are not read.
     A 429, timeout, or other provider error stops this call and is not retried.
+    A billing-shape miss keeps a parsed answer and leaves usage unidentified.
     """
     key, key_failures = _read_key(root / ".env")
     if key is None or key_failures:
@@ -144,7 +154,7 @@ async def hp_a_once(
         raise LunaError("wire_body_exceeded")
     transport = network_transport()
     try:
-        draft, usage, stopped = await _post_live_once(
+        draft, note, stopped = await _post_live_once(
             encoded,
             request,
             api_key=key,
@@ -154,9 +164,13 @@ async def hp_a_once(
         )
     finally:
         await transport.aclose()
-    if usage is None:
-        raise LunaError("usage_missing")
-    return LiveCall(draft=draft, usage=usage, stopped=stopped)
+    return LiveCall(
+        draft=draft,
+        usage=note.usage,
+        stopped=stopped,
+        usage_code=note.code,
+        usage_fields=note.fields,
+    )
 
 
 def _knowledge(knowledge: Path | None) -> Path:

@@ -45,4 +45,4 @@ GitHub Actions 會使用 `uv.lock` 安裝依賴，在 Python 3.12 與 3.13 執�
 
 離線回答草稿把 caller 已經選好的 hits 收成有界 evidence request，再解析一份假的自然回答。固定 policy 與模型看得到的 JSON 資料分開。HP-A 的來源對照、mock HTTP 自然草稿與無證據 handoff 在 [`knowledge/README.md`](knowledge/README.md)。那是 mock，沒有呼叫 Luna，也還沒有核准啟用。
 
-`hp_a_once` 是唯一的 live 入口，只讀呼叫者指定專案根的 key，準備同一題與既有保養 chunk，最多送一次。它不讀 policy、不開舊 ledger，也不用費率、token 成本或預留當作准入。`max_output_tokens` 只限制這一次的輸出長度。429 會立刻停，並依 provider code 分成 `insufficient_quota` 或 `rate_limit`；認不出的 429 不是超額。說明與邊界見 [`knowledge/README.md`](knowledge/README.md)。
+`hp_a_once` 是唯一的 live 入口，只讀呼叫者指定專案根的 key，準備同一題與既有保養 chunk，最多送一次。它不讀 policy、不開舊 ledger，也不用費率、token 成本或預留當作准入。`max_output_tokens` 只限制這一次的輸出長度。429 會立刻停，並依 provider code 分成 `insufficient_quota` 或 `rate_limit`；認不出的 429 不是超額。認不出的計費欄位不會丟掉已通過模型、狀態與來源檢查的回答，也不會把 usage 填成 0。說明與邊界見 [`knowledge/README.md`](knowledge/README.md)。
