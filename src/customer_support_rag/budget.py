@@ -1,9 +1,12 @@
-"""Minimal ledger compatible with the existing cumulative budget file.
+"""Offline ledger compatible with the historical cumulative budget file.
 
 Opening a ledger never creates or migrates a database. Synthetic fixtures use
 ``init_synthetic_ledger``. Importing this module does not read the environment,
-a key, or a database. The reservation formula is the historical local unit
-formula already stored in that ledger. It is not a verified current price.
+a key, or a database. Reserve, settle, and unknown retention stay here for the
+offline adapter. The live HP-A entry does not open this ledger, read a policy,
+or use those rows as admission. This module does not delete or rewrite an
+existing ledger. The reservation formula is the historical local unit formula
+already stored in that ledger. It is not a verified current price.
 """
 
 from __future__ import annotations
@@ -300,8 +303,8 @@ def load_policy(path: Path) -> LunaPolicy:
 def load_runtime(path: Path, api_key: str) -> LunaRuntime:
     """Build a runtime from an explicit policy path and key argument.
 
-    The environment is not read. ``pricing_bound_verified`` stays false: the
-    historical formula is not a same-day fee ceiling.
+    The environment is not read. ``pricing_bound_verified`` stays false and is
+    not a live-send authorization. The live entry does not read this flag.
     """
     if (
         not isinstance(api_key, str)

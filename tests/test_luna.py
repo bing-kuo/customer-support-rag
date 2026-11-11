@@ -44,6 +44,7 @@ from customer_support_rag.luna import (
     DRAFT_SCHEMA,
     MAX_RESPONSE_BYTES,
     MODEL,
+    WIRE_FUDGE,
     LunaError,
     build_luna_body,
     generate_draft,
@@ -353,7 +354,7 @@ def test_oversized_request_is_refused_before_reserve(tmp_path: Path) -> None:
         hits=[_hit(text)],
     )
     encoded = wire_bytes(build_luna_body(request))
-    if len(encoded) + 256 + OUTPUT_RESERVATION <= 4096:
+    if len(encoded) + WIRE_FUDGE + OUTPUT_RESERVATION <= 4096:
         pytest.fail("the long evidence fixture no longer exceeds the old total cap")
     spy = Spy(httpx.Response(200, json=envelope("{}")))
     path, caught = run_draft(tmp_path, request, spy, "too-long")

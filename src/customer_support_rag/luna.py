@@ -1,8 +1,9 @@
 """Fixed gpt-6-luna adapter. Tests inject a mock transport and a tmp ledger.
 
 Importing this module does not read a key, open a database, or make a network
-call. A real transport is refused: the same-day fee ceiling is not verified.
-``store=false`` does not mean zero data retention.
+call. ``generate_draft`` accepts only a mock transport and is the offline
+ledger path. The one-shot runner is the only live entry. ``store=false`` does
+not mean zero data retention.
 """
 
 from __future__ import annotations
@@ -40,7 +41,10 @@ MODEL = "gpt-6-luna"
 ORIGIN = "https://api.openai.com"
 RESPONSES_PATH = "/v1/responses"
 MAX_WIRE_BYTES = 16 * 1024
-WIRE_FUDGE = 256
+MAX_INPUT_TOKENS = TOTAL_RESERVATION - OUTPUT_RESERVATION
+# Offline ledger reservation candidate only. It is not a live token-cost gate
+# and the count API is not called. The live entry does not consult it.
+WIRE_FUDGE = 1024
 MAX_RESPONSE_BYTES = 64 * 1024
 CONNECT_TIMEOUT_SECONDS = 2.0
 DEFAULT_DEADLINE_SECONDS = 60.0
@@ -94,11 +98,15 @@ __all__ = [
     "MODEL",
     "LunaError",
     "Usage",
+    "WireParts",
     "build_luna_body",
     "generate_draft",
+    "network_transport",
     "parse_luna_output",
     "parse_usage",
     "responses_client",
+    "wire_composition",
+    "wire_bytes",
 ]
 
 
@@ -108,6 +116,32 @@ class LunaError(Exception):
     def __init__(self, code: str) -> None:
         super().__init__(code)
         self.code = code
+
+
+_FACTORY = object()
+_QUOTA_CODES = frozenset(
+    {
+        "insufficient_quota",
+        "credit_balance_exhausted",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "organization_usage_limit_exceeded",
+    }
+)
+_RATE_CODES = frozenset({"rate_limit_exceeded", "rate_limit", "slow_down"})
+
+
+@dataclass(frozen=True)
+class WireParts:
+    """Byte lengths of one serialized body. Lengths are not token certificates."""
+
+    policy_bytes: int
+    data_bytes: int
+    schema_bytes: int
+    framing_bytes: int
+    total_bytes: int
+    reserved_input_tokens: int
+    ceiling_headroom_tokens: int
 
 
 @dataclass(frozen=True)
@@ -124,14 +158,27 @@ class Usage:
     reasoning_tokens: int | None
 
 
-def responses_client(transport: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
-    """Build the fixed client around an injected transport.
+def network_transport() -> httpx.AsyncHTTPTransport:
+    """Build the one TLS transport. Tests may replace this; callers do not."""
+    transport = httpx.AsyncHTTPTransport(verify=True, trust_env=False, retries=0)
+    pool = transport._pool
+    if pool._retries != 0 or type(pool).__name__ != "AsyncConnectionPool":
+        raise LunaError("provider_transport_error")
+    transport._luna_factory = _FACTORY
+    return transport
 
-    Only ``httpx.MockTransport`` is accepted. A network transport stays blocked
-    until a later dispatch verifies the fee ceiling.
+
+def responses_client(transport: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
+    """Build the fixed client for a mock transport.
+
+    A factory or caller-built network transport is refused before any request.
     """
-    if not isinstance(transport, httpx.MockTransport):
+    if type(transport) is not httpx.MockTransport:
         raise LunaError("paid_blocked")
+    return _open_client(transport)
+
+
+def _open_client(transport: httpx.AsyncBaseTransport) -> httpx.AsyncClient:
     return httpx.AsyncClient(
         base_url=ORIGIN,
         verify=True,
@@ -189,17 +236,55 @@ def wire_bytes(body: Mapping[str, object]) -> bytes:
 
 
 def input_reservation(encoded: bytes) -> int:
-    """Return the offline byte candidate, or refuse a body past the old cap.
+    """Reserve one token per serialized byte, plus the structural allowance.
 
-    ``len(body) + 256`` is not a proven provider token count. A body that
-    cannot fit under the existing 4096 total is refused instead of truncated.
+    The allowance is only the offline candidate above. A body that cannot fit
+    under the historical total is refused instead of truncated.
     """
     if len(encoded) > MAX_WIRE_BYTES:
         raise LunaError("wire_body_exceeded")
     candidate = len(encoded) + WIRE_FUDGE
-    if candidate + OUTPUT_RESERVATION > TOTAL_RESERVATION:
+    if candidate > MAX_INPUT_TOKENS:
         raise LunaError("input_bound_exceeded")
     return candidate
+
+
+def wire_composition(request: AnswerRequest) -> WireParts:
+    """Split one body into policy, model data, schema, and framing.
+
+    ``data_bytes`` is the model-visible JSON before it is placed in a JSON
+    string. ``framing_bytes`` is the rest of the wire, including object syntax
+    and the extra bytes that string escaping adds. The token reservation uses
+    the whole wire plus the structural allowance, not the visible pieces alone.
+    """
+    _require_request(request)
+    encoded = wire_bytes(build_luna_body(request))
+    policy = GROUNDED_POLICY.encode()
+    data = request.model_data_json().encode()
+    schema = json.dumps(
+        DRAFT_SCHEMA,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    ).encode()
+    escaped = json.dumps(request.model_data_json(), ensure_ascii=False).encode()
+    spans = (_span(encoded, policy), _span(encoded, schema), _span(encoded, escaped))
+    if len(escaped) < len(data) + 2 or _overlaps(spans):
+        raise LunaError("wire_composition_invalid")
+    framing = len(encoded) - (len(policy) + len(data) + len(schema))
+    if framing < 0:
+        raise LunaError("wire_composition_invalid")
+    reserved = input_reservation(encoded)
+    return WireParts(
+        policy_bytes=len(policy),
+        data_bytes=len(data),
+        schema_bytes=len(schema),
+        framing_bytes=framing,
+        total_bytes=len(encoded),
+        reserved_input_tokens=reserved,
+        ceiling_headroom_tokens=MAX_INPUT_TOKENS - reserved,
+    )
 
 
 def parse_usage(raw: Mapping[str, object]) -> Usage:
@@ -274,12 +359,13 @@ async def generate_draft(
     scope: str,
     deadline: float = DEFAULT_DEADLINE_SECONDS,
 ) -> GroundedDraft:
-    """Reserve, send once through the injected transport, then resolve.
+    """Reserve on the offline ledger, send once through a mock, then resolve.
 
     Empty evidence returns the fixed handoff and does not reserve. Failures
-    after a durable send keep the reservation. Nothing is retried.
+    after a durable send keep the reservation. Nothing is retried. A network
+    transport is refused before reserve. The live entry does not call this.
     """
-    if not isinstance(transport, httpx.MockTransport):
+    if type(transport) is not httpx.MockTransport:
         raise LunaError("paid_blocked")
     if not isinstance(runtime, LunaRuntime) or not isinstance(ledger, Ledger):
         raise LunaError("runtime_unavailable")
@@ -334,6 +420,27 @@ async def generate_draft(
         response_id,
         request_header,
         time.monotonic() - started,
+    )
+
+
+def _span(haystack: bytes, needle: bytes) -> tuple[int, int]:
+    start = haystack.find(needle)
+    if start < 0 or haystack.find(needle, start + 1) != -1:
+        raise LunaError("wire_composition_invalid")
+    return start, start + len(needle)
+
+
+def _overlaps(spans: tuple[tuple[int, int], ...]) -> bool:
+    ordered = sorted(spans)
+    return any(
+        left[1] > right[0] for left, right in zip(ordered, ordered[1:], strict=False)
+    )
+
+
+def _factory_transport(transport: object) -> bool:
+    return (
+        type(transport) is httpx.AsyncHTTPTransport
+        and getattr(transport, "_luna_factory", None) is _FACTORY
     )
 
 
@@ -445,21 +552,71 @@ async def _post(
     runtime: LunaRuntime,
     transport: httpx.AsyncBaseTransport,
 ) -> tuple[Mapping[str, object], str | None, str | None]:
+    body, status_code, request_header = await _exchange(
+        encoded, request_id, runtime.api_key, transport
+    )
+    if status_code != 200:
+        raise LunaError(_provider_status_code(status_code, body))
+    return _completed_payload(body, runtime.api_key, request_header)
+
+
+async def _post_live_once(
+    encoded: bytes,
+    request: AnswerRequest,
+    *,
+    api_key: str,
+    transport: httpx.AsyncBaseTransport,
+    request_id: str,
+    deadline: float,
+) -> tuple[GroundedDraft | None, _UsageNote, str | None]:
+    """Post one live body. This does not reserve or write a ledger."""
+    if not _factory_transport(transport):
+        raise LunaError("paid_blocked")
+    _require_deadline(deadline)
+    try:
+        body, status_code, _request_header = await asyncio.wait_for(
+            _exchange(encoded, request_id, api_key, transport), deadline
+        )
+    except TimeoutError:
+        raise LunaError("logical_timeout") from None
+    if status_code != 200:
+        raise LunaError(_provider_status_code(status_code, body))
+    payload, _response_id, _request_header = _completed_payload(
+        body, api_key, _request_header
+    )
+    return _live_outcome(payload, request)
+
+
+def _require_deadline(deadline: float) -> None:
+    if (
+        type(deadline) not in (int, float)
+        or not math.isfinite(deadline)
+        or deadline <= 0
+    ):
+        raise LunaError("runtime_unavailable")
+
+
+async def _exchange(
+    encoded: bytes,
+    request_id: str,
+    api_key: str,
+    transport: httpx.AsyncBaseTransport,
+) -> tuple[bytes, int, str | None]:
     headers = {
-        "Authorization": f"Bearer {runtime.api_key}",
+        "Authorization": f"Bearer {api_key}",
         "Content-Type": "application/json",
         "X-Client-Request-Id": request_id,
     }
     try:
-        async with responses_client(transport) as client:
+        async with _open_client(transport) as client:
             # stream=True bounds the HTTP read. The JSON body still has stream false.
             async with client.stream(
                 "POST", RESPONSES_PATH, content=encoded, headers=headers
             ) as response:
                 body = await _read_bounded(response)
                 status_code = response.status_code
-                request_header = _safe_id(
-                    response.headers.get("x-request-id"), _REQUEST_ID, runtime
+                request_header = _public_id(
+                    response.headers.get("x-request-id"), _REQUEST_ID, api_key
                 )
     except LunaError:
         raise
@@ -467,23 +624,206 @@ async def _post(
         raise LunaError("provider_transport_error") from None
     except httpx.TransportError:
         raise LunaError("provider_transport_error") from None
-    if status_code in (401, 403):
-        raise LunaError("provider_authentication_or_access_unavailable")
-    if status_code == 404:
-        raise LunaError("provider_model_or_endpoint_unavailable")
-    if status_code == 429:
-        raise LunaError("provider_capacity")
-    if status_code != 200:
-        raise LunaError("provider_service_unavailable")
+    return body, status_code, request_header
+
+
+def _completed_payload(
+    body: bytes, api_key: str, request_header: str | None
+) -> tuple[Mapping[str, object], str | None, str | None]:
     try:
         payload = _json_object(body.decode("utf-8"))
     except UnicodeError:
         raise LunaError("invalid_response") from None
     return (
         payload,
-        _safe_id(_text(payload.get("id")), _RESPONSE_ID, runtime),
+        _public_id(_text(payload.get("id")), _RESPONSE_ID, api_key),
         request_header,
     )
+
+
+def _provider_status_code(status_code: int, body: bytes) -> str:
+    if status_code in (401, 403):
+        return "provider_authentication_or_access_unavailable"
+    if status_code == 404:
+        return "provider_model_or_endpoint_unavailable"
+    if status_code == 429:
+        return _limit_code(body)
+    return "provider_service_unavailable"
+
+
+def _limit_code(body: bytes) -> str:
+    """Map a 429 body to a safe code. An unrecognized 429 is not quota."""
+    error = _error_object(body)
+    if error is None:
+        return "provider_capacity"
+    code = error.get("code")
+    kind = error.get("type")
+    if isinstance(code, str) and code in _QUOTA_CODES:
+        return "insufficient_quota"
+    if isinstance(code, str) and code in _RATE_CODES:
+        return "rate_limit"
+    if kind == "insufficient_quota":
+        return "insufficient_quota"
+    if kind == "rate_limit_error":
+        return "rate_limit"
+    return "provider_capacity"
+
+
+def _error_object(body: bytes) -> Mapping[str, object] | None:
+    try:
+        payload = json.loads(body.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError, ValueError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    return error
+
+
+_USAGE_OBSERVATION_CODES = frozenset(
+    {
+        "unknown_billing_component",
+        "usage_missing",
+        "usage_shape_invalid",
+        "usage_totals_invalid",
+        "known_usage_extension_invalid",
+    }
+)
+_SAFE_FIELD = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,64}")
+
+
+@dataclass(frozen=True)
+class _UsageNote:
+    """Recognized counts, or a safe incomplete record.
+
+    ``usage is None`` means the counts were not identified. It is not zero.
+    ``fields`` are dotted names only. Values are never copied. A key that is
+    not a short identifier becomes ``unlisted_field``.
+    """
+
+    usage: Usage | None
+    code: str | None
+    fields: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if (self.usage is None) == (self.code is None):
+            raise LunaError("invalid_response")
+        if self.code is None and self.fields:
+            raise LunaError("invalid_response")
+
+
+def _safe_field(prefix: str, key: object) -> str:
+    if isinstance(key, str) and _SAFE_FIELD.fullmatch(key):
+        return f"{prefix}.{key}"
+    return f"{prefix}.unlisted_field"
+
+
+def _extra_fields(value: object, allowed: frozenset[str], prefix: str) -> list[str]:
+    if not isinstance(value, dict):
+        return []
+    return [_safe_field(prefix, key) for key in value if key not in allowed]
+
+
+def _billing_gaps(payload: Mapping[str, object]) -> tuple[str, ...]:
+    """Name billing keys outside the pinned sets. This stores no values."""
+    found: list[str] = []
+    usage = payload.get("usage")
+    found.extend(_extra_fields(usage, _USAGE_TOP, "usage"))
+    if isinstance(usage, dict):
+        incoming = usage.get("input_tokens_details")
+        found.extend(
+            _extra_fields(incoming, _INPUT_DETAILS, "usage.input_tokens_details")
+        )
+        if isinstance(incoming, dict):
+            found.extend(
+                _extra_fields(
+                    incoming.get("cache_write_tokens_details"),
+                    _TTL,
+                    "usage.input_tokens_details.cache_write_tokens_details",
+                )
+            )
+        found.extend(
+            _extra_fields(
+                usage.get("output_tokens_details"),
+                frozenset({"reasoning_tokens"}),
+                "usage.output_tokens_details",
+            )
+        )
+    tool = payload.get("tool_usage")
+    if "tool_usage" in payload and tool is not None and not isinstance(tool, dict):
+        found.append("tool_usage")
+    if isinstance(tool, dict):
+        found.extend(_extra_fields(tool, _TOOL_FAMILIES, "tool_usage"))
+        web = tool.get("web_search")
+        if isinstance(web, dict):
+            found.extend(
+                _extra_fields(web, frozenset({"num_requests"}), "tool_usage.web_search")
+            )
+            if web.get("num_requests") not in (None, 0):
+                found.append("tool_usage.web_search.num_requests")
+        image = tool.get("image_gen")
+        if isinstance(image, dict):
+            allowed = _IMAGE_GEN_COUNTS | _IMAGE_GEN_OPTIONAL
+            found.extend(_extra_fields(image, allowed, "tool_usage.image_gen"))
+            if not _IMAGE_GEN_COUNTS <= set(image):
+                found.append("tool_usage.image_gen")
+            for key in _IMAGE_GEN_COUNTS:
+                if image.get(key) not in (None, 0):
+                    found.append(f"tool_usage.image_gen.{key}")
+    return tuple(sorted(dict.fromkeys(found)))
+
+
+def _observe_live_usage(payload: Mapping[str, object]) -> _UsageNote:
+    """Read usage for a live answer. A billing-shape miss does not raise.
+
+    The offline ledger path still calls ``parse_usage`` directly and keeps
+    its strict rejection. This note never fills missing counts with zero.
+    """
+    try:
+        usage = parse_usage(payload)
+        _reject_unpriced_tool_fee(payload)
+    except LunaError as exc:
+        if exc.code not in _USAGE_OBSERVATION_CODES:
+            raise
+        fields = (
+            _billing_gaps(payload) if exc.code == "unknown_billing_component" else ()
+        )
+        return _UsageNote(None, exc.code, fields)
+    return _UsageNote(usage, None, ())
+
+
+def _live_outcome(
+    payload: Mapping[str, object], request: AnswerRequest
+) -> tuple[GroundedDraft | None, _UsageNote, str | None]:
+    if payload.get("model") != MODEL:
+        raise LunaError("unverified_returned_model")
+    if payload.get("service_tier") != "default":
+        raise LunaError("unverified_service_tier")
+    status = payload.get("status")
+    if status not in _TERMINAL:
+        raise LunaError("unknown_response_terminal_state")
+    note = _observe_live_usage(payload)
+    if _contradicts_terminal(str(status), payload):
+        return None, note, "contradictory_response"
+    if status != "completed":
+        return None, note, f"provider_{status}"
+    try:
+        draft = parse_luna_output(payload, request)
+    except LunaError as exc:
+        return None, note, exc.code
+    return draft, note, None
+
+
+def _public_id(value: object, pattern: re.Pattern[str], secret: str) -> str | None:
+    if (
+        not isinstance(value, str)
+        or secret in value
+        or pattern.fullmatch(value) is None
+    ):
+        return None
+    return value
 
 
 async def _read_bounded(response: httpx.Response) -> bytes:
@@ -630,18 +970,6 @@ def _retain_quietly(ledger: Ledger, request_id: str) -> None:
         ledger.retain_unknown(request_id)
     except BudgetError:
         return
-
-
-def _safe_id(
-    value: object, pattern: re.Pattern[str], runtime: LunaRuntime
-) -> str | None:
-    if (
-        not isinstance(value, str)
-        or runtime.api_key in value
-        or pattern.fullmatch(value) is None
-    ):
-        return None
-    return value
 
 
 def _text(value: object) -> str | None:
