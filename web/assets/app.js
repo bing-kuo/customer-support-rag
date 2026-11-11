@@ -189,13 +189,18 @@
     if (!(typeof payload.usage_code === "string" || payload.usage_code === null)) return false;
     if (!Array.isArray(payload.usage_fields)) return false;
     if (payload.status === "answer") {
-      return typeof payload.answer === "string" && payload.reason === null && payload.sources.every((source) =>
-        source && ["source_id", "artifact_key", "document_id", "product_id", "version", "title", "heading", "text"].every((key) => typeof source[key] === "string") &&
-        ["chunk_index", "char_start", "char_end"].every((key) => Number.isInteger(source[key])) &&
-        source.chunk_index >= 0 && source.char_start >= 0 && source.char_end >= source.char_start &&
-        ["hp-a", "hp-b"].includes(source.product_id));
+      return typeof payload.answer === "string" && payload.answer.trim().length > 0 &&
+        payload.reason === null && payload.sources.length > 0 && payload.sources.every(validSource);
     }
     return payload.status === "handoff" && payload.answer === null && ["no_evidence", "conflicting_evidence", "refund_request"].includes(payload.reason) && payload.sources.length === 0;
+  }
+
+  function validSource(source) {
+    return source && ["source_id", "artifact_key", "document_id", "version", "title", "text"].every((key) =>
+      typeof source[key] === "string" && source[key].trim().length > 0) &&
+      typeof source.heading === "string" && ["hp-a", "hp-b"].includes(source.product_id) &&
+      ["chunk_index", "char_start", "char_end"].every((key) => Number.isInteger(source[key])) &&
+      source.chunk_index >= 0 && source.char_start >= 0 && source.char_end > source.char_start;
   }
 
   function validUsage(usage) {
