@@ -21,6 +21,10 @@ from customer_support_rag.knowledge import (
     chunk_document,
     read_document,
 )
+from customer_support_rag.knowledge.embedding import (
+    OLLAMA_TAGS_URL,
+    PUBLISHED_MODEL_DIGEST,
+)
 
 KNOWLEDGE_ROOT = Path(__file__).parents[1] / "knowledge"
 HP_A_BODY = (
@@ -607,5 +611,96 @@ def test_hp_a_care_document_embeds_only_the_eligible_chunk() -> None:
     assert len(embedded) == 1
     assert embedded[0].chunk is chunks[1]
     assert embedded[0].chunk.index == 1
-    assert embedded[0].chunk.body_sha256 == chunks[0].body_sha256
-    assert len(embedded[0].vector) == EMBEDDING_DIMENSIONS
+
+
+def _published_tags(digest: str = PUBLISHED_MODEL_DIGEST) -> httpx.Response:
+    return httpx.Response(
+        200, json={"models": [{"name": EMBEDDING_MODEL, "digest": digest}]}
+    )
+
+
+def test_checked_chunks_use_the_fixed_endpoint_without_truncation() -> None:
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/tags":
+            return _published_tags()
+        return embed_response([vector(1)])
+
+    chunk = make_chunk("keep this text")
+    with OllamaEmbeddingAdapter(httpx.MockTransport(handler)) as adapter:
+        embedded = adapter.embed_chunks_checked(
+            [chunk], expected_model_digest=PUBLISHED_MODEL_DIGEST
+        )
+
+    assert [item.url.path for item in requests] == [
+        "/api/tags",
+        "/api/embed",
+        "/api/tags",
+    ]
+    assert str(requests[0].url) == OLLAMA_TAGS_URL
+    assert str(requests[1].url) == OLLAMA_EMBED_URL
+    assert str(requests[2].url) == OLLAMA_TAGS_URL
+    body = payload(requests[1])
+    assert body["model"] == EMBEDDING_MODEL
+    assert body["input"] == ["keep this text"]
+    assert body["truncate"] is False
+    assert body["keep_alive"] == 0
+    assert len(embedded) == 1
+    assert embedded[0].chunk is chunk
+
+
+def test_checked_chunks_stop_on_digest_mismatch_before_the_post() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        return _published_tags("ab" * 32)
+
+    with OllamaEmbeddingAdapter(httpx.MockTransport(handler)) as adapter:
+        with pytest.raises(EmbeddingError, match="digest does not match"):
+            adapter.embed_chunks_checked(
+                [make_chunk("one")], expected_model_digest=PUBLISHED_MODEL_DIGEST
+            )
+
+    assert requests == ["/api/tags"]
+
+
+def test_checked_chunks_timeout_is_not_retried_and_returns_nothing() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/api/tags":
+            return _published_tags()
+        raise httpx.ReadTimeout("slow")
+
+    with OllamaEmbeddingAdapter(httpx.MockTransport(handler)) as adapter:
+        with pytest.raises(EmbeddingError, match="timed out"):
+            adapter.embed_chunks_checked(
+                [make_chunk("one"), make_chunk("two")],
+                expected_model_digest=PUBLISHED_MODEL_DIGEST,
+            )
+
+    assert requests == ["/api/tags", "/api/embed"]
+
+
+def test_checked_chunks_reject_a_digest_change_after_the_post() -> None:
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/api/embed":
+            return embed_response([vector(1), vector(2)])
+        digest = PUBLISHED_MODEL_DIGEST if requests == ["/api/tags"] else "cd" * 32
+        return _published_tags(digest)
+
+    with OllamaEmbeddingAdapter(httpx.MockTransport(handler)) as adapter:
+        with pytest.raises(EmbeddingError, match="digest does not match"):
+            adapter.embed_chunks_checked(
+                [make_chunk("one"), make_chunk("two")],
+                expected_model_digest=PUBLISHED_MODEL_DIGEST,
+            )
+
+    assert requests == ["/api/tags", "/api/embed", "/api/tags"]

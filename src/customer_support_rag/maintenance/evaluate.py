@@ -1,22 +1,32 @@
-"""Mock regression for one candidate. Generation cases stay unverified.
+"""Regression for one candidate. Generation cases stay unverified.
 
-Running this module does not call Luna or Ollama. A boolean with no cases is
-not a result.
+The default path does not call Luna or Ollama. A real candidate can embed its
+retrieval questions only when the caller passes a test transport or sets the
+explicit live query flag. A boolean with no cases is not a result.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
 
+import httpx
+
 from customer_support_rag.assist import SlotCoordinator
-from customer_support_rag.knowledge.embedding import OllamaEmbeddingAdapter
+from customer_support_rag.knowledge.embedding import (
+    PUBLISHED_MODEL_DIGEST,
+    EmbeddingError,
+    OllamaEmbeddingAdapter,
+)
 from customer_support_rag.knowledge.retrieval import ExactCosineIndex
 from customer_support_rag.knowledge.storage import EmbeddingStore
 from customer_support_rag.maintenance.baseline import baseline_order
 from customer_support_rag.maintenance.errors import MaintenanceError
 from customer_support_rag.maintenance.hashes import describe_document, sha256_file
 from customer_support_rag.maintenance.json_text import human_json, load_object
-from customer_support_rag.maintenance.mock_embed import mock_transport
+from customer_support_rag.maintenance.mock_embed import (
+    MOCK_EMBED_DIGEST,
+    mock_transport,
+)
 from customer_support_rag.maintenance.paths import require_directory
 from customer_support_rag.maintenance.release import (
     ActiveSnapshot,
@@ -48,14 +58,25 @@ def evaluate_release(
     suite_path: Path,
     *,
     code_sha: str,
+    query_transport: httpx.MockTransport | None = None,
+    live_query: bool = False,
 ) -> Path:
-    """Write ``regression.json`` beside the candidate database."""
+    """Write ``regression.json`` beside the candidate database.
+
+    ``live_query`` is the only switch that embeds retrieval questions through
+    the real Ollama transport. It is rejected for a mock candidate. Generation
+    cases stay unverified either way.
+    """
     _code_sha(code_sha)
     suite = _load_suite(suite_path)
     with workspace_lock(workspace):
         snapshot = candidate_snapshot(workspace, release_id)
+        selected, query_label = _select_query_transport(
+            snapshot, query_transport, live_query
+        )
         cases = [
-            _run_case(case, snapshot, suite, knowledge_root) for case in _cases(suite)
+            _run_case(case, snapshot, suite, knowledge_root, selected)
+            for case in _cases(suite)
         ]
         report = {
             "schema": "knowledge-release-regression",
@@ -66,7 +87,9 @@ def evaluate_release(
             "code_sha": code_sha,
             "suite_version": suite["suite_version"],
             "rubric_version": suite["rubric_version"],
-            "transport": "mock",
+            "transport": snapshot.transport,
+            "model_digest": snapshot.model_digest,
+            "query_transport": query_label,
             "mock_is_not_generation_evidence": True,
             "cases": cases,
         }
@@ -138,6 +161,46 @@ def require_mock_regression(report: dict[str, object]) -> None:
         raise MaintenanceError("regression is missing a required category")
     if report.get("mock_is_not_generation_evidence") is not True:
         raise MaintenanceError("regression is invalid")
+    _require_transport_fields(report)
+
+
+def _require_transport_fields(report: dict[str, object]) -> None:
+    transport = report.get("transport")
+    query_transport = report.get("query_transport")
+    model_digest = report.get("model_digest")
+    if transport == "mock":
+        if query_transport != "mock" or model_digest != MOCK_EMBED_DIGEST:
+            raise MaintenanceError("regression is invalid")
+        return
+    if (
+        transport == "ollama"
+        and query_transport in {"mock", "ollama"}
+        and model_digest == PUBLISHED_MODEL_DIGEST
+    ):
+        return
+    raise MaintenanceError("regression is invalid")
+
+
+def _select_query_transport(
+    snapshot: ActiveSnapshot,
+    query_transport: httpx.MockTransport | None,
+    live_query: bool,
+) -> tuple[httpx.MockTransport | None, str]:
+    if live_query and query_transport is not None:
+        raise MaintenanceError("embedding transport is invalid")
+    if snapshot.transport == "mock":
+        if live_query or query_transport is not None:
+            raise MaintenanceError("mock candidate cannot use another embedder")
+        return mock_transport(snapshot.model_digest), "mock"
+    if snapshot.transport != "ollama":
+        raise MaintenanceError("active release is unavailable")
+    if query_transport is not None:
+        if type(query_transport) is not httpx.MockTransport:
+            raise MaintenanceError("embedding transport is invalid")
+        return query_transport, "mock"
+    if live_query:
+        return None, "ollama"
+    raise MaintenanceError("embedding transport is offline")
 
 
 def _run_case(
@@ -145,6 +208,7 @@ def _run_case(
     snapshot: ActiveSnapshot,
     suite: dict[str, object],
     knowledge_root: Path,
+    query_transport: httpx.MockTransport | None,
 ) -> dict[str, object]:
     kind = case["type"]
     base = {
@@ -168,7 +232,7 @@ def _run_case(
     if kind == "absent_document":
         return {**base, **_absent_case(case, snapshot)}
     if kind == "retrieval":
-        return {**base, **_retrieval_case(case, snapshot, suite)}
+        return {**base, **_retrieval_case(case, snapshot, suite, query_transport)}
     raise MaintenanceError("suite is invalid")
 
 
@@ -259,7 +323,10 @@ def _absent_case(
 
 
 def _retrieval_case(
-    case: dict[str, object], snapshot: ActiveSnapshot, suite: dict[str, object]
+    case: dict[str, object],
+    snapshot: ActiveSnapshot,
+    suite: dict[str, object],
+    query_transport: httpx.MockTransport | None,
 ) -> dict[str, object]:
     source_sets = suite["source_sets"]
     name = case.get("source_set")
@@ -278,7 +345,7 @@ def _retrieval_case(
     top_k = suite.get("top_k")
     if not isinstance(top_k, int):
         raise MaintenanceError("suite is invalid")
-    cosine, baseline = _rank(snapshot, question, product, top_k)
+    cosine, baseline = _rank(snapshot, question, product, top_k, query_transport)
     detail = {
         "result": "pass",
         "model_called": False,
@@ -301,7 +368,11 @@ def _retrieval_case(
 
 
 def _rank(
-    snapshot: ActiveSnapshot, question: str, product: str, top_k: int
+    snapshot: ActiveSnapshot,
+    question: str,
+    product: str,
+    top_k: int,
+    query_transport: httpx.MockTransport | None,
 ) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
     store = EmbeddingStore.open_readonly(snapshot.database)
     try:
@@ -318,12 +389,15 @@ def _rank(
             for chunk in loaded.chunks:
                 if chunk.metadata.product_id == product and chunk.text.strip():
                     rows.append((key, chunk))
-        adapter = OllamaEmbeddingAdapter(mock_transport(snapshot.model_digest))
+        adapter = OllamaEmbeddingAdapter(query_transport)
         try:
-            query = adapter.embed_query(
-                question, expected_model_digest=snapshot.model_digest
-            )
-            hits = index.search(query, product_id=product, top_k=top_k)
+            try:
+                query = adapter.embed_query(
+                    question, expected_model_digest=snapshot.model_digest
+                )
+                hits = index.search(query, product_id=product, top_k=top_k)
+            except EmbeddingError:
+                raise MaintenanceError("embedding failed") from None
         finally:
             adapter.close()
     finally:

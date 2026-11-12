@@ -14,6 +14,9 @@ from pydantic import BaseModel, ConfigDict
 from customer_support_rag.knowledge.models import KnowledgeChunk
 
 EMBEDDING_MODEL = "qwen3-embedding:0.6b"
+PUBLISHED_MODEL_DIGEST = (
+    "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"
+)
 EMBEDDING_DIMENSIONS = 1024
 MAX_CHUNKS_PER_REQUEST = 8
 MAX_EMBED_TEXT_CHARS = 1200
@@ -145,6 +148,22 @@ class OllamaEmbeddingAdapter:
             dimensions=EMBEDDING_DIMENSIONS,
             query_profile=QUERY_PROFILE,
         )
+
+    def embed_chunks_checked(
+        self, chunks: Sequence[KnowledgeChunk], *, expected_model_digest: str
+    ) -> list[EmbeddedChunk]:
+        """Embed document chunks after the local model digest matches.
+
+        This uses the same tag check as :meth:`embed_query`: one read before
+        the single embed request and one after it. A mismatch or a failed
+        response raises ``EmbeddingError`` and returns no chunks. The request
+        is not retried, split, or truncated.
+        """
+        digest = _expected_digest(expected_model_digest)
+        self._require_tag_digest(digest)
+        embedded = self.embed_chunks(chunks)
+        self._require_tag_digest(digest)
+        return embedded
 
     def _post(self, texts: list[str]) -> httpx.Response:
         return self._exchange(

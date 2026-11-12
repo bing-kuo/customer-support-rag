@@ -1,6 +1,8 @@
-"""Command line for mock draft hashes, candidates, and explicit activation.
+"""Command line for draft hashes, candidates, and explicit activation.
 
-There is no approve command. Reviewer identity is read from an existing record.
+The default embedder is offline and mock. ``--embed ollama`` is the only live
+embedding switch. There is no approve command. Reviewer identity is read from
+an existing record.
 """
 
 from __future__ import annotations
@@ -22,6 +24,7 @@ from customer_support_rag.maintenance.hashes import (
     sha256_file,
 )
 from customer_support_rag.maintenance.json_text import human_json
+from customer_support_rag.maintenance.mock_embed import OllamaEmbedder
 from customer_support_rag.maintenance.release import (
     activate,
     build_candidate,
@@ -59,6 +62,7 @@ def _parser() -> argparse.ArgumentParser:
     _workspace(build)
     build.add_argument("--root", type=Path, required=True)
     build.add_argument("--source", action="append", required=True)
+    _embed_choice(build)
     build.set_defaults(func=_build)
     evaluate = commands.add_parser("evaluate")
     _workspace(evaluate)
@@ -66,6 +70,7 @@ def _parser() -> argparse.ArgumentParser:
     evaluate.add_argument("--release", required=True)
     evaluate.add_argument("--suite", type=Path, required=True)
     evaluate.add_argument("--code-sha", required=True)
+    _embed_choice(evaluate)
     evaluate.set_defaults(func=_evaluate)
     consume_release = commands.add_parser("consume-release")
     _workspace(consume_release)
@@ -88,6 +93,10 @@ def _workspace(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--workspace", type=Path, required=True)
 
 
+def _embed_choice(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--embed", choices=("mock", "ollama"), default="mock")
+
+
 def _hashes(args: argparse.Namespace) -> int:
     _print(describe_document(args.root, args.path).as_dict())
     return 0
@@ -105,7 +114,8 @@ def _consume_document(args: argparse.Namespace) -> int:
 
 
 def _build(args: argparse.Namespace) -> int:
-    result = build_candidate(args.workspace, args.root, tuple(args.source))
+    embedder = OllamaEmbedder() if args.embed == "ollama" else None
+    result = build_candidate(args.workspace, args.root, tuple(args.source), embedder)
     _print(
         {
             "release_id": result.release_id,
@@ -124,6 +134,7 @@ def _evaluate(args: argparse.Namespace) -> int:
         args.release,
         args.suite,
         code_sha=args.code_sha,
+        live_query=args.embed == "ollama",
     )
     _print({"regression": path.name})
     return 0
@@ -161,6 +172,8 @@ def _status(args: argparse.Namespace) -> int:
     _print(
         {
             "active": snapshot.release_id,
+            "transport": snapshot.transport,
+            "model_digest": snapshot.model_digest,
             "manifest_sha256": snapshot.manifest_sha256,
             "database_sha256": snapshot.database_sha256,
         }

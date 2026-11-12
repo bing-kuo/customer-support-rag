@@ -8,9 +8,11 @@ succeeds and the pointer directory fsync then fails, activation returns
 The writer lock is ``flock`` in this process; it is not a distributed lock.
 
 Same-bytes rebuild returns the existing directory and does not embed again.
-Artifact keys do not cover vectors. Copying them requires the source manifest,
-database file hash, mock digest, document identity, and a mock vector for
-every chunk. Activation also checks that file hash.
+Artifact keys do not cover vectors. Copying them requires the same transport,
+the source manifest, the database file hash, and the document identity. A mock
+candidate also requires the mock digest and a mock vector for every chunk. An
+Ollama candidate requires the published digest and is never filled from a mock
+candidate. Activation also checks that file hash.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ from pathlib import Path, PurePosixPath
 from customer_support_rag.knowledge.embedding import (
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
+    PUBLISHED_MODEL_DIGEST,
 )
 from customer_support_rag.knowledge.parser import parse_document
 from customer_support_rag.knowledge.storage import (
@@ -52,6 +55,7 @@ from customer_support_rag.maintenance.json_text import (
 from customer_support_rag.maintenance.mock_embed import (
     MOCK_EMBED_DIGEST,
     MockEmbedder,
+    OllamaEmbedder,
     mock_vector,
 )
 from customer_support_rag.maintenance.paths import (
@@ -83,6 +87,7 @@ class ActiveSnapshot:
     model_digest: str
     manifest_sha256: str
     database_sha256: str
+    transport: str
 
 
 @contextmanager
@@ -105,12 +110,18 @@ def build_candidate(
     workspace: Path,
     knowledge_root: Path,
     sources: tuple[str, ...] | list[str],
-    embedder: MockEmbedder | None = None,
+    embedder: object | None = None,
 ) -> BuildResult:
-    """Build one complete mock candidate, or return the identical release."""
+    """Build one complete candidate, or return the identical release.
+
+    The default embedder is the offline mock. An ``OllamaEmbedder`` selects
+    the published digest and does not reuse mock vectors.
+    """
     with workspace_lock(workspace) as root:
         described = _approved_sources(root, knowledge_root, sources)
-        identity, release_id = _identity(described)
+        selected = MockEmbedder() if embedder is None else embedder
+        transport, model_digest = _profile(selected)
+        identity, release_id = _identity(described, transport, model_digest)
         releases = ensure_real_directory(root, PurePosixPath("releases"))
         final = releases / release_id
         if final.is_symlink():
@@ -119,13 +130,16 @@ def build_candidate(
             if _matches_existing(final, release_id, identity):
                 return BuildResult(release_id, True, 0, 0)
             raise MaintenanceError("release already exists")
-        selected = MockEmbedder() if embedder is None else embedder
         partial_name = f".partial-{uuid.uuid4().hex}"
         partial = ensure_real_directory(root, PurePosixPath("releases") / partial_name)
         try:
-            embedded, copied = _write_database(root, partial, described, selected)
+            embedded, copied = _write_database(
+                root, partial, described, selected, transport, model_digest
+            )
             database_sha = sha256_file(partial / "knowledge.sqlite")
-            manifest = _manifest(release_id, described, database_sha)
+            manifest = _manifest(
+                release_id, described, database_sha, transport, model_digest
+            )
             _durable_bytes(
                 partial / "manifest.json", human_json(manifest).encode("utf-8")
             )
@@ -291,12 +305,21 @@ def _approved_sources(
     return tuple(sorted(described, key=lambda item: item.relative_path))
 
 
-def _identity(described: tuple[DocumentDigest, ...]) -> tuple[dict[str, object], str]:
+def _profile(embedder: object) -> tuple[str, str]:
+    """Return the transport name and digest selected by this embedder."""
+    if isinstance(embedder, OllamaEmbedder):
+        return "ollama", PUBLISHED_MODEL_DIGEST
+    return "mock", MOCK_EMBED_DIGEST
+
+
+def _identity(
+    described: tuple[DocumentDigest, ...], transport: str, model_digest: str
+) -> tuple[dict[str, object], str]:
     documents = []
     for item in described:
         parsed = parse_document(item.text)
         key = document_embedding_key(
-            parsed, model_digest=MOCK_EMBED_DIGEST, max_chars=_MAX_CHARS
+            parsed, model_digest=model_digest, max_chars=_MAX_CHARS
         )
         documents.append(
             {
@@ -312,8 +335,8 @@ def _identity(described: tuple[DocumentDigest, ...]) -> tuple[dict[str, object],
     identity: dict[str, object] = {
         "schema": "knowledge-release-identity",
         "schema_version": 1,
-        "transport": "mock",
-        "embedding": _embedding_block(),
+        "transport": transport,
+        "embedding": _embedding_block(model_digest),
         "sources": documents,
     }
     digest = hashlib.sha256(canonical_json(identity).encode("utf-8")).hexdigest()
@@ -324,7 +347,9 @@ def _write_database(
     workspace: Path,
     partial: Path,
     described: tuple[DocumentDigest, ...],
-    embedder: MockEmbedder,
+    embedder: object,
+    transport: str,
+    model_digest: str,
 ) -> tuple[int, int]:
     database = partial / "knowledge.sqlite"
     embedded = 0
@@ -333,24 +358,24 @@ def _write_database(
     try:
         for item in described:
             document = parse_document(item.text)
-            key = document_embedding_key(document, model_digest=MOCK_EMBED_DIGEST)
-            reusable = _reusable_embeddings(workspace, key, document.body)
+            key = document_embedding_key(document, model_digest=model_digest)
+            reusable = _reusable_embeddings(
+                workspace, key, document.body, transport, model_digest
+            )
             if reusable is not None:
                 try:
-                    store.put_document(
-                        document, reusable, model_digest=MOCK_EMBED_DIGEST
-                    )
+                    store.put_document(document, reusable, model_digest=model_digest)
                     copied += 1
                     continue
                 except ValueError:
                     pass
             try:
-                vectors = embedder.embed_document(document)
+                vectors = embedder.embed_document(document)  # type: ignore[attr-defined]
             except MaintenanceError:
                 raise
             except Exception:  # noqa: BLE001 - embedder failures stay category-only
                 raise MaintenanceError("embedding failed") from None
-            store.put_document(document, vectors, model_digest=MOCK_EMBED_DIGEST)
+            store.put_document(document, vectors, model_digest=model_digest)
             embedded += 1
     finally:
         store.close()
@@ -363,7 +388,11 @@ def _write_database(
 
 
 def _reusable_embeddings(
-    workspace: Path, artifact_key: str, body: str
+    workspace: Path,
+    artifact_key: str,
+    body: str,
+    transport: str,
+    model_digest: str,
 ) -> object | None:
     releases = workspace / "releases"
     if releases.is_symlink() or not releases.is_dir():
@@ -375,14 +404,20 @@ def _reusable_embeddings(
     for child in sorted(releases.iterdir()):
         if child.is_symlink() or not child.is_dir() or child.name.startswith("."):
             continue
-        reusable = _embeddings_from_release(child, artifact_key, body)
+        reusable = _embeddings_from_release(
+            child, artifact_key, body, transport, model_digest
+        )
         if reusable is not None:
             return reusable
     return None
 
 
 def _embeddings_from_release(
-    directory: Path, artifact_key: str, body: str
+    directory: Path,
+    artifact_key: str,
+    body: str,
+    transport: str,
+    model_digest: str,
 ) -> object | None:
     database = directory / "knowledge.sqlite"
     manifest_path = directory / "manifest.json"
@@ -401,9 +436,10 @@ def _embeddings_from_release(
     database_record = manifest.get("database")
     documents = manifest.get("documents")
     if (
-        manifest.get("transport") != "mock"
+        manifest.get("transport") != transport
         or not isinstance(embedding, dict)
-        or embedding.get("model_digest") != MOCK_EMBED_DIGEST
+        or embedding.get("model_digest") != model_digest
+        or not _digest_matches_transport(transport, model_digest)
         or not isinstance(database_record, dict)
         or database_record.get("sha256") != sha256_file(database)
         or not isinstance(documents, list)
@@ -433,7 +469,7 @@ def _embeddings_from_release(
         store.close()
     if loaded is None or loaded.document.body != body:
         return None
-    if loaded.model_digest != MOCK_EMBED_DIGEST or not loaded.embedded_chunks:
+    if loaded.model_digest != model_digest or not loaded.embedded_chunks:
         return None
     metadata = loaded.document.metadata
     if (
@@ -442,14 +478,19 @@ def _embeddings_from_release(
         or identity.get("version") != metadata.version
     ):
         return None
-    for item in loaded.embedded_chunks:
-        if item.vector != tuple(mock_vector(item.chunk.text)):
-            return None
+    if transport == "mock":
+        for item in loaded.embedded_chunks:
+            if item.vector != tuple(mock_vector(item.chunk.text)):
+                return None
     return loaded.embedded_chunks
 
 
 def _manifest(
-    release_id: str, described: tuple[DocumentDigest, ...], database_sha256: str
+    release_id: str,
+    described: tuple[DocumentDigest, ...],
+    database_sha256: str,
+    transport: str,
+    model_digest: str,
 ) -> dict[str, object]:
     documents = []
     for item in described:
@@ -464,7 +505,7 @@ def _manifest(
                 "file_sha256": item.file_sha256,
                 "body_sha256": item.body_sha256,
                 "artifact_key": document_embedding_key(
-                    parsed, model_digest=MOCK_EMBED_DIGEST
+                    parsed, model_digest=model_digest
                 ),
             }
         )
@@ -472,22 +513,30 @@ def _manifest(
         "schema": "knowledge-release-manifest",
         "schema_version": 1,
         "release_id": release_id,
-        "transport": "mock",
-        "embedding": _embedding_block(),
+        "transport": transport,
+        "embedding": _embedding_block(model_digest),
         "documents": documents,
         "database": {"relative_path": "knowledge.sqlite", "sha256": database_sha256},
     }
 
 
-def _embedding_block() -> dict[str, object]:
+def _embedding_block(model_digest: str) -> dict[str, object]:
     return {
         "model": EMBEDDING_MODEL,
-        "model_digest": MOCK_EMBED_DIGEST,
+        "model_digest": model_digest,
         "dimensions": EMBEDDING_DIMENSIONS,
         "input_profile": INPUT_PROFILE,
         "chunking_profile": CHUNKING_PROFILE,
         "max_chars": _MAX_CHARS,
     }
+
+
+def _digest_matches_transport(transport: str, model_digest: str) -> bool:
+    if transport == "mock":
+        return model_digest == MOCK_EMBED_DIGEST
+    if transport == "ollama":
+        return model_digest == PUBLISHED_MODEL_DIGEST
+    return False
 
 
 def _matches_existing(
@@ -524,7 +573,15 @@ def _matches_existing(
         for item in sources
         if isinstance(item, dict)
     }
-    return actual == expected and manifest.get("transport") == "mock"
+    embedding = identity.get("embedding")
+    manifest_embedding = manifest.get("embedding")
+    return (
+        actual == expected
+        and manifest.get("transport") == identity.get("transport")
+        and isinstance(embedding, dict)
+        and isinstance(manifest_embedding, dict)
+        and manifest_embedding.get("model_digest") == embedding.get("model_digest")
+    )
 
 
 def _read_pointer(pointer: Path) -> tuple[dict[str, object], bytes]:
@@ -582,19 +639,22 @@ def _verified_directory(
         manifest = load_object(manifest_path, manifest_path.read_bytes())
     except OSError:
         raise MaintenanceError("active release is unavailable") from None
-    if manifest.get("release_id") != release_id or manifest.get("transport") != "mock":
-        raise MaintenanceError("active release is unavailable")
+    transport = manifest.get("transport")
     database = manifest.get("database")
     documents = manifest.get("documents")
     embedding = manifest.get("embedding")
+    digest = embedding.get("model_digest") if isinstance(embedding, dict) else None
     if (
-        not isinstance(database, dict)
+        manifest.get("release_id") != release_id
+        or not isinstance(transport, str)
+        or not isinstance(digest, str)
+        or not _digest_matches_transport(transport, digest)
+        or not isinstance(database, dict)
         or database.get("relative_path") != "knowledge.sqlite"
         or database.get("sha256") != database_sha
         or not isinstance(documents, list)
         or not documents
         or not isinstance(embedding, dict)
-        or embedding.get("model_digest") != MOCK_EMBED_DIGEST
     ):
         raise MaintenanceError("active release is unavailable")
     keys: list[str] = []
@@ -604,14 +664,36 @@ def _verified_directory(
         keys.append(item["artifact_key"])
     if len(keys) != len(set(keys)):
         raise MaintenanceError("active release is unavailable")
+    _require_stored_digest(database_path, tuple(keys), digest)
     return ActiveSnapshot(
         release_id=release_id,
         database=database_path,
         artifact_keys=tuple(keys),
-        model_digest=MOCK_EMBED_DIGEST,
+        model_digest=digest,
         manifest_sha256=manifest_sha,
         database_sha256=database_sha,
+        transport=transport,
     )
+
+
+def _require_stored_digest(
+    database_path: Path, keys: tuple[str, ...], model_digest: str
+) -> None:
+    """Reject a manifest digest that does not match the stored payloads."""
+    try:
+        store = EmbeddingStore.open_readonly(database_path)
+    except (OSError, StorageError):
+        raise MaintenanceError("active release is unavailable") from None
+    try:
+        for key in keys:
+            try:
+                loaded = store.get_document(key)
+            except (OSError, StorageError):
+                raise MaintenanceError("active release is unavailable") from None
+            if loaded is None or loaded.model_digest != model_digest:
+                raise MaintenanceError("active release is unavailable")
+    finally:
+        store.close()
 
 
 def _open_keys(snapshot: ActiveSnapshot) -> None:

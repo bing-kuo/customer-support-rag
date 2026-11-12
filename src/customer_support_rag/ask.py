@@ -28,6 +28,7 @@ from customer_support_rag.knowledge.answering import (
     prepare_answer,
 )
 from customer_support_rag.knowledge.embedding import (
+    PUBLISHED_MODEL_DIGEST,
     EmbeddingError,
     OllamaEmbeddingAdapter,
 )
@@ -42,7 +43,7 @@ from customer_support_rag.luna_live import post_prepared_answer
 from customer_support_rag.maintenance.errors import MaintenanceError
 from customer_support_rag.maintenance.release import load_active_snapshot
 
-PUBLISHED_DIGEST = "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"
+PUBLISHED_DIGEST = PUBLISHED_MODEL_DIGEST
 HP_A_CARE_ARTIFACT = "9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad"
 HP_B_CONNECTION_ARTIFACT = (
     "18812b328a8e3614c4c83a849c2bfcd108e695453c8eaf9d57cf87200cefafae"

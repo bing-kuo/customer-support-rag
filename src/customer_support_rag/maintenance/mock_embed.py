@@ -1,4 +1,9 @@
-"""Deterministic mock embeddings. This does not contact Ollama."""
+"""Mock embeddings, and the explicit Ollama document embedder.
+
+Importing this module does not open a connection. ``MockEmbedder`` never
+contacts Ollama. ``OllamaEmbedder`` contacts Ollama only when its transport
+is omitted.
+"""
 
 import hashlib
 import json
@@ -9,6 +14,7 @@ from customer_support_rag.knowledge.chunker import chunk_document
 from customer_support_rag.knowledge.embedding import (
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
+    PUBLISHED_MODEL_DIGEST,
     OllamaEmbeddingAdapter,
 )
 from customer_support_rag.knowledge.models import KnowledgeDocument
@@ -77,3 +83,28 @@ class MockEmbedder:
         self.calls += 1
         with OllamaEmbeddingAdapter(self.transport) as adapter:
             return adapter.embed_chunks(chunk_document(document))
+
+
+class OllamaEmbedder:
+    """Embed one approved document with the fixed local model.
+
+    Pass a ``MockTransport`` from tests. Omit it only for an explicit live
+    build: that uses ``HTTPTransport`` and the published digest. A mock digest
+    is not accepted. One document performs at most one embed POST. A failed
+    tag check, timeout, or response does not retry and does not return vectors.
+    """
+
+    def __init__(self, transport: httpx.MockTransport | None = None) -> None:
+        if transport is not None and type(transport) is not httpx.MockTransport:
+            raise TypeError("transport must be an httpx.MockTransport")
+        self.transport = transport
+        self.calls = 0
+
+    def embed_document(self, document: KnowledgeDocument) -> list[object]:
+        with OllamaEmbeddingAdapter(self.transport) as adapter:
+            embedded = adapter.embed_chunks_checked(
+                chunk_document(document),
+                expected_model_digest=PUBLISHED_MODEL_DIGEST,
+            )
+        self.calls += 1
+        return embedded

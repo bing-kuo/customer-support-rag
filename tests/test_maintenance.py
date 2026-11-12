@@ -20,6 +20,11 @@ from customer_support_rag.ask import (
     config_from_environment,
 )
 from customer_support_rag.knowledge import KnowledgeChunk, KnowledgeMetadata
+from customer_support_rag.knowledge.embedding import (
+    EMBEDDING_MODEL,
+    OLLAMA_EMBED_URL,
+    PUBLISHED_MODEL_DIGEST,
+)
 from customer_support_rag.knowledge.storage import EmbeddingStore
 from customer_support_rag.luna import MODEL
 from customer_support_rag.maintenance.approval import consume_document_approval
@@ -27,6 +32,7 @@ from customer_support_rag.maintenance.baseline import baseline_order, bigram_ove
 from customer_support_rag.maintenance.cli import main
 from customer_support_rag.maintenance.errors import MaintenanceError
 from customer_support_rag.maintenance.evaluate import (
+    _select_query_transport,
     evaluate_release,
     require_mock_regression,
 )
@@ -39,9 +45,11 @@ from customer_support_rag.maintenance.json_text import human_json, load_object
 from customer_support_rag.maintenance.mock_embed import (
     MOCK_EMBED_DIGEST,
     MockEmbedder,
+    OllamaEmbedder,
     mock_vector,
 )
 from customer_support_rag.maintenance.release import (
+    BuildResult,
     activate,
     build_candidate,
     candidate_snapshot,
@@ -614,6 +622,321 @@ def test_vertical_mock_ask_cites_faq_only_after_that_release(
     assert MOCK_EMBED_DIGEST != PUBLISHED_DIGEST
 
 
+def test_default_cli_embed_stays_offline_and_ollama_is_explicit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    captured: dict[str, object] = {}
+
+    def fake_build(*args: object, **kwargs: object):
+        captured["embedder"] = kwargs.get(
+            "embedder", args[3] if len(args) > 3 else None
+        )
+        return BuildResult("ab" * 32, False, 0, 0)
+
+    monkeypatch.setattr(
+        "customer_support_rag.maintenance.cli.build_candidate", fake_build
+    )
+    assert (
+        main(
+            [
+                "build",
+                "--workspace",
+                str(tmp_path),
+                "--root",
+                str(KNOWLEDGE),
+                "--source",
+                BASELINE[0],
+            ]
+        )
+        == 0
+    )
+    assert captured["embedder"] is None
+    assert (
+        main(
+            [
+                "build",
+                "--workspace",
+                str(tmp_path),
+                "--root",
+                str(KNOWLEDGE),
+                "--source",
+                BASELINE[0],
+                "--embed",
+                "ollama",
+            ]
+        )
+        == 0
+    )
+    live = captured["embedder"]
+    assert isinstance(live, OllamaEmbedder)
+    assert live.transport is None
+    assert live.calls == 0
+    capsys.readouterr()
+
+    def fake_evaluate(*_args: object, **kwargs: object) -> Path:
+        captured["live_query"] = kwargs.get("live_query")
+        return tmp_path / "regression.json"
+
+    monkeypatch.setattr(
+        "customer_support_rag.maintenance.cli.evaluate_release", fake_evaluate
+    )
+    assert (
+        main(
+            [
+                "evaluate",
+                "--workspace",
+                str(tmp_path),
+                "--root",
+                str(KNOWLEDGE),
+                "--release",
+                "ab" * 32,
+                "--suite",
+                str(SUITE),
+                "--code-sha",
+                CODE,
+            ]
+        )
+        == 0
+    )
+    assert captured["live_query"] is False
+    assert (
+        main(
+            [
+                "evaluate",
+                "--workspace",
+                str(tmp_path),
+                "--root",
+                str(KNOWLEDGE),
+                "--release",
+                "ab" * 32,
+                "--suite",
+                str(SUITE),
+                "--code-sha",
+                CODE,
+                "--embed",
+                "ollama",
+            ]
+        )
+        == 0
+    )
+    assert captured["live_query"] is True
+
+
+def test_ollama_identity_does_not_reuse_mock_vectors(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    _approve(workspace, BASELINE)
+    mocked = build_candidate(workspace, KNOWLEDGE, BASELINE)
+    requests: list[httpx.Request] = []
+    embedder = OllamaEmbedder(_published_transport(requests))
+    built = build_candidate(workspace, KNOWLEDGE, BASELINE, embedder)
+    assert built.release_id != mocked.release_id
+    assert built.copied == 0
+    assert built.embedded == 2
+    assert embedder.calls == 2
+    mock_manifest = _manifest_payload(workspace, mocked.release_id)
+    real_manifest = _manifest_payload(workspace, built.release_id)
+    assert mock_manifest["transport"] == "mock"
+    assert real_manifest["transport"] == "ollama"
+    assert _embedding_digest(mock_manifest) == MOCK_EMBED_DIGEST
+    assert _embedding_digest(real_manifest) == PUBLISHED_MODEL_DIGEST
+    posts = [item for item in requests if item.url.path == "/api/embed"]
+    assert len(posts) == 2
+    assert all(str(item.url) == OLLAMA_EMBED_URL for item in posts)
+    body = json.loads(posts[0].content)
+    assert body["model"] == EMBEDDING_MODEL
+    assert body["truncate"] is False
+    assert body["keep_alive"] == 0
+    again = build_candidate(workspace, KNOWLEDGE, BASELINE, embedder)
+    assert again.noop is True
+    assert again.release_id == built.release_id
+    assert embedder.calls == 2
+    assert len([item for item in requests if item.url.path == "/api/embed"]) == 2
+
+
+def test_ollama_faq_reuses_only_the_published_documents(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    _approve(workspace, FAQ)
+    baseline = build_candidate(
+        workspace, KNOWLEDGE, BASELINE, OllamaEmbedder(_published_transport([]))
+    )
+    requests: list[httpx.Request] = []
+    embedder = OllamaEmbedder(_published_transport(requests))
+    faq = build_candidate(workspace, KNOWLEDGE, FAQ, embedder)
+    assert faq.release_id != baseline.release_id
+    assert faq.copied == 2
+    assert faq.embedded == 1
+    assert embedder.calls == 1
+    assert len([item for item in requests if item.url.path == "/api/embed"]) == 1
+
+
+def test_ollama_digest_timeout_and_partial_stop_without_retry(tmp_path: Path) -> None:
+    mismatch = _workspace(tmp_path / "mismatch")
+    _approve(mismatch, BASELINE)
+    mismatch_requests: list[httpx.Request] = []
+    mismatch_embedder = OllamaEmbedder(
+        _published_transport(mismatch_requests, fail="mismatch")
+    )
+    with pytest.raises(MaintenanceError, match="embedding failed"):
+        build_candidate(mismatch, KNOWLEDGE, BASELINE, mismatch_embedder)
+    assert mismatch_embedder.calls == 0
+    assert [item.url.path for item in mismatch_requests] == ["/api/tags"]
+    assert list((mismatch / "releases").glob(".partial-*")) == []
+
+    timed_out = _workspace(tmp_path / "timeout")
+    _approve(timed_out, BASELINE)
+    timeout_requests: list[httpx.Request] = []
+    timeout_embedder = OllamaEmbedder(
+        _published_transport(timeout_requests, fail="timeout")
+    )
+    with pytest.raises(MaintenanceError, match="embedding failed"):
+        build_candidate(timed_out, KNOWLEDGE, BASELINE, timeout_embedder)
+    assert timeout_embedder.calls == 0
+    assert [item.url.path for item in timeout_requests] == ["/api/tags", "/api/embed"]
+    assert list((timed_out / "releases").glob(".partial-*")) == []
+
+    stopped = _workspace(tmp_path / "second")
+    _approve(stopped, BASELINE)
+    stopped_requests: list[httpx.Request] = []
+    stopped_embedder = OllamaEmbedder(
+        _published_transport(stopped_requests, fail="second")
+    )
+    with pytest.raises(MaintenanceError, match="embedding failed"):
+        build_candidate(stopped, KNOWLEDGE, BASELINE, stopped_embedder)
+    assert stopped_embedder.calls == 1
+    assert (
+        len([item for item in stopped_requests if item.url.path == "/api/embed"]) == 2
+    )
+    assert list(stopped.rglob("knowledge.sqlite")) == []
+
+    discarded = _workspace(tmp_path / "after")
+    _approve(discarded, BASELINE)
+    after_requests: list[httpx.Request] = []
+    after_embedder = OllamaEmbedder(_published_transport(after_requests, fail="after"))
+    with pytest.raises(MaintenanceError, match="embedding failed"):
+        build_candidate(discarded, KNOWLEDGE, BASELINE, after_embedder)
+    assert after_embedder.calls == 0
+    assert [item.url.path for item in after_requests] == [
+        "/api/tags",
+        "/api/embed",
+        "/api/tags",
+    ]
+    assert list(discarded.rglob("knowledge.sqlite")) == []
+
+    conflict = _workspace(tmp_path / "conflict")
+    _approve(conflict, (*POLICY_V1, POLICY_V2[0]))
+    conflict_embedder = OllamaEmbedder(_published_transport([]))
+    with pytest.raises(MaintenanceError, match="document version conflict"):
+        build_candidate(
+            conflict,
+            KNOWLEDGE,
+            ("drafts/hp-a/return-policy-v1.md", "drafts/hp-a/return-policy-v2.md"),
+            conflict_embedder,
+        )
+    assert conflict_embedder.calls == 0
+    assert not (conflict / "active.json").exists()
+
+
+def test_ollama_evaluate_stays_offline_and_generation_stays_unverified(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    _approve(workspace, BASELINE)
+    mocked = build_candidate(workspace, KNOWLEDGE, BASELINE)
+    built = build_candidate(
+        workspace, KNOWLEDGE, BASELINE, OllamaEmbedder(_published_transport([]))
+    )
+    with pytest.raises(MaintenanceError, match="offline"):
+        evaluate_release(workspace, KNOWLEDGE, built.release_id, SUITE, code_sha=CODE)
+    assert not (workspace / "releases" / built.release_id / "regression.json").exists()
+    report_path = evaluate_release(
+        workspace,
+        KNOWLEDGE,
+        built.release_id,
+        SUITE,
+        code_sha=CODE,
+        query_transport=_published_transport([]),
+    )
+    report = load_object(report_path, report_path.read_bytes())
+    assert report["transport"] == "ollama"
+    assert report["model_digest"] == PUBLISHED_MODEL_DIGEST
+    assert report["query_transport"] == "mock"
+    assert report["mock_is_not_generation_evidence"] is True
+    cases = report["cases"]
+    assert isinstance(cases, list)
+    assert {item["result"] for item in cases if item["type"] == "generation"} == {
+        "unverified"
+    }
+    assert all(item["model_called"] is False for item in cases)
+    normal = next(item for item in cases if item["id"] == "normal-care")
+    assert normal["result"] == "pass"
+    selected, label = _select_query_transport(
+        candidate_snapshot(workspace, built.release_id), None, True
+    )
+    assert selected is None
+    assert label == "ollama"
+    with pytest.raises(MaintenanceError, match="another embedder"):
+        _select_query_transport(
+            candidate_snapshot(workspace, mocked.release_id), None, True
+        )
+
+
+def test_rewritten_mock_manifest_cannot_claim_the_published_digest(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path)
+    _approve(workspace, BASELINE)
+    mocked = build_candidate(workspace, KNOWLEDGE, BASELINE)
+    directory = workspace / "releases" / mocked.release_id
+    manifest_path = directory / "manifest.json"
+    manifest = load_object(manifest_path, manifest_path.read_bytes())
+    manifest["transport"] = "ollama"
+    embedding = manifest["embedding"]
+    assert isinstance(embedding, dict)
+    embedding["model_digest"] = PUBLISHED_MODEL_DIGEST
+    database = manifest["database"]
+    assert isinstance(database, dict)
+    database["sha256"] = sha256_file(directory / "knowledge.sqlite")
+    manifest_path.write_text(human_json(manifest), encoding="utf-8")
+    with pytest.raises(MaintenanceError, match="unavailable"):
+        candidate_snapshot(workspace, mocked.release_id)
+
+
+def test_ollama_release_keeps_the_published_digest_at_ask(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    calls = {"luna": 0}
+
+    async def luna(_self: object, request: httpx.Request) -> httpx.Response:
+        calls["luna"] += 1
+        data = _model_data(request)
+        rows = data["evidence"]
+        assert isinstance(rows, list)
+        source_ids = [item["source_id"] for item in rows]
+        return httpx.Response(200, json=_envelope(_draft("合成草稿。", source_ids)))
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", luna)
+    release_id = _build_evaluated_ollama(workspace, BASELINE)
+    _approve_release(tmp_path / "approval", workspace, release_id)
+    assert activate(workspace, release_id, expected_previous=None) == "activated"
+    assert candidate_snapshot(workspace, release_id).model_digest == PUBLISHED_DIGEST
+    client = _ask_client(tmp_path, workspace, _published_transport([]))
+    answered = client.post(
+        "/ask",
+        json={"product_id": "hp-a", "question": "耳機可以用水洗嗎？"},
+    )
+    assert answered.status_code == 200
+    assert "hp-a-care" in {item["document_id"] for item in answered.json()["sources"]}
+    assert calls["luna"] == 1
+    rejected = _ask_client(tmp_path, workspace).post(
+        "/ask",
+        json={"product_id": "hp-a", "question": "耳機可以用水洗嗎？"},
+    )
+    assert rejected.status_code == 502
+    assert rejected.json()["code"] == "embedding_unavailable"
+    assert calls["luna"] == 1
+
+
 def _workspace(path: Path) -> Path:
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -650,6 +973,78 @@ def _build_evaluated(workspace: Path, sources: tuple[str, ...]) -> str:
     built = build_candidate(workspace, KNOWLEDGE, sources)
     evaluate_release(workspace, KNOWLEDGE, built.release_id, SUITE, code_sha=CODE)
     return built.release_id
+
+
+def _build_evaluated_ollama(workspace: Path, sources: tuple[str, ...]) -> str:
+    _approve(workspace, sources)
+    built = build_candidate(
+        workspace, KNOWLEDGE, sources, OllamaEmbedder(_published_transport([]))
+    )
+    evaluate_release(
+        workspace,
+        KNOWLEDGE,
+        built.release_id,
+        SUITE,
+        code_sha=CODE,
+        query_transport=_published_transport([]),
+    )
+    return built.release_id
+
+
+def _published_transport(
+    requests: list[httpx.Request], *, fail: str | None = None
+) -> httpx.MockTransport:
+    seen = {"tags": 0, "posts": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        if request.url.path == "/api/tags":
+            seen["tags"] += 1
+            digest = PUBLISHED_MODEL_DIGEST
+            if fail == "mismatch" or (fail == "after" and seen["tags"] > 1):
+                digest = "ab" * 32
+            return httpx.Response(
+                200,
+                json={"models": [{"name": EMBEDDING_MODEL, "digest": digest}]},
+            )
+        if request.url.path != "/api/embed":
+            return httpx.Response(404)
+        seen["posts"] += 1
+        if fail == "timeout" or (fail == "second" and seen["posts"] >= 2):
+            raise httpx.ReadTimeout("slow")
+        try:
+            payload = json.loads(request.content.decode("utf-8"))
+            texts = payload["input"]
+        except (UnicodeDecodeError, json.JSONDecodeError, KeyError, TypeError):
+            return httpx.Response(400)
+        if not isinstance(texts, list) or not all(
+            isinstance(item, str) for item in texts
+        ):
+            return httpx.Response(400)
+        return httpx.Response(
+            200,
+            json={
+                "model": EMBEDDING_MODEL,
+                "embeddings": [mock_vector(text) for text in texts],
+            },
+        )
+
+    return httpx.MockTransport(handler)
+
+
+def _manifest_payload(workspace: Path, release_id: str) -> dict[str, object]:
+    path = workspace / "releases" / release_id / "manifest.json"
+    payload = load_object(path, path.read_bytes())
+    assert isinstance(payload, dict)
+    return payload
+
+
+def _embedding_digest(manifest: dict[str, object]) -> str:
+    embedding = manifest["embedding"]
+    assert isinstance(embedding, dict)
+    digest = embedding["model_digest"]
+    assert isinstance(digest, str)
+    return digest
 
 
 def _activate_sources(
@@ -799,7 +1194,9 @@ async def answer(config: AskConfig):
     return await answer_ask(config, "hp-a", "可以用水洗嗎？", "req-test")
 
 
-def _ask_client(tmp_path: Path, workspace: Path):
+def _ask_client(
+    tmp_path: Path, workspace: Path, transport: httpx.MockTransport | None = None
+):
     from fastapi.testclient import TestClient
 
     root = tmp_path / "key-root"
@@ -814,7 +1211,7 @@ def _ask_client(tmp_path: Path, workspace: Path):
         artifact_keys=(),
         model_digest=PUBLISHED_DIGEST,
         key_root=root,
-        embedding_transport=mock_transport(),
+        embedding_transport=transport if transport is not None else mock_transport(),
         release_root=workspace,
     )
     return TestClient(create_app(config), base_url="http://127.0.0.1")
