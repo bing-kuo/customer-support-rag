@@ -324,7 +324,10 @@ def _restart_status(guard_root: Path, workspace: Path) -> dict[str, object]:
 
 
 def _assert_local_startup() -> None:
-    with TestClient(create_app(None)) as client:
+    # The API deliberately rejects TestClient's default "testserver" Host.
+    # Use a trusted loopback host so this exercises the same local boundary as
+    # the documented localhost startup without opening a listening socket.
+    with TestClient(create_app(None), base_url="http://localhost") as client:
         _require(client.get("/health").status_code == 200, "health endpoint failed")
         _require(client.get("/docs").status_code == 200, "API docs failed")
         _require(client.get("/").status_code == 200, "local page failed")
