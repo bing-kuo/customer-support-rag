@@ -16,6 +16,7 @@ import re
 import time
 from collections.abc import Mapping
 from dataclasses import dataclass
+from pathlib import Path
 
 import httpx
 
@@ -593,7 +594,8 @@ async def _post_live_once(
     if status_code != 200:
         code = _provider_status_code(status_code, body)
         if diagnostic is not None and record is not None:
-            diagnostic.finish(
+            _finish_diagnostic(
+                diagnostic,
                 record,
                 parser_stage="http_status",
                 safe_code=(
@@ -626,7 +628,7 @@ async def _post_live_once(
                 }
                 else "invalid_response"
             )
-            diagnostic.finish(record, parser_stage=stage, safe_code=safe)
+            _finish_diagnostic(diagnostic, record, parser_stage=stage, safe_code=safe)
         raise
     if diagnostic is not None and record is not None:
         stopped = outcome[2]
@@ -653,8 +655,31 @@ async def _post_live_once(
                 }
                 else "invalid_response"
             )
-        diagnostic.finish(record, parser_stage=stage, safe_code=code)
+        _finish_diagnostic(diagnostic, record, parser_stage=stage, safe_code=code)
     return outcome
+
+
+def _finish_diagnostic(
+    diagnostic: EvalDiagnostic,
+    record: Path,
+    *,
+    parser_stage: str,
+    safe_code: str | None,
+) -> None:
+    """Keep diagnostic persistence failures inside Luna's safe error contract."""
+    try:
+        diagnostic.finish(record, parser_stage=parser_stage, safe_code=safe_code)
+    except DiagnosticCaptureError as exc:
+        code = exc.args[0] if exc.args else "diagnostic_storage_unavailable"
+        if code not in {
+            "diagnostic_outcome_invalid",
+            "diagnostic_record_missing",
+            "diagnostic_storage_unavailable",
+        }:
+            code = "diagnostic_storage_unavailable"
+        raise LunaError(code) from None
+    except Exception:
+        raise LunaError("diagnostic_storage_unavailable") from None
 
 
 def _require_deadline(deadline: float) -> None:

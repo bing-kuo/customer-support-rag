@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import socket
 from pathlib import Path
 
 import pytest
 
+from customer_support_rag import eval_diagnostic as eval_diagnostic_module
 from customer_support_rag import luna
 from customer_support_rag.eval_diagnostic import (
     MAX_DIAGNOSTIC_BODY,
@@ -21,6 +23,15 @@ from customer_support_rag.luna import LunaError
 
 REPO = Path(__file__).parents[1]
 SHA = "a" * 64
+GIT_SHA = "a" * 40
+
+
+@pytest.fixture(autouse=True)
+def block_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    def reject_connect(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("diagnostic tests must remain offline")
+
+    monkeypatch.setattr(socket.socket, "connect", reject_connect)
 
 
 def diagnostic(path: Path) -> EvalDiagnostic:
@@ -28,7 +39,7 @@ def diagnostic(path: Path) -> EvalDiagnostic:
         path,
         candidate="baseline",
         case_id="faq-absent-baseline",
-        code_sha=SHA,
+        code_sha=GIT_SHA,
         suite_version="dev-suite-v1",
         suite_sha256=SHA,
         rubric_version="semantic-rubric-v1",
@@ -195,3 +206,163 @@ def test_live_path_capture_failure_stops_after_single_mock_exchange(
     assert calls == 1
     assert list(recorder.root.iterdir()) == []
     recorder.root.rmdir()
+
+
+def test_opt_in_rejects_symlink_ancestor_without_touching_target(
+    tmp_path: Path,
+) -> None:
+    link = REPO / ".data" / "diagnostic-symlink-ancestor"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    link.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(
+        DiagnosticCaptureError, match="diagnostic_root_not_gitignored_evidence"
+    ):
+        diagnostic(link / "capture")
+    assert list(outside.iterdir()) == []
+    link.unlink()
+
+
+def test_opt_in_rejects_insecure_existing_mode_without_chmod(tmp_path: Path) -> None:
+    root = REPO / ".data" / "diagnostic-insecure-existing"
+    root.mkdir(parents=True, exist_ok=True)
+    root.chmod(0o755)
+    with pytest.raises(DiagnosticCaptureError, match="diagnostic_storage_unavailable"):
+        diagnostic(root)
+    assert root.stat().st_mode & 0o777 == 0o755
+    root.chmod(0o700)
+    root.rmdir()
+
+
+def test_capture_rejects_root_replaced_by_symlink(tmp_path: Path) -> None:
+    root = REPO / ".data" / "diagnostic-replaced-root"
+    if root.is_symlink():
+        root.unlink()
+    elif root.exists():
+        root.rmdir()
+    recorder = diagnostic(root)
+    outside = tmp_path / "outside"
+    outside.mkdir(mode=0o700)
+    root.rmdir()
+    root.symlink_to(outside, target_is_directory=True)
+    with pytest.raises(DiagnosticCaptureError, match="diagnostic_storage_unavailable"):
+        recorder.capture(b"{}", http_status=200, api_key="synthetic-secret")
+    assert list(outside.iterdir()) == []
+    root.unlink()
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        b'{"error":"synthetic-secret"}',
+        b'{"error":"synthetic-\\u0073ecret"}',
+        b'{"error":"synthetic-\\\\u0073ecret"}',
+        b'{"nested":{"error":"synthetic-\\u0073ecret"}}',
+        b'"{\\"error\\":\\"synthetic-\\\\u0073ecret\\"}"',
+    ],
+)
+def test_capture_rejects_json_escape_key_shapes(body: bytes) -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-key-shape"
+    if root.exists():
+        for child in root.iterdir():
+            child.unlink()
+        root.rmdir()
+    root.mkdir(parents=True, mode=0o700)
+    recorder = diagnostic(root)
+    with pytest.raises(DiagnosticCaptureError, match="diagnostic_secret_in_body"):
+        recorder.capture(body, http_status=200, api_key="synthetic-secret")
+    assert list(root.iterdir()) == []
+    root.rmdir()
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "accepted"),
+    [
+        ("code_sha", "a" * 40, True),
+        ("code_sha", "a" * 64, False),
+        ("suite_sha256", "a" * 64, True),
+        ("suite_sha256", "a" * 40, False),
+        ("rubric_sha256", "b" * 64, True),
+        ("rubric_sha256", "b" * 40, False),
+    ],
+)
+def test_diagnostic_hash_fields_use_their_own_lengths(
+    field: str, value: str, accepted: bool
+) -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-hash-length"
+    if root.exists():
+        root.rmdir()
+    identity = {
+        "candidate": "baseline",
+        "case_id": "faq-absent-baseline",
+        "code_sha": GIT_SHA,
+        "suite_version": "dev-suite-v1",
+        "suite_sha256": SHA,
+        "rubric_version": "semantic-rubric-v1",
+        "rubric_sha256": SHA,
+    }
+    identity[field] = value
+    if accepted:
+        recorder = EvalDiagnostic.opt_in(root, **identity)  # type: ignore[arg-type]
+        assert recorder.root == root
+        root.rmdir()
+    else:
+        with pytest.raises(DiagnosticCaptureError, match="diagnostic_identity_invalid"):
+            EvalDiagnostic.opt_in(root, **identity)  # type: ignore[arg-type]
+        assert not root.exists()
+
+
+def test_finish_failure_is_a_safe_luna_error_after_one_exchange(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-finish-failure"
+    if root.exists():
+        for child in root.iterdir():
+            child.unlink()
+        root.rmdir()
+    recorder = diagnostic(root)
+    calls = 0
+
+    original_write_at = eval_diagnostic_module._write_new_at
+    writes = 0
+
+    def fail_finish_write(root_fd: int, name: str, data: bytes) -> None:
+        nonlocal writes
+        writes += 1
+        if writes == 3:
+            raise OSError("synthetic raw persistence exception")
+        original_write_at(root_fd, name, data)
+
+    async def mock_exchange(*_args: object, **_kwargs: object):
+        nonlocal calls
+        calls += 1
+        return (
+            b'{"output":[{"type":"message","role":"assistant","status":"completed",'
+            b'"content":[{"type":"output_text","text":"{\\"status\\":\\"handoff\\",'
+            b'\\"answer\\":null,\\"source_ids\\":[],\\"reason\\":\\"no_evidence\\"}"}]}]}',
+            200,
+            None,
+        )
+
+    monkeypatch.setattr(eval_diagnostic_module, "_write_new_at", fail_finish_write)
+    monkeypatch.setattr(luna, "_factory_transport", lambda _transport: True)
+    monkeypatch.setattr(luna, "_exchange", mock_exchange)
+    request = prepare_answer("synthetic query", product_id="hp-a", hits=[])
+
+    with pytest.raises(LunaError, match="diagnostic_storage_unavailable") as exc:
+        asyncio.run(
+            luna._post_live_once(
+                b"{}",
+                request,
+                api_key="synthetic-key",
+                transport=object(),  # type: ignore[arg-type]
+                request_id="synthetic-request",
+                deadline=1,
+                diagnostic=recorder,
+            )
+        )
+    assert str(exc.value) == "diagnostic_storage_unavailable"
+    assert calls == 1
+    for child in root.iterdir():
+        child.unlink()
+    root.rmdir()
