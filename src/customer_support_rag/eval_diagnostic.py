@@ -550,7 +550,7 @@ def _decode_json_escapes(text: str) -> str:
 
 
 def _fragment_contains_key(fragment: str, api_key: str) -> bool:
-    """Search an incomplete token through the bounded JSON escape layers."""
+    """Return found/absent only when bounded fragment decoding is conclusive."""
     for _ in range(MAX_SECRET_UNESCAPE_LAYERS + 1):
         if api_key in fragment:
             return True
@@ -558,7 +558,9 @@ def _fragment_contains_key(fragment: str, api_key: str) -> bool:
         if decoded == fragment:
             return False
         fragment = decoded
-    return api_key in fragment
+    if api_key in fragment:
+        return True
+    raise DiagnosticCaptureError("diagnostic_body_uninspectable")
 
 
 def _complete_json_string_tokens(text: str) -> list[str] | None:

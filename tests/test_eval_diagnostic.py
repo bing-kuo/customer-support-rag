@@ -429,6 +429,50 @@ def test_capture_keeps_scanning_completed_tokens_across_malformed_fragments(
 
 
 @pytest.mark.parametrize(
+    ("depth", "expected"),
+    [
+        (7, "diagnostic_secret_in_body"),
+        (8, "diagnostic_secret_in_body"),
+        (9, "diagnostic_body_uninspectable"),
+        (10, "diagnostic_body_uninspectable"),
+        (11, "diagnostic_body_uninspectable"),
+    ],
+)
+def test_partial_escape_depth_limit_never_treats_unknown_as_safe(
+    depth: int, expected: str
+) -> None:
+    root = REPO / ".data" / f"test-eval-diagnostic-partial-depth-{depth}"
+    if root.exists():
+        shutil.rmtree(root)
+    fragment = r"synthetic\/secret"
+    for _ in range(depth):
+        fragment = json.dumps(fragment)[1:-1]
+    body = json.dumps({"wrapped": '"' + fragment}).encode("utf-8")
+    recorder = diagnostic(root)
+    with pytest.raises(DiagnosticCaptureError, match=expected):
+        recorder.capture(body, http_status=200, api_key="synthetic/secret")
+    assert list(root.iterdir()) == []
+    recorder.close()
+    root.rmdir()
+
+
+def test_unstable_partial_escape_without_key_fails_closed() -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-partial-depth-safe-looking"
+    if root.exists():
+        shutil.rmtree(root)
+    fragment = r"ordinary\/suffix"
+    for _ in range(9):
+        fragment = json.dumps(fragment)[1:-1]
+    body = json.dumps({"wrapped": '"' + fragment}).encode("utf-8")
+    recorder = diagnostic(root)
+    with pytest.raises(DiagnosticCaptureError, match="diagnostic_body_uninspectable"):
+        recorder.capture(body, http_status=200, api_key="synthetic/secret")
+    assert list(root.iterdir()) == []
+    recorder.close()
+    root.rmdir()
+
+
+@pytest.mark.parametrize(
     ("leading", "trailing"),
     [
         (leading, trailing)
