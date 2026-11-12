@@ -21,6 +21,7 @@ from customer_support_rag.eval_diagnostic import (
 )
 from customer_support_rag.knowledge.answering import prepare_answer
 from customer_support_rag.luna import LunaError
+from customer_support_rag.luna_live import _key_shape
 
 REPO = Path(__file__).parents[1]
 SHA = "a" * 64
@@ -349,6 +350,51 @@ def test_capture_rejects_json_escape_key_shapes(body: bytes) -> None:
     with pytest.raises(DiagnosticCaptureError, match="diagnostic_secret_in_body"):
         recorder.capture(body, http_status=200, api_key="synthetic-secret")
     assert list(root.iterdir()) == []
+    root.rmdir()
+
+
+@pytest.mark.parametrize(
+    ("key", "encoded"),
+    [
+        ("synthetic/secret", '"synthetic/secret"'),
+        ("synthetic/secret", r'"synthetic\/secret"'),
+        ("synthetic/secret", r'"synthetic\u002fsecret"'),
+        (
+            "synthetic/secret",
+            r'"\u0073\u0079\u006e\u0074\u0068\u0065\u0074\u0069\u0063\u002f\u0073\u0065\u0063\u0072\u0065\u0074"',
+        ),
+        ("synthetic/secret", r'"synthetic\u002fse\u0063ret"'),
+        ("synthetic\\secret", json.dumps("synthetic\\secret")),
+        ('synthetic"secret', json.dumps('synthetic"secret')),
+    ],
+)
+def test_capture_rejects_json_escape_encodings_of_accepted_keys(
+    key: str, encoded: str
+) -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-slash-key"
+    if root.exists():
+        shutil.rmtree(root)
+    recorder = diagnostic(root)
+    assert _key_shape(key)
+    with pytest.raises(DiagnosticCaptureError, match="diagnostic_secret_in_body"):
+        recorder.capture(
+            ('{"token":' + encoded + "}").encode(), http_status=200, api_key=key
+        )
+    assert list(root.iterdir()) == []
+    recorder.close()
+    root.rmdir()
+
+
+def test_capture_rejects_key_wrapped_inside_json_string() -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-wrapped-key"
+    if root.exists():
+        shutil.rmtree(root)
+    recorder = diagnostic(root)
+    body = json.dumps({"wrapped": json.dumps({"token": "synthetic/secret"})}).encode()
+    with pytest.raises(DiagnosticCaptureError, match="diagnostic_secret_in_body"):
+        recorder.capture(body, http_status=200, api_key="synthetic/secret")
+    assert list(root.iterdir()) == []
+    recorder.close()
     root.rmdir()
 
 

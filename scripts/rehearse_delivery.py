@@ -153,6 +153,29 @@ def main(argv: list[str] | None = None) -> int:
             "previous FAQ snapshot must remain after recovery",
         )
 
+        policy_v1_pointer = (workspace / "active.json").read_bytes()
+        _consume_release_approval(workspace, approvals, releases["policy-v2"])
+        _activate_from_pointer(workspace, releases["policy-v2"], policy_v1_pointer)
+        _require(
+            _status(workspace)["active"] == releases["policy-v2"],
+            "status must confirm the policy-v2 release",
+        )
+        _require(
+            _restart_status(guard_root, workspace)["active"] == releases["policy-v2"],
+            "a fresh CLI process must load the active policy-v2 snapshot",
+        )
+        _require(
+            (workspace / "releases" / releases["policy-v1"]).is_dir(),
+            "previous policy-v1 snapshot must remain after policy-v2 activation",
+        )
+        serving["policy-v2"] = _assert_release_serving(
+            workspace,
+            key_root,
+            expected_release=releases["policy-v2"],
+            expected_citation_version="2",
+            question="未拆封商品可在購買後14日內申請退貨嗎？",
+        )
+
         print(
             json.dumps(
                 {
@@ -172,7 +195,8 @@ def main(argv: list[str] | None = None) -> int:
                     "serving_release_checks": serving,
                     "key": "fake-only; never read by rehearsal",
                     "usage": None,
-                    "active_after_recovery": releases["policy-v1"],
+                    "active_after_recovery": releases["policy-v2"],
+                    "active_policy_version_after_recovery": "2",
                     "previous_snapshots_retained": True,
                 },
                 ensure_ascii=False,
@@ -363,7 +387,12 @@ def _assert_local_startup() -> None:
 
 
 def _assert_release_serving(
-    workspace: Path, key_root: Path, *, expected_release: str | None
+    workspace: Path,
+    key_root: Path,
+    *,
+    expected_release: str | None,
+    expected_citation_version: str | None = None,
+    question: str = "Synthetic serving release-root check",
 ) -> dict[str, object]:
     names = (
         "CUSTOMER_SUPPORT_RAG_RELEASE_ROOT",
@@ -425,14 +454,29 @@ def _assert_release_serving(
     async def fake_generation(_root: Path, request: object, **_kwargs: object):
         nonlocal generation_calls
         generation_calls += 1
-        if not getattr(request, "sources", ()):
+        sources = getattr(request, "sources", ())
+        if not sources:
             raise RuntimeError("serving fixture expected an active candidate source")
+        selected_source = sources[0]
+        if expected_citation_version is not None:
+            selected_source = next(
+                (
+                    source
+                    for source in sources
+                    if source.hit.chunk.metadata.version == expected_citation_version
+                ),
+                None,
+            )
+            _require(
+                selected_source is not None,
+                "retrieval did not return the expected policy citation version",
+            )
         return LiveCall(
             draft=GroundedDraft(
                 status="answer",
                 answer="OFFLINE REHEARSAL MOCK ANSWER; NOT MODEL OUTPUT",
                 reason=None,
-                sources=(request.sources[0],),
+                sources=(selected_source,),
             ),
             usage=None,
             stopped=None,
@@ -445,14 +489,17 @@ def _assert_release_serving(
                 "/ask",
                 json={
                     "product_id": "hp-a",
-                    "question": "Synthetic serving release-root check",
+                    "question": question,
                 },
             )
             assist_start = client.post(
                 "/assist",
                 json={
                     "action": "start",
-                    "question": "Synthetic assist release-root check",
+                    "question": question.replace(
+                        "Synthetic serving release-root check",
+                        "Synthetic assist release-root check",
+                    ),
                 },
             )
             assist_view = assist_start.json()
@@ -500,6 +547,14 @@ def _assert_release_serving(
             and bool(payload.get("sources")),
             "serving did not return evidence from the active snapshot",
         )
+        if expected_citation_version is not None:
+            _require(
+                all(
+                    source.get("version") == expected_citation_version
+                    for source in payload["sources"]
+                ),
+                "ask citation does not match the active policy version",
+            )
         _require(
             assist_answer.status_code == 200
             and assist_answer.json().get("answer")
@@ -507,12 +562,21 @@ def _assert_release_serving(
             and bool(assist_answer.json().get("sources")),
             "assist did not continue to active release serving",
         )
+        if expected_citation_version is not None:
+            _require(
+                all(
+                    source.get("version") == expected_citation_version
+                    for source in assist_answer.json()["sources"]
+                ),
+                "assist citation does not match the active policy version",
+            )
         _require(
             query_calls == 2 and generation_calls == 2,
             "ask/assist mock serving call count changed",
         )
     return {
         "active_release": expected_release,
+        "citation_version": expected_citation_version,
         "mock_query_embedding_calls": query_calls,
         "mock_generation_calls": generation_calls,
     }

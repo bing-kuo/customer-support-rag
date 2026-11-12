@@ -34,3 +34,11 @@ def test_unknown_argument_exits_with_usage_error() -> None:
 
     assert result.returncode == 2
     assert "unrecognized arguments" in result.stderr
+
+
+def test_faq_manual_build_uses_rehearsal_source_path() -> None:
+    docs = (REPO / "docs" / "reproducible-delivery.md").read_text(encoding="utf-8")
+
+    assert (REPO / "knowledge" / "drafts/hp-a/charging-faq.md").is_file()
+    assert "--source drafts/hp-a/charging-faq.md" in docs
+    assert "--source hp-a/charging-faq.md" not in docs

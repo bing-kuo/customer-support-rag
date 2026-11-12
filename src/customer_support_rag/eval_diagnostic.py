@@ -393,7 +393,13 @@ def _create_private_root(path: Path, parent: Path) -> int:
 
 
 def _contains_secret_shape(body: bytes, api_key: str) -> bool:
-    """Search bounded response bytes without recursively parsing JSON."""
+    """Search bounded response bytes and JSON string encodings for the key.
+
+    This is a string-token scan rather than a recursive JSON parse so valid
+    provider metadata can be arbitrarily deep without exhausting Python's
+    parser stack. Decoded string values are rescanned a bounded number of
+    times to cover JSON text wrapped inside JSON strings.
+    """
     try:
         key_bytes = api_key.encode("ascii")
     except UnicodeEncodeError:
@@ -406,22 +412,67 @@ def _contains_secret_shape(body: bytes, api_key: str) -> bool:
         text = body.decode("utf-8")
     except UnicodeDecodeError:
         raise DiagnosticCaptureError("diagnostic_body_encoding_invalid") from None
-    if api_key in text:
-        return True
+    pending = [(text, 0)]
+    inspected: set[str] = set()
     escaped_unicode = re.compile(r"\\+u([0-9a-fA-F]{4})")
-    value = text
-    for _ in range(MAX_SECRET_UNESCAPE_LAYERS):
-        unescaped = escaped_unicode.sub(
-            lambda match: chr(int(match.group(1), 16)), value
-        )
-        if unescaped == value:
-            return False
-        if api_key in unescaped:
+    while pending:
+        value, layer = pending.pop()
+        if value in inspected:
+            continue
+        inspected.add(value)
+        if api_key in value:
             return True
-        value = unescaped
-    if escaped_unicode.search(value):
-        raise DiagnosticCaptureError("diagnostic_body_uninspectable")
+        unescaped = value
+        for _ in range(MAX_SECRET_UNESCAPE_LAYERS):
+            unescaped = escaped_unicode.sub(
+                lambda match: chr(int(match.group(1), 16)), unescaped
+            )
+            if api_key in unescaped:
+                return True
+        if escaped_unicode.search(unescaped):
+            raise DiagnosticCaptureError("diagnostic_body_uninspectable")
+        tokens = _json_string_tokens(value)
+        if tokens is None:
+            raise DiagnosticCaptureError("diagnostic_body_uninspectable")
+        for decoded in tokens:
+            if api_key in decoded:
+                return True
+            if '"' in decoded:
+                if layer >= MAX_SECRET_UNESCAPE_LAYERS:
+                    raise DiagnosticCaptureError("diagnostic_body_uninspectable")
+                pending.append((decoded, layer + 1))
     return False
+
+
+def _json_string_tokens(text: str) -> list[str] | None:
+    """Decode each complete JSON string token without descending into objects."""
+    values: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] != '"':
+            index += 1
+            continue
+        start = index
+        index += 1
+        while index < len(text):
+            character = text[index]
+            if character == "\\":
+                index += 2
+            elif character == '"':
+                index += 1
+                try:
+                    decoded = json.loads(text[start:index])
+                except (json.JSONDecodeError, RecursionError):
+                    return None
+                if not isinstance(decoded, str):
+                    return None
+                values.append(decoded)
+                break
+            else:
+                index += 1
+        else:
+            return None
+    return values
 
 
 def replay_parser_body(body: bytes, request: object):
