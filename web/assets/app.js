@@ -38,6 +38,7 @@
   };
   let busy = false;
   let slotToken = null;
+  let serverFields = null;
   let previousProductId = productSelect.value;
   let previousDialogFocus = null;
   let toastTimer = null;
@@ -85,6 +86,19 @@
     document.querySelectorAll('input[name="mode"]').forEach((input) => { input.disabled = value; });
     result.setAttribute("aria-busy", String(value));
     if (value) submitButton.querySelector(".button-label").textContent = "整理中…";
+  }
+
+  function currentAssistFields() {
+    return {
+      product_id: productSelect.value || null,
+      question: questionInput.value.trim() || null,
+      steps_tried: stepsInput.value.trim() || null,
+    };
+  }
+
+  function needsServerReset(fields) {
+    if (!slotToken || !serverFields) return false;
+    return serverFields.product_id && serverFields.product_id !== fields.product_id;
   }
 
   function startResult(kind, label, caption) {
@@ -202,6 +216,7 @@
     const noGenerationReasons = ["insufficient_information", "reset_required"];
     addUsage(payload, noGenerationReasons.includes(payload.reason) ? false : null);
     addRequestId(payload);
+    if (guided()) newQuestionButton.hidden = false;
   }
 
   function showClarify(payload) {
@@ -266,6 +281,14 @@
       showError("服務回應格式無法確認，請稍後檢查服務狀態。", payload && payload.request_id, "回應格式異常");
       return false;
     }
+    if (typeof payload.slot_token === "string") {
+      slotToken = payload.slot_token;
+      serverFields = {
+        product_id: payload.product_id || null,
+        question: payload.question || null,
+        steps_tried: payload.steps_tried || null,
+      };
+    }
     if (payload.status === "clarify") showClarify(payload);
     else if (payload.status === "handoff") showHandoff(payload);
     else {
@@ -289,12 +312,24 @@
     resultContent.append(element("p", "answer-text", "請稍候，正在確認回答與原文依據。"));
     try {
       if (guided()) {
+        const fields = currentAssistFields();
+        if (needsServerReset(fields)) {
+          const oldToken = slotToken;
+          const reset = await request("/assist", { action: "reset", slot_token: oldToken });
+          if (reset) {
+            serverFields = { product_id: null, question: null, steps_tried: null };
+            assistStatus.textContent = "已明確重設商品對話，避免沿用舊商品資料；請再次送出目前資料。";
+          }
+          return;
+        }
         const action = slotToken ? "continue" : "start";
         const body = { action };
         if (slotToken) body.slot_token = slotToken;
         if (productId) body.product_id = productId;
-        if (question.trim()) body.question = question.trim();
-        if (steps.trim()) body.steps_tried = steps.trim();
+        if (slotToken && serverFields && serverFields.question && !question.trim()) body.question = null;
+        else if (question.trim()) body.question = question.trim();
+        if (slotToken && serverFields && serverFields.steps_tried && !steps.trim()) body.steps_tried = null;
+        else if (steps.trim()) body.steps_tried = steps.trim();
         await request("/assist", body);
       } else {
         const response = await fetch("/ask", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ product_id: productId, question: question.trim() }) });
@@ -319,6 +354,7 @@
   async function resetConversation() {
     if (busy) return;
     const oldToken = slotToken;
+    const oldServerFields = serverFields;
     let resetSlotToken = null;
     let resetConfirmed = !oldToken;
     setBusy(true);
@@ -331,7 +367,9 @@
     } catch {
       resetConfirmed = false;
     } finally {
-      slotToken = resetConfirmed ? resetSlotToken : null;
+      slotToken = resetConfirmed ? resetSlotToken : slotToken;
+      if (resetConfirmed) serverFields = { product_id: null, question: null, steps_tried: null };
+      else serverFields = serverFields || oldServerFields;
       productSelect.value = "";
       previousProductId = "";
       questionInput.value = "";
@@ -348,23 +386,37 @@
       }
       setBusy(false);
       updateMode();
-      newQuestionButton.hidden = true;
+      newQuestionButton.hidden = resetConfirmed || !slotToken;
     }
   }
 
   questionInput.addEventListener("input", updateCount);
-  productSelect.addEventListener("change", () => {
+  productSelect.addEventListener("change", async () => {
     const changedExistingProduct = previousProductId && previousProductId !== productSelect.value;
     if (changedExistingProduct) {
+      const oldToken = slotToken;
       questionInput.value = "";
       stepsInput.value = "";
-      slotToken = null;
-      assistStatus.textContent = "商品已變更；舊問題與已試步驟已清除，請輸入新問題。";
+      assistStatus.textContent = "商品已變更；正在明確重設舊問題，避免沿用舊欄位。";
       if (sourceDialog.open) sourceDialog.close();
       sourceMetadata.replaceChildren();
       sourceText.textContent = "";
       startResult("", "回答整理結果", "商品已變更，請輸入新的顧客問題。");
       resultContent.append(element("div", "empty-state", "商品已變更，舊回答與引用已清除。"));
+      if (oldToken) {
+        setBusy(true);
+        try {
+          const reset = await request("/assist", { action: "reset", slot_token: oldToken });
+          assistStatus.textContent = reset
+            ? "商品已變更；舊問題與已試步驟已清除，伺服器對話也已重設。請輸入新問題。"
+            : "商品已變更；畫面已清除，但伺服器未確認舊對話重設。請再次開始新問題後再送出。";
+        } catch {
+          assistStatus.textContent = "商品已變更；畫面已清除，但伺服器未確認舊對話重設。請確認服務狀態後再送出。";
+        } finally {
+          setBusy(false);
+          updateMode();
+        }
+      }
     }
     previousProductId = productSelect.value;
     updateCount();
