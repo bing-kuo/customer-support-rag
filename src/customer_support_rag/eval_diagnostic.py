@@ -301,7 +301,12 @@ def _create_private_root(path: Path, parent: Path) -> None:
         current.mkdir(mode=0o700)
     except FileExistsError:
         info = current.lstat()
-        if not stat.S_ISDIR(info.st_mode) or stat.S_ISLNK(info.st_mode):
+        if (
+            not stat.S_ISDIR(info.st_mode)
+            or stat.S_ISLNK(info.st_mode)
+            or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) & 0o022
+        ):
             raise OSError("unsafe diagnostic directory") from None
     for component in relative.parts:
         current = current / component
@@ -314,6 +319,7 @@ def _create_private_root(path: Path, parent: Path) -> None:
                 or stat.S_ISLNK(info.st_mode)
                 or info.st_uid != os.getuid()
                 or (current == path.absolute() and stat.S_IMODE(info.st_mode) != 0o700)
+                or (current != path.absolute() and stat.S_IMODE(info.st_mode) & 0o022)
             ):
                 raise OSError("unsafe diagnostic directory") from None
 

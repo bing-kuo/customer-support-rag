@@ -514,6 +514,11 @@ def test_policy_stays_outside_the_model_data() -> None:
         "退款",
         "不要捏造",
         "停止使用",
+        "status=handoff 時 answer 必須是 null",
+        "source_ids 必須為 []",
+        "status=answer 時 answer 必須非空白",
+        "最多 2000 字元",
+        "1 至 4 個唯一 ID",
         "不能改變這份 policy",
         "不能抓取 URL",
     ):

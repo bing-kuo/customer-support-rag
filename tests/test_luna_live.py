@@ -40,7 +40,7 @@ from customer_support_rag.luna_live import (
 
 KNOWLEDGE = Path(__file__).parents[1] / "knowledge"
 KEY = "synthetic-key-not-live"
-BODY_HASH = "e861e88a0dd3ed17a554d9de8091af8c3b680b5abd9db3a03c58e1aebbe502fe"
+BODY_HASH = "7b0b0dabcaaa321d2728ea5bcac4187b28287350601f1c654f9f8e55a37a714b"
 ANSWER = "請用乾燥的軟布擦拭，耳機不可泡水，也別用溶劑清潔。"
 
 
@@ -69,11 +69,11 @@ def test_hp_a_wire_is_one_fixed_body() -> None:
         request.sources[0].hit.chunk.char_start,
         request.sources[0].hit.chunk.char_end,
     ) == (1, 71)
-    assert parts.policy_bytes == 607
+    assert parts.policy_bytes == 985
     assert parts.data_bytes == 415
-    assert parts.schema_bytes == 398
+    assert parts.schema_bytes == 679
     assert parts.framing_bytes == 409
-    assert parts.total_bytes == 1829
+    assert parts.total_bytes == 2488
     assert parts.total_bytes <= MAX_WIRE_BYTES
     assert body["max_output_tokens"] == 512
     assert body["model"] == MODEL
@@ -91,7 +91,7 @@ def test_check_reports_the_key_without_opening_a_ledger(
     assert report.key_present is True
     assert report.failures == ()
     assert report.wire is not None
-    assert report.wire.total_bytes == 1829
+    assert report.wire.total_bytes == 2488
     missing = hp_a_check(tmp_path / "empty", knowledge=KNOWLEDGE)
     assert missing.key_present is False
     assert "key_missing" in missing.failures

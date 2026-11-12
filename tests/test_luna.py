@@ -21,6 +21,7 @@ from customer_support_rag.budget import (
 )
 from customer_support_rag.knowledge.answering import (
     GROUNDED_POLICY,
+    PROMPT_REVISION,
     prepare_answer,
     resolve_draft,
 )
@@ -284,6 +285,134 @@ def test_hp_a_mock_http_settles_and_resolves_the_original_source(
     assert row["state"] == "settled"
     assert row["used_input"] == 12
     assert KEY.encode() not in ledger_path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("case_name", "expected"),
+    [
+        ("valid-answer", "answer"),
+        ("valid-handoff", "handoff"),
+        ("handoff-text-and-source", "invalid_model_schema"),
+        ("handoff-text-only", "invalid_model_schema"),
+        ("handoff-source-only", "invalid_model_schema"),
+        ("handoff-null-reason", "invalid_model_schema"),
+        ("handoff-invalid-reason", "invalid_model_schema"),
+        ("answer-null-text", "invalid_model_schema"),
+        ("answer-blank-text", "invalid_model_schema"),
+        ("answer-with-reason", "invalid_model_schema"),
+        ("answer-without-sources", "invalid_model_schema"),
+        ("answer-duplicate-sources", "invalid_model_schema"),
+        ("answer-overlong", "invalid_model_schema"),
+        ("unknown-source-remains-rejected", "unknown_citation"),
+    ],
+)
+def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
+    tmp_path: Path, case_name: str, expected: str
+) -> None:
+    document = KnowledgeDocument(
+        metadata=KnowledgeMetadata(
+            document_id="museum-catalogue",
+            product_id="hp-a",
+            version="1",
+            title="Invented museum catalogue",
+            synthetic=True,
+        ),
+        body=(
+            "# Catalogue desk\n\n"
+            "The museum catalogue desk handles astronomy booklet enquiries.\n"
+        ),
+    )
+    chunk = next(item for item in chunk_document(document) if item.text.strip())
+    hit = RetrievalHit(artifact_key="f" * 64, chunk=chunk, raw_score=0.0)
+    request = prepare_answer(
+        "Which desk handles astronomy catalogue questions?",
+        product_id="hp-a",
+        hits=[hit],
+    )
+    source_id = request.evidence[0].source_id
+    if case_name.startswith("handoff") or case_name == "valid-handoff":
+        payload: dict[str, object] = {
+            "status": "handoff",
+            "answer": None,
+            "source_ids": [],
+            "reason": "conflicting_evidence",
+        }
+        if case_name == "handoff-text-and-source":
+            payload.update(
+                answer="Ask the museum catalogue desk.", source_ids=[source_id]
+            )
+        elif case_name == "handoff-text-only":
+            payload["answer"] = "Ask the museum catalogue desk."
+        elif case_name == "handoff-source-only":
+            payload["source_ids"] = [source_id]
+        elif case_name == "handoff-null-reason":
+            payload["reason"] = None
+        elif case_name == "handoff-invalid-reason":
+            payload["reason"] = "not-a-handoff-reason"
+    else:
+        payload = {
+            "status": "answer",
+            "answer": "Ask the museum catalogue desk.",
+            "source_ids": [source_id],
+            "reason": None,
+        }
+        if case_name == "answer-null-text":
+            payload["answer"] = None
+        elif case_name == "answer-blank-text":
+            payload["answer"] = "   "
+        elif case_name == "answer-with-reason":
+            payload["reason"] = "no_evidence"
+        elif case_name == "answer-without-sources":
+            payload["source_ids"] = []
+        elif case_name == "answer-duplicate-sources":
+            payload["source_ids"] = [source_id, source_id]
+        elif case_name == "answer-overlong":
+            payload["answer"] = "x" * 2001
+        elif case_name == "unknown-source-remains-rejected":
+            payload["source_ids"] = ["ev:" + "a" * 64 + ":1"]
+    spy = Spy(
+        httpx.Response(200, json=envelope(json.dumps(payload, ensure_ascii=False)))
+    )
+    _ledger_path, result = run_draft(tmp_path / case_name, request, spy, case_name)
+
+    assert len(spy.calls) == 1
+    sent = json.loads(spy.calls[0].content)
+    assert sent["instructions"] == GROUNDED_POLICY
+    model_data = json.loads(sent["input"][0]["content"][0]["text"])
+    assert model_data == json.loads(request.model_data_json())
+    assert model_data["prompt_revision"] == PROMPT_REVISION == "grounded-draft-v2"
+    for instruction in (
+        "status=handoff 時 answer 必須是 null",
+        "source_ids 必須為 []",
+        "status=answer 時 answer 必須非空白",
+        "最多 2000 字元",
+        "1 至 4 個唯一 ID",
+        "本次 evidence",
+    ):
+        assert instruction in sent["instructions"]
+    schema = sent["text"]["format"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {"status", "answer", "source_ids", "reason"}
+    assert set(schema["properties"]) == {"status", "answer", "source_ids", "reason"}
+    assert "anyOf" not in schema
+    assert "branch rules are instructed, not enforced" in schema["description"]
+    for unsupported in (
+        "allOf",
+        "not",
+        "dependentRequired",
+        "dependentSchemas",
+        "if",
+        "then",
+        "else",
+    ):
+        assert unsupported not in schema
+    assert "grounded-draft-schema-v2" in schema["description"]
+    if expected in {"answer", "handoff"}:
+        assert result.status == expected
+    else:
+        assert isinstance(result, LunaError)
+        assert result.code == expected
 
 
 def test_empty_hits_do_not_reserve_or_call_http(tmp_path: Path) -> None:

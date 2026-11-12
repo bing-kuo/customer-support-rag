@@ -234,6 +234,17 @@ def test_opt_in_rejects_insecure_existing_mode_without_chmod(tmp_path: Path) -> 
     root.rmdir()
 
 
+def test_opt_in_rejects_group_or_world_writable_ancestor_without_chmod() -> None:
+    parent = REPO / ".data" / "diagnostic-writable-ancestor"
+    parent.mkdir(parents=True, exist_ok=True)
+    parent.chmod(0o777)
+    with pytest.raises(DiagnosticCaptureError, match="diagnostic_storage_unavailable"):
+        diagnostic(parent / "capture")
+    assert parent.stat().st_mode & 0o777 == 0o777
+    parent.chmod(0o700)
+    parent.rmdir()
+
+
 def test_capture_rejects_root_replaced_by_symlink(tmp_path: Path) -> None:
     root = REPO / ".data" / "diagnostic-replaced-root"
     if root.is_symlink():

@@ -76,11 +76,25 @@ _IMAGE_GEN_COUNTS = frozenset(
 _IMAGE_GEN_OPTIONAL = frozenset({"cached_tokens_details", "output_tokens_details"})
 DRAFT_SCHEMA = {
     "type": "object",
+    "description": (
+        "grounded-draft-schema-v2; flat object; branch rules are instructed, "
+        "not enforced."
+    ),
     "additionalProperties": False,
     "properties": {
-        "status": {"type": "string", "enum": ["answer", "handoff"]},
-        "answer": {"anyOf": [{"type": "string"}, {"type": "null"}]},
-        "source_ids": {"type": "array", "items": {"type": "string"}},
+        "status": {
+            "type": "string",
+            "enum": ["answer", "handoff"],
+        },
+        "answer": {
+            "anyOf": [{"type": "string"}, {"type": "null"}],
+            "description": "Answer: nonblank <=2000 chars; handoff: null.",
+        },
+        "source_ids": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Answer: 1-4 unique evidence IDs; handoff: [].",
+        },
         "reason": {
             "anyOf": [
                 {"type": "null"},
@@ -92,7 +106,8 @@ DRAFT_SCHEMA = {
                         "refund_request",
                     ],
                 },
-            ]
+            ],
+            "description": "Answer: null; handoff: one allowed reason.",
         },
     },
     "required": ["status", "answer", "source_ids", "reason"],
