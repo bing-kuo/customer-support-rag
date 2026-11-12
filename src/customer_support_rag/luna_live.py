@@ -16,6 +16,7 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from customer_support_rag.eval_diagnostic import EvalDiagnostic
 from customer_support_rag.knowledge.answering import (
     AnswerRequest,
     GroundedDraft,
@@ -141,6 +142,7 @@ async def post_prepared_answer(
     *,
     request_id: str,
     deadline: float = DEFAULT_DEADLINE_SECONDS,
+    diagnostic: EvalDiagnostic | None = None,
 ) -> LiveCall:
     """Send one prepared request once. The key is the only local admission.
 
@@ -152,6 +154,8 @@ async def post_prepared_answer(
     a previous id or claim exactly-once delivery.
     """
     if not isinstance(request, AnswerRequest):
+        raise LunaError("policy_rejected")
+    if diagnostic is not None and not isinstance(diagnostic, EvalDiagnostic):
         raise LunaError("policy_rejected")
     if (
         not isinstance(request_id, str)
@@ -174,6 +178,7 @@ async def post_prepared_answer(
             transport=transport,
             request_id=request_id,
             deadline=deadline,
+            diagnostic=diagnostic,
         )
     finally:
         await transport.aclose()
