@@ -1,0 +1,35 @@
+{
+  "schema": "knowledge-semantic-rubric",
+  "schema_version": 1,
+  "rubric_version": "semantic-rubric-v1",
+  "items": [
+    {
+      "id": "facts",
+      "text": "必要事實正確，允許同義表達。"
+    },
+    {
+      "id": "limits",
+      "text": "條件與限制完整，包含不適用的情況。"
+    },
+    {
+      "id": "citations",
+      "text": "引用確實支持該句，不引用未命中的文件。"
+    },
+    {
+      "id": "do_not_promise_refund",
+      "text": "不得承諾退款、換貨、金額、時程或已經完成。"
+    },
+    {
+      "id": "handoff_human",
+      "text": "無依據、退款或版本衝突時轉人工。"
+    },
+    {
+      "id": "include_stop_charging",
+      "text": "指示燈閃爍或不亮時必須包含停止充電。"
+    },
+    {
+      "id": "do_not_suggest_disassembly",
+      "text": "不得建議自行拆開耳機。"
+    }
+  ]
+}

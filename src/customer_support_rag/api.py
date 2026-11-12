@@ -2,8 +2,9 @@
 
 Importing this module does not read an API key, open a database, or send a
 question. ``GET /health``, ``GET /docs``, ``GET /``, and ``GET /assets/*`` stay
-local. ``POST /ask`` is the only route that can retrieve or call Luna, and only
-after the body is valid and the Host/Origin checks pass.
+local. ``POST /ask`` and ``POST /assist`` can retrieve or call Luna only after
+the body is valid and the Host/Origin checks pass. ``/assist`` does not call a
+model while a required field is still missing.
 """
 
 import json
@@ -22,8 +23,16 @@ from customer_support_rag.ask import (
     AskConfig,
     AskFailure,
     AskResponse,
+    CitedSource,
+    UsageCounts,
     answer_ask,
     config_from_environment,
+)
+from customer_support_rag.assist import (
+    AssistError,
+    AssistView,
+    SlotCoordinator,
+    handoff_summary,
 )
 from customer_support_rag.local_http import (
     forwarded_host_present,
@@ -72,6 +81,39 @@ class _AskInput(BaseModel):
     question: str
 
 
+class _AssistInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    action: Literal["start", "continue", "reset"]
+    slot_token: str | None = None
+    product_id: Literal["hp-a", "hp-b"] | None = None
+    question: str | None = None
+    steps_tried: str | None = None
+
+
+class AssistResponse(BaseModel):
+    """One clarify, answer, or handoff step. User fields are not verified."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    request_id: str
+    status: Literal["clarify", "answer", "handoff"]
+    slot_token: str
+    attempt: int
+    missing: list[str]
+    product_id: Literal["hp-a", "hp-b"] | None
+    question: str | None
+    steps_tried: str | None
+    summary: str | None
+    user_statements_unverified: Literal[True]
+    answer: str | None
+    reason: str | None
+    sources: list[CitedSource]
+    usage: UsageCounts | None
+    usage_code: str | None
+    usage_fields: list[str]
+
+
 def create_app(
     config: AskConfig | None | _FromEnvironment = _FROM_ENVIRONMENT,
     *,
@@ -92,6 +134,7 @@ def create_app(
     application.state.ask_config = selected
     application.state.web_root = pages
     application.state.extra_hosts = extra_hosts
+    application.state.slots = SlotCoordinator()
 
     @application.middleware("http")
     async def guard_local_http(
@@ -101,7 +144,7 @@ def create_app(
             request.headers.get("host"), request.app.state.extra_hosts
         ):
             return _rejected(request)
-        if request.method == "POST" and request.url.path == "/ask":
+        if request.method == "POST" and request.url.path in {"/ask", "/assist"}:
             origin = request.headers.get("origin")
             host_header = request.headers.get("host", "")
             scheme = str(request.scope.get("scheme", "http"))
@@ -168,6 +211,54 @@ def create_app(
                 content={"code": failure.code, "request_id": request_id},
             )
 
+    @application.post(
+        "/assist",
+        response_model=AssistResponse,
+        responses={
+            413: {"model": AskError},
+            422: {"model": AskError},
+            429: {"model": AskError},
+            502: {"model": AskError},
+            503: {"model": AskError},
+            504: {"model": AskError},
+        },
+        openapi_extra={
+            "requestBody": {
+                "required": True,
+                "content": {
+                    "application/json": {"schema": _AssistInput.model_json_schema()}
+                },
+            }
+        },
+    )
+    async def post_assist(request: Request) -> AssistResponse | JSONResponse:
+        request_id = f"assist-{uuid.uuid4().hex}"
+        try:
+            incoming = await _parse_assist(request)
+            view = _slot_view(request, incoming)
+            if view.needs_model:
+                if view.product_id is None or view.question is None:
+                    raise AssistError("invalid_request")
+                answered = await answer_ask(
+                    request.app.state.ask_config,
+                    view.product_id,
+                    view.question,
+                    request_id,
+                )
+                return _assist_from_ask(request_id, view, answered)
+            return _assist_from_view(request_id, view)
+        except AssistError as exc:
+            status_code = {"slot_capacity": 503}.get(exc.code, 422)
+            return JSONResponse(
+                status_code=status_code,
+                content={"code": exc.code, "request_id": request_id},
+            )
+        except AskFailure as failure:
+            return JSONResponse(
+                status_code=failure.status_code,
+                content={"code": failure.code, "request_id": request_id},
+            )
+
     return application
 
 
@@ -180,11 +271,8 @@ def request_web_root(application: FastAPI) -> Path:
 
 
 def _rejected(request: Request) -> JSONResponse:
-    request_id = (
-        f"ask-{uuid.uuid4().hex}"
-        if request.url.path == "/ask"
-        else f"req-{uuid.uuid4().hex}"
-    )
+    prefix = {"/ask": "ask", "/assist": "assist"}.get(request.url.path, "req")
+    request_id = f"{prefix}-{uuid.uuid4().hex}"
     return JSONResponse(
         status_code=422,
         content={"code": "invalid_request", "request_id": request_id},
@@ -256,6 +344,105 @@ def _integer_conversion_limit(exc: ValueError) -> bool:
     as a client input error.
     """
     return type(exc) is ValueError and "integer string conversion" in str(exc)
+
+
+async def _parse_assist(request: Request) -> _AssistInput:
+    if not _json_content_type(request.headers.get("content-type")):
+        raise AskFailure(422, "invalid_request")
+    raw = await _read_limited(request)
+    try:
+        payload = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise AskFailure(422, "invalid_request") from None
+    except ValueError as exc:
+        if not _integer_conversion_limit(exc):
+            raise
+        raise AskFailure(422, "invalid_request") from None
+    try:
+        return _AssistInput.model_validate(payload)
+    except ValidationError:
+        raise AskFailure(422, "invalid_request") from None
+
+
+_ASSIST_FIELDS = ("product_id", "question", "steps_tried")
+
+
+def _slot_view(request: Request, incoming: _AssistInput) -> AssistView:
+    coordinator: SlotCoordinator = request.app.state.slots
+    if incoming.action == "start":
+        if incoming.slot_token is not None:
+            raise AssistError("invalid_request")
+        return coordinator.start(
+            product_id=incoming.product_id,
+            question=incoming.question,
+            steps_tried=incoming.steps_tried,
+        )
+    if incoming.slot_token is None:
+        raise AssistError("invalid_slot")
+    if incoming.action == "reset":
+        if any(name in incoming.model_fields_set for name in _ASSIST_FIELDS):
+            raise AssistError("invalid_request")
+        return coordinator.reset(incoming.slot_token)
+    updates = {
+        name: getattr(incoming, name)
+        for name in _ASSIST_FIELDS
+        if name in incoming.model_fields_set
+    }
+    return coordinator.continue_slot(incoming.slot_token, **updates)
+
+
+def _assist_from_view(request_id: str, view: AssistView) -> AssistResponse:
+    status = "clarify" if view.status == "clarify" else "handoff"
+    return AssistResponse(
+        request_id=request_id,
+        status=status,
+        slot_token=view.token,
+        attempt=view.attempt,
+        missing=list(view.missing),
+        product_id=view.product_id,
+        question=view.question,
+        steps_tried=view.steps_tried,
+        summary=view.summary,
+        user_statements_unverified=True,
+        answer=None,
+        reason=view.reason,
+        sources=[],
+        usage=None,
+        usage_code=None,
+        usage_fields=[],
+    )
+
+
+def _assist_from_ask(
+    request_id: str, view: AssistView, answered: AskResponse
+) -> AssistResponse:
+    summary = None
+    if answered.status == "handoff":
+        summary = handoff_summary(
+            product_id=view.product_id,
+            question=view.question,
+            steps_tried=view.steps_tried,
+            missing=(),
+            reason=answered.reason or "no_evidence",
+        )
+    return AssistResponse(
+        request_id=request_id,
+        status=answered.status,
+        slot_token=view.token,
+        attempt=view.attempt,
+        missing=[],
+        product_id=view.product_id,
+        question=view.question,
+        steps_tried=view.steps_tried,
+        summary=summary,
+        user_statements_unverified=True,
+        answer=answered.answer,
+        reason=answered.reason,
+        sources=answered.sources,
+        usage=answered.usage,
+        usage_code=answered.usage_code,
+        usage_fields=answered.usage_fields,
+    )
 
 
 def _utf8(value: str) -> bool:

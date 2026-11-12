@@ -27,6 +27,10 @@ from customer_support_rag.budget import (
     LunaPolicy,
     LunaRuntime,
 )
+from customer_support_rag.eval_diagnostic import (
+    DiagnosticCaptureError,
+    EvalDiagnostic,
+)
 from customer_support_rag.knowledge.answering import (
     GROUNDED_POLICY,
     PROMPT_REVISION,
@@ -568,6 +572,7 @@ async def _post_live_once(
     transport: httpx.AsyncBaseTransport,
     request_id: str,
     deadline: float,
+    diagnostic: EvalDiagnostic | None = None,
 ) -> tuple[GroundedDraft | None, _UsageNote, str | None]:
     """Post one live body. This does not reserve or write a ledger."""
     if not _factory_transport(transport):
@@ -579,12 +584,77 @@ async def _post_live_once(
         )
     except TimeoutError:
         raise LunaError("logical_timeout") from None
+    record = None
+    if diagnostic is not None:
+        try:
+            record = diagnostic.capture(body, http_status=status_code, api_key=api_key)
+        except DiagnosticCaptureError as exc:
+            raise LunaError(exc.args[0]) from None
     if status_code != 200:
-        raise LunaError(_provider_status_code(status_code, body))
-    payload, _response_id, _request_header = _completed_payload(
-        body, api_key, _request_header
-    )
-    return _live_outcome(payload, request)
+        code = _provider_status_code(status_code, body)
+        if diagnostic is not None and record is not None:
+            diagnostic.finish(
+                record,
+                parser_stage="http_status",
+                safe_code=(
+                    code
+                    if code in {"provider_service_unavailable", "provider_capacity"}
+                    else "provider_service_unavailable"
+                ),
+            )
+        raise LunaError(code)
+    try:
+        payload, _response_id, _request_header = _completed_payload(
+            body, api_key, _request_header
+        )
+        outcome = _live_outcome(payload, request)
+    except LunaError as exc:
+        if diagnostic is not None and record is not None:
+            stage = (
+                "output_parser"
+                if exc.code == "invalid_model_schema"
+                else "provider_envelope"
+            )
+            safe = (
+                exc.code
+                if exc.code
+                in {
+                    "invalid_model_schema",
+                    "invalid_response",
+                    "unknown_citation",
+                    "output_refusal",
+                }
+                else "invalid_response"
+            )
+            diagnostic.finish(record, parser_stage=stage, safe_code=safe)
+        raise
+    if diagnostic is not None and record is not None:
+        stopped = outcome[2]
+        if stopped is None:
+            stage, code = "parsed", "parsed"
+        elif stopped == "output_refusal":
+            stage, code = "refusal", stopped
+        elif stopped in {
+            "invalid_model_schema",
+            "invalid_response",
+            "unknown_citation",
+        }:
+            stage, code = "output_parser", stopped
+        else:
+            stage = "provider_envelope"
+            code = (
+                stopped
+                if stopped
+                in {
+                    "provider_incomplete",
+                    "provider_failed",
+                    "provider_cancelled",
+                    "contradictory_response",
+                }
+                else "invalid_response"
+            )
+        diagnostic.finish(record, parser_stage=stage, safe_code=code)
+    return outcome
 
 
 def _require_deadline(deadline: float) -> None:

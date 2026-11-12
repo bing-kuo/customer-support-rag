@@ -19,9 +19,9 @@
 
     <main>
       <section class="intro" aria-labelledby="page-title">
-        <p class="eyebrow">合成耳機資料・單次回答草稿</p>
+        <p class="eyebrow">合成耳機資料・客服回答草稿</p>
         <h1 id="page-title">先看清楚問題，<br class="mobile-break">再整理有根據的回覆。</h1>
-        <p class="intro-copy">選擇商品並輸入顧客問題。系統會嘗試整理回答、原文依據，或建議轉由專人處理。</p>
+        <p class="intro-copy">選擇商品與整理方式。逐步補充可先確認必要資訊，再整理回答、原文依據或人工交接摘要。</p>
       </section>
 
       <section class="workspace" aria-label="建立客服問答">
@@ -31,8 +31,16 @@
             <div><h2>整理顧客問題</h2><p>請勿輸入真實個人資料。</p></div>
           </div>
 
+          <fieldset class="mode-picker" aria-describedby="mode-help">
+            <legend>處理方式</legend>
+            <label class="mode-option"><input type="radio" name="mode" value="single" checked> 單題整理</label>
+            <label class="mode-option"><input type="radio" name="mode" value="guided"> 逐步補充</label>
+            <p id="mode-help" class="field-help">逐步補充會先確認商品與必要資訊；欄位不足時最多追問兩次。</p>
+          </fieldset>
+
           <label for="product">商品</label>
           <select id="product" name="product_id">
+            <option value="" selected>請選擇商品</option>
             <option value="hp-a">HP-A｜無線耳機</option>
             <option value="hp-b">HP-B｜無線耳機</option>
           </select>
@@ -44,10 +52,17 @@
           <textarea id="question" name="question" rows="5" placeholder="例如：HP-A 耳機可以用水洗嗎？" aria-describedby="question-help character-count" required></textarea>
           <p id="question-help" class="field-help">最多 1000 字。送出後只會詢問一次，不會自動重試。</p>
 
+          <div id="steps-field" hidden>
+            <label for="steps-tried">已經試過哪些步驟？</label>
+            <textarea id="steps-tried" name="steps_tried" rows="3" maxlength="1000" placeholder="請描述已嘗試的處理方式；尚未嘗試也可以說明。"></textarea>
+            <p id="assist-status" class="field-help">資料只保留在目前頁面與本機暫存對話中。</p>
+          </div>
+
           <button id="submit-button" class="submit-button" type="submit">
             <span class="button-label">整理回答</span><span class="button-arrow" aria-hidden="true">→</span>
           </button>
-          <p class="privacy-note"><span aria-hidden="true">⌁</span>問題只用於這次請求，不會保存在瀏覽器。</p>
+          <button id="new-question" class="secondary-button new-question" type="button" hidden>開始新問題</button>
+          <p class="privacy-note"><span aria-hidden="true">⌁</span>不寫入瀏覽器儲存；逐步補充期間會暫留在本頁與本機對話中。</p>
         </form>
 
         <section id="result" class="result-card" aria-labelledby="result-title" aria-live="polite" aria-busy="false">

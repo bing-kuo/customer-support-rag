@@ -16,12 +16,14 @@ import stat
 from dataclasses import dataclass
 from pathlib import Path
 
+from customer_support_rag.eval_diagnostic import EvalDiagnostic
 from customer_support_rag.knowledge.answering import (
     AnswerRequest,
     GroundedDraft,
     prepare_answer,
 )
 from customer_support_rag.knowledge.chunker import chunk_document
+from customer_support_rag.knowledge.embedding import PUBLISHED_MODEL_DIGEST
 from customer_support_rag.knowledge.reader import read_document
 from customer_support_rag.knowledge.retrieval import RetrievalHit
 from customer_support_rag.knowledge.storage import document_embedding_key
@@ -41,7 +43,7 @@ from customer_support_rag.luna import (
 QUESTION = "HP-A 耳機可以用水洗嗎？"
 REQUEST_ID = "hp-a-luna-natural-answer-one-shot-v1"
 CARE_PATH = "hp-a/headphone-care.md"
-PUBLISHED_DIGEST = "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"
+PUBLISHED_DIGEST = PUBLISHED_MODEL_DIGEST
 _CARE_ARTIFACT = "9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad"
 
 __all__ = [
@@ -140,6 +142,7 @@ async def post_prepared_answer(
     *,
     request_id: str,
     deadline: float = DEFAULT_DEADLINE_SECONDS,
+    diagnostic: EvalDiagnostic | None = None,
 ) -> LiveCall:
     """Send one prepared request once. The key is the only local admission.
 
@@ -151,6 +154,8 @@ async def post_prepared_answer(
     a previous id or claim exactly-once delivery.
     """
     if not isinstance(request, AnswerRequest):
+        raise LunaError("policy_rejected")
+    if diagnostic is not None and not isinstance(diagnostic, EvalDiagnostic):
         raise LunaError("policy_rejected")
     if (
         not isinstance(request_id, str)
@@ -173,6 +178,7 @@ async def post_prepared_answer(
             transport=transport,
             request_id=request_id,
             deadline=deadline,
+            diagnostic=diagnostic,
         )
     finally:
         await transport.aclose()
