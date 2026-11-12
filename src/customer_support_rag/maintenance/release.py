@@ -9,10 +9,13 @@ The writer lock is ``flock`` in this process; it is not a distributed lock.
 
 Same-bytes rebuild returns the existing directory and does not embed again.
 Artifact keys do not cover vectors. Copying them requires the same transport,
-the source manifest, the database file hash, and the document identity. A mock
-candidate also requires the mock digest and a mock vector for every chunk. An
-Ollama candidate requires the published digest and is never filled from a mock
-candidate. Activation also checks that file hash.
+the full embedding identity, the source manifest, the database file hash, and
+the document identity. A mock candidate also requires the mock digest and a
+mock vector for every chunk. An Ollama candidate requires the published digest
+and is never filled from a mock candidate. Snapshot, no-op, reuse, evaluation,
+and activation reject a manifest whose model, digest, dimensions, document
+profile, chunking profile, or query profile differs from that identity or from
+the stored payload. A regression must repeat that same identity.
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from customer_support_rag.knowledge.embedding import (
     EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
     PUBLISHED_MODEL_DIGEST,
+    QUERY_PROFILE,
 )
 from customer_support_rag.knowledge.parser import parse_document
 from customer_support_rag.knowledge.storage import (
@@ -194,15 +198,17 @@ def activate(
             or approval["database_sha256"] != database_sha
         ):
             raise MaintenanceError("release approval does not match the candidate")
+        snapshot = _verified_directory(
+            root, directory, release_id, manifest_sha, database_sha
+        )
         _require_regression(
             directory,
             approval,
             release_id=release_id,
             manifest_sha256=manifest_sha,
             database_sha256=database_sha,
-        )
-        snapshot = _verified_directory(
-            root, directory, release_id, manifest_sha, database_sha
+            transport=snapshot.transport,
+            model_digest=snapshot.model_digest,
         )
         pointer = root / _POINTER_NAME
         current = _pointer_sha(pointer)
@@ -237,15 +243,14 @@ def release_hashes(workspace: Path, release_id: str) -> dict[str, str]:
     """Return the candidate hashes a release approval must repeat."""
     root = require_directory(workspace)
     directory = release_directory(root, release_id)
-    manifest_path = _regular_file(directory / "manifest.json")
-    database_path = _regular_file(directory / "knowledge.sqlite")
     regression_path = _regular_file(directory / "regression.json")
     try:
         report = load_object(regression_path, regression_path.read_bytes())
     except OSError:
         raise MaintenanceError("regression is unavailable") from None
-    manifest_sha256 = sha256_file(manifest_path)
-    database_sha256 = sha256_file(database_path)
+    snapshot = candidate_snapshot(workspace, release_id)
+    manifest_sha256 = snapshot.manifest_sha256
+    database_sha256 = snapshot.database_sha256
     from customer_support_rag.maintenance.evaluate import regression_matches_candidate
 
     if not regression_matches_candidate(
@@ -253,6 +258,8 @@ def release_hashes(workspace: Path, release_id: str) -> dict[str, str]:
         release_id=release_id,
         manifest_sha256=manifest_sha256,
         database_sha256=database_sha256,
+        transport=snapshot.transport,
+        model_digest=snapshot.model_digest,
     ):
         raise MaintenanceError("regression does not match the candidate")
     code_sha = report.get("code_sha")
@@ -438,7 +445,7 @@ def _embeddings_from_release(
     if (
         manifest.get("transport") != transport
         or not isinstance(embedding, dict)
-        or embedding.get("model_digest") != model_digest
+        or embedding != _embedding_block(model_digest)
         or not _digest_matches_transport(transport, model_digest)
         or not isinstance(database_record, dict)
         or database_record.get("sha256") != sha256_file(database)
@@ -467,16 +474,9 @@ def _embeddings_from_release(
         return None
     finally:
         store.close()
-    if loaded is None or loaded.document.body != body:
+    if loaded is None or loaded.document.body != body or not loaded.embedded_chunks:
         return None
-    if loaded.model_digest != model_digest or not loaded.embedded_chunks:
-        return None
-    metadata = loaded.document.metadata
-    if (
-        identity.get("document_id") != metadata.document_id
-        or identity.get("product_id") != metadata.product_id
-        or identity.get("version") != metadata.version
-    ):
+    if not _payload_matches_identity(loaded, identity, _embedding_block(model_digest)):
         return None
     if transport == "mock":
         for item in loaded.embedded_chunks:
@@ -520,6 +520,11 @@ def _manifest(
     }
 
 
+def embedding_identity(model_digest: str) -> dict[str, object]:
+    """Return the only embedding identity a candidate may record."""
+    return _embedding_block(model_digest)
+
+
 def _embedding_block(model_digest: str) -> dict[str, object]:
     return {
         "model": EMBEDDING_MODEL,
@@ -528,6 +533,7 @@ def _embedding_block(model_digest: str) -> dict[str, object]:
         "input_profile": INPUT_PROFILE,
         "chunking_profile": CHUNKING_PROFILE,
         "max_chars": _MAX_CHARS,
+        "query_profile": QUERY_PROFILE,
     }
 
 
@@ -574,14 +580,25 @@ def _matches_existing(
         if isinstance(item, dict)
     }
     embedding = identity.get("embedding")
-    manifest_embedding = manifest.get("embedding")
-    return (
+    if not (
         actual == expected
         and manifest.get("transport") == identity.get("transport")
         and isinstance(embedding, dict)
-        and isinstance(manifest_embedding, dict)
-        and manifest_embedding.get("model_digest") == embedding.get("model_digest")
-    )
+        and manifest.get("embedding") == embedding
+        and _digest_matches_transport(
+            str(identity.get("transport")), str(embedding.get("model_digest"))
+        )
+        and all(isinstance(item, dict) for item in documents)
+    ):
+        return False
+    digest = embedding.get("model_digest")
+    if not isinstance(digest, str):
+        return False
+    try:
+        _require_stored_identity(database_path, documents, digest)
+    except MaintenanceError:
+        return False
+    return True
 
 
 def _read_pointer(pointer: Path) -> tuple[dict[str, object], bytes]:
@@ -654,17 +671,19 @@ def _verified_directory(
         or database.get("sha256") != database_sha
         or not isinstance(documents, list)
         or not documents
-        or not isinstance(embedding, dict)
+        or embedding != _embedding_block(digest)
     ):
         raise MaintenanceError("active release is unavailable")
     keys: list[str] = []
+    stored_documents: list[dict[str, object]] = []
     for item in documents:
         if not isinstance(item, dict) or not isinstance(item.get("artifact_key"), str):
             raise MaintenanceError("active release is unavailable")
         keys.append(item["artifact_key"])
+        stored_documents.append(item)
     if len(keys) != len(set(keys)):
         raise MaintenanceError("active release is unavailable")
-    _require_stored_digest(database_path, tuple(keys), digest)
+    _require_stored_identity(database_path, stored_documents, digest)
     return ActiveSnapshot(
         release_id=release_id,
         database=database_path,
@@ -676,24 +695,56 @@ def _verified_directory(
     )
 
 
-def _require_stored_digest(
-    database_path: Path, keys: tuple[str, ...], model_digest: str
+def _require_stored_identity(
+    database_path: Path,
+    documents: list[dict[str, object]],
+    model_digest: str,
 ) -> None:
-    """Reject a manifest digest that does not match the stored payloads."""
+    """Reject a manifest that does not match the stored payload identity."""
+    expected = _embedding_block(model_digest)
     try:
         store = EmbeddingStore.open_readonly(database_path)
     except (OSError, StorageError):
         raise MaintenanceError("active release is unavailable") from None
     try:
-        for key in keys:
+        for item in documents:
+            key = item.get("artifact_key")
+            if not isinstance(key, str):
+                raise MaintenanceError("active release is unavailable")
             try:
                 loaded = store.get_document(key)
             except (OSError, StorageError):
                 raise MaintenanceError("active release is unavailable") from None
-            if loaded is None or loaded.model_digest != model_digest:
+            if loaded is None or not _payload_matches_identity(loaded, item, expected):
                 raise MaintenanceError("active release is unavailable")
     finally:
         store.close()
+
+
+def _payload_matches_identity(
+    loaded: object,
+    item: dict[str, object],
+    expected: dict[str, object],
+) -> bool:
+    from customer_support_rag.knowledge.storage import StoredEmbeddingDocument
+
+    if not isinstance(loaded, StoredEmbeddingDocument):
+        return False
+    metadata = loaded.document.metadata
+    body_hash = hashlib.sha256(loaded.document.body.encode("utf-8")).hexdigest()
+    return (
+        loaded.embedding_model == expected["model"]
+        and loaded.model_digest == expected["model_digest"]
+        and loaded.dimensions == expected["dimensions"]
+        and loaded.input_profile == expected["input_profile"]
+        and loaded.chunking_profile == expected["chunking_profile"]
+        and loaded.max_chars == expected["max_chars"]
+        and item.get("document_id") == metadata.document_id
+        and item.get("product_id") == metadata.product_id
+        and item.get("version") == metadata.version
+        and item.get("title") == metadata.title
+        and item.get("body_sha256") == body_hash
+    )
 
 
 def _open_keys(snapshot: ActiveSnapshot) -> None:
@@ -746,6 +797,8 @@ def _require_regression(
     release_id: str,
     manifest_sha256: str,
     database_sha256: str,
+    transport: str,
+    model_digest: str,
 ) -> None:
     from customer_support_rag.maintenance.evaluate import (
         regression_matches_candidate,
@@ -762,6 +815,8 @@ def _require_regression(
         release_id=release_id,
         manifest_sha256=manifest_sha256,
         database_sha256=database_sha256,
+        transport=transport,
+        model_digest=model_digest,
     ):
         raise MaintenanceError("regression does not match the candidate")
     if sha256_file(path) != approval.get("regression_sha256"):

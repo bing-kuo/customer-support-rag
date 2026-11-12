@@ -21,11 +21,17 @@ from customer_support_rag.ask import (
 )
 from customer_support_rag.knowledge import KnowledgeChunk, KnowledgeMetadata
 from customer_support_rag.knowledge.embedding import (
+    EMBEDDING_DIMENSIONS,
     EMBEDDING_MODEL,
+    MAX_EMBED_TEXT_CHARS,
     OLLAMA_EMBED_URL,
     PUBLISHED_MODEL_DIGEST,
 )
-from customer_support_rag.knowledge.storage import EmbeddingStore
+from customer_support_rag.knowledge.storage import (
+    CHUNKING_PROFILE,
+    INPUT_PROFILE,
+    EmbeddingStore,
+)
 from customer_support_rag.luna import MODEL
 from customer_support_rag.maintenance.approval import consume_document_approval
 from customer_support_rag.maintenance.baseline import baseline_order, bigram_overlap
@@ -34,6 +40,7 @@ from customer_support_rag.maintenance.errors import MaintenanceError
 from customer_support_rag.maintenance.evaluate import (
     _select_query_transport,
     evaluate_release,
+    regression_matches_candidate,
     require_mock_regression,
 )
 from customer_support_rag.maintenance.hashes import (
@@ -53,6 +60,7 @@ from customer_support_rag.maintenance.release import (
     activate,
     build_candidate,
     candidate_snapshot,
+    embedding_identity,
     release_hashes,
 )
 
@@ -859,6 +867,7 @@ def test_ollama_evaluate_stays_offline_and_generation_stays_unverified(
     report = load_object(report_path, report_path.read_bytes())
     assert report["transport"] == "ollama"
     assert report["model_digest"] == PUBLISHED_MODEL_DIGEST
+    assert report["embedding"] == embedding_identity(PUBLISHED_MODEL_DIGEST)
     assert report["query_transport"] == "mock"
     assert report["mock_is_not_generation_evidence"] is True
     cases = report["cases"]
@@ -901,6 +910,216 @@ def test_rewritten_mock_manifest_cannot_claim_the_published_digest(
         candidate_snapshot(workspace, mocked.release_id)
 
 
+def test_manifest_identity_tamper_is_rejected_at_every_entry(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    previous = _activate_sources(tmp_path / "mock-review", workspace, BASELINE)
+    before = _pointer_sha(workspace)
+    mock_again = build_candidate(workspace, KNOWLEDGE, BASELINE)
+    assert mock_again.noop is True
+    assert mock_again.release_id == previous
+    assert mock_again.embedded == 0
+    assert mock_again.copied == 0
+
+    requests: list[httpx.Request] = []
+    embedder = OllamaEmbedder(_published_transport(requests))
+    built = build_candidate(workspace, KNOWLEDGE, BASELINE, embedder)
+    assert built.copied == 0
+    assert built.embedded == 2
+    manifest_path = workspace / "releases" / built.release_id / "manifest.json"
+    original = manifest_path.read_bytes()
+    fields: dict[str, object] = {
+        "model": "other-model",
+        "dimensions": 7,
+        "input_profile": "other-input",
+        "chunking_profile": "other-chunks",
+        "max_chars": 17,
+        "query_profile": "other-query",
+    }
+    for name, value in fields.items():
+        _rewrite_embedding(manifest_path, **{name: value})
+        _assert_manifest_identity_rejected(workspace, built.release_id, embedder)
+        manifest_path.write_bytes(original)
+
+    payload = load_object(manifest_path, original)
+    payload["transport"] = "mock"
+    embedding = payload["embedding"]
+    assert isinstance(embedding, dict)
+    embedding["model_digest"] = MOCK_EMBED_DIGEST
+    manifest_path.write_text(human_json(payload), encoding="utf-8")
+    _assert_manifest_identity_rejected(workspace, built.release_id, embedder)
+    manifest_path.write_bytes(original)
+    assert embedder.calls == 2
+    assert len([item for item in requests if item.url.path == "/api/embed"]) == 2
+    again = build_candidate(workspace, KNOWLEDGE, BASELINE, embedder)
+    assert again.noop is True
+    assert again.embedded == 0
+    assert len([item for item in requests if item.url.path == "/api/embed"]) == 2
+
+    marcus = {
+        "model": "other-model",
+        "dimensions": 7,
+        "input_profile": "other-input",
+        "chunking_profile": "other-chunks",
+        "max_chars": 17,
+    }
+    _rewrite_embedding(manifest_path, **marcus)
+    rewritten = load_object(manifest_path, manifest_path.read_bytes())
+    rewritten_embedding = rewritten["embedding"]
+    assert isinstance(rewritten_embedding, dict)
+    assert rewritten["transport"] == "ollama"
+    assert rewritten_embedding["model_digest"] == PUBLISHED_MODEL_DIGEST
+    _assert_stored_payload_unchanged(workspace, built.release_id)
+    _assert_manifest_identity_rejected(workspace, built.release_id, embedder)
+    assert embedder.calls == 2
+    _approve(workspace, FAQ)
+    reused = build_candidate(
+        workspace, KNOWLEDGE, FAQ, OllamaEmbedder(_published_transport([]))
+    )
+    assert reused.release_id != built.release_id
+    assert reused.copied == 0
+    assert reused.embedded == 3
+    manifest_path.write_bytes(original)
+
+    evaluate_release(
+        workspace,
+        KNOWLEDGE,
+        built.release_id,
+        SUITE,
+        code_sha=CODE,
+        query_transport=_published_transport([]),
+    )
+    combined = dict(marcus)
+    _rewrite_embedding(manifest_path, **combined)
+    with pytest.raises(MaintenanceError, match="unavailable"):
+        _approve_release(tmp_path / "blocked", workspace, built.release_id)
+    manifest_path.write_bytes(original)
+    _approve_release(tmp_path / "ollama-review", workspace, built.release_id)
+    _rewrite_embedding(manifest_path, **combined)
+    _patch_consumed_approval(
+        workspace,
+        built.release_id,
+        manifest_sha256=sha256_file(manifest_path),
+    )
+    with pytest.raises(MaintenanceError, match="unavailable"):
+        activate(workspace, built.release_id, expected_previous=before)
+    assert _pointer_sha(workspace) == before
+    assert load_active(workspace) == previous
+    assert list((workspace / "releases").glob(".partial-*")) == []
+
+
+def test_regression_identity_cannot_swap_mock_and_ollama(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    previous = _activate_sources(tmp_path / "mock-review", workspace, BASELINE)
+    requests: list[httpx.Request] = []
+    embedder = OllamaEmbedder(_published_transport(requests))
+    built = build_candidate(workspace, KNOWLEDGE, BASELINE, embedder)
+    report_path = evaluate_release(
+        workspace,
+        KNOWLEDGE,
+        built.release_id,
+        SUITE,
+        code_sha=CODE,
+        query_transport=_published_transport([]),
+    )
+    original = report_path.read_bytes()
+    report = load_object(report_path, original)
+    snapshot = candidate_snapshot(workspace, built.release_id)
+    assert report["query_transport"] == "mock"
+    assert report["embedding"] == embedding_identity(PUBLISHED_MODEL_DIGEST)
+    assert regression_matches_candidate(
+        report,
+        release_id=built.release_id,
+        manifest_sha256=snapshot.manifest_sha256,
+        database_sha256=snapshot.database_sha256,
+        transport=snapshot.transport,
+        model_digest=snapshot.model_digest,
+    )
+    _reject_swapped_report(workspace, built.release_id, report_path, original, False)
+    swapped = load_object(report_path, report_path.read_bytes())
+    swapped_embedding = swapped["embedding"]
+    assert swapped["transport"] == "mock"
+    assert swapped["model_digest"] == MOCK_EMBED_DIGEST
+    assert swapped["query_transport"] == "mock"
+    assert isinstance(swapped_embedding, dict)
+    assert swapped_embedding["model_digest"] == PUBLISHED_MODEL_DIGEST
+    stayed = candidate_snapshot(workspace, built.release_id)
+    assert stayed.transport == "ollama"
+    assert stayed.model_digest == PUBLISHED_MODEL_DIGEST
+    _reject_swapped_report(workspace, built.release_id, report_path, original, True)
+    _reject_report_embedding_lie(workspace, built.release_id, report_path, original)
+    report_path.write_bytes(original)
+    _approve_release(tmp_path / "ollama-review", workspace, built.release_id)
+    current = _pointer_sha(workspace)
+    assert activate(workspace, built.release_id, expected_previous=current) == (
+        "activated"
+    )
+    moved = _pointer_sha(workspace)
+    assert load_active(workspace) == built.release_id
+    again = build_candidate(workspace, KNOWLEDGE, BASELINE, embedder)
+    assert again.noop is True
+    assert again.embedded == 0
+    assert again.copied == 0
+    assert len([item for item in requests if item.url.path == "/api/embed"]) == 2
+
+    _reject_swapped_report(workspace, built.release_id, report_path, original, False)
+    _patch_consumed_approval(
+        workspace,
+        built.release_id,
+        regression_sha256=sha256_file(report_path),
+    )
+    with pytest.raises(
+        MaintenanceError, match="regression does not match the candidate"
+    ):
+        activate(workspace, built.release_id, expected_previous=moved)
+    assert _pointer_sha(workspace) == moved
+    assert load_active(workspace) == built.release_id
+    stayed_after = candidate_snapshot(workspace, built.release_id)
+    assert stayed_after.transport == "ollama"
+    assert stayed_after.model_digest == PUBLISHED_MODEL_DIGEST
+
+    mock_path = workspace / "releases" / previous / "regression.json"
+    mock_report = load_object(mock_path, mock_path.read_bytes())
+    mock_report["transport"] = "ollama"
+    mock_report["model_digest"] = PUBLISHED_MODEL_DIGEST
+    mock_report["query_transport"] = "mock"
+    mock_report["embedding"] = embedding_identity(PUBLISHED_MODEL_DIGEST)
+    mock_path.write_text(human_json(mock_report), encoding="utf-8")
+    require_mock_regression(load_object(mock_path, mock_path.read_bytes()))
+    with pytest.raises(
+        MaintenanceError, match="regression does not match the candidate"
+    ):
+        release_hashes(workspace, previous)
+    _patch_consumed_approval(
+        workspace,
+        previous,
+        regression_sha256=sha256_file(mock_path),
+    )
+    with pytest.raises(
+        MaintenanceError, match="regression does not match the candidate"
+    ):
+        activate(workspace, previous, expected_previous=moved)
+    assert _pointer_sha(workspace) == moved
+    assert load_active(workspace) == built.release_id
+
+
+def test_failed_embed_keeps_the_old_pointer(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path)
+    previous = _activate_sources(tmp_path / "mock-review", workspace, BASELINE)
+    before = _pointer_sha(workspace)
+    _approve(workspace, FAQ)
+    requests: list[httpx.Request] = []
+    embedder = OllamaEmbedder(_published_transport(requests, fail="timeout"))
+    with pytest.raises(MaintenanceError, match="embedding failed"):
+        build_candidate(workspace, KNOWLEDGE, FAQ, embedder)
+    assert embedder.calls == 0
+    assert [item.url.path for item in requests] == ["/api/tags", "/api/embed"]
+    assert _pointer_sha(workspace) == before
+    assert load_active(workspace) == previous
+    assert list((workspace / "releases").glob(".partial-*")) == []
+    databases = [path for path in workspace.rglob("knowledge.sqlite") if path.is_file()]
+    assert [path.parent.name for path in databases] == [previous]
+
+
 def test_ollama_release_keeps_the_published_digest_at_ask(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -935,6 +1154,117 @@ def test_ollama_release_keeps_the_published_digest_at_ask(
     assert rejected.status_code == 502
     assert rejected.json()["code"] == "embedding_unavailable"
     assert calls["luna"] == 1
+
+
+def _rewrite_embedding(path: Path, **fields: object) -> None:
+    payload = load_object(path, path.read_bytes())
+    embedding = payload["embedding"]
+    assert isinstance(embedding, dict)
+    embedding.update(fields)
+    path.write_text(human_json(payload), encoding="utf-8")
+
+
+def _patch_consumed_approval(
+    workspace: Path, release_id: str, **fields: object
+) -> None:
+    path = workspace / "control" / "release-approvals" / f"{release_id}.json"
+    payload = load_object(path, path.read_bytes())
+    payload.update(fields)
+    path.write_text(human_json(payload), encoding="utf-8")
+
+
+def _assert_stored_payload_unchanged(workspace: Path, release_id: str) -> None:
+    directory = workspace / "releases" / release_id
+    manifest = load_object(
+        directory / "manifest.json", (directory / "manifest.json").read_bytes()
+    )
+    documents = manifest["documents"]
+    assert isinstance(documents, list)
+    store = EmbeddingStore.open_readonly(directory / "knowledge.sqlite")
+    try:
+        for item in documents:
+            assert isinstance(item, dict)
+            loaded = store.get_document(str(item["artifact_key"]))
+            assert loaded is not None
+            assert loaded.embedding_model == EMBEDDING_MODEL
+            assert loaded.model_digest == PUBLISHED_MODEL_DIGEST
+            assert loaded.dimensions == EMBEDDING_DIMENSIONS
+            assert loaded.input_profile == INPUT_PROFILE
+            assert loaded.chunking_profile == CHUNKING_PROFILE
+            assert loaded.max_chars == MAX_EMBED_TEXT_CHARS
+    finally:
+        store.close()
+
+
+def _assert_manifest_identity_rejected(
+    workspace: Path, release_id: str, embedder: OllamaEmbedder
+) -> None:
+    with pytest.raises(MaintenanceError, match="unavailable"):
+        candidate_snapshot(workspace, release_id)
+    with pytest.raises(MaintenanceError, match="release already exists"):
+        build_candidate(workspace, KNOWLEDGE, BASELINE, embedder)
+    with pytest.raises(MaintenanceError, match="unavailable"):
+        evaluate_release(
+            workspace,
+            KNOWLEDGE,
+            release_id,
+            SUITE,
+            code_sha=CODE,
+            query_transport=_published_transport([]),
+        )
+
+
+def _reject_swapped_report(
+    workspace: Path,
+    release_id: str,
+    path: Path,
+    original: bytes,
+    include_embedding: bool,
+) -> None:
+    report = load_object(path, original)
+    report["transport"] = "mock"
+    report["model_digest"] = MOCK_EMBED_DIGEST
+    report["query_transport"] = "mock"
+    if include_embedding:
+        report["embedding"] = embedding_identity(MOCK_EMBED_DIGEST)
+    path.write_text(human_json(report), encoding="utf-8")
+    _assert_report_does_not_match(workspace, release_id, path)
+
+
+def _reject_report_embedding_lie(
+    workspace: Path, release_id: str, path: Path, original: bytes
+) -> None:
+    report = load_object(path, original)
+    embedding = report["embedding"]
+    assert isinstance(embedding, dict)
+    embedding["model"] = "other-model"
+    path.write_text(human_json(report), encoding="utf-8")
+    _assert_report_does_not_match(workspace, release_id, path)
+    missing = load_object(path, original)
+    missing.pop("embedding")
+    path.write_text(human_json(missing), encoding="utf-8")
+    _assert_report_does_not_match(workspace, release_id, path)
+
+
+def _assert_report_does_not_match(workspace: Path, release_id: str, path: Path) -> None:
+    loaded = load_object(path, path.read_bytes())
+    require_mock_regression(loaded)
+    snapshot = candidate_snapshot(workspace, release_id)
+    assert (
+        regression_matches_candidate(
+            loaded,
+            release_id=release_id,
+            manifest_sha256=snapshot.manifest_sha256,
+            database_sha256=snapshot.database_sha256,
+            transport=snapshot.transport,
+            model_digest=snapshot.model_digest,
+        )
+        is False
+    )
+    with pytest.raises(
+        MaintenanceError, match="regression does not match the candidate"
+    ):
+        release_hashes(workspace, release_id)
 
 
 def _workspace(path: Path) -> Path:

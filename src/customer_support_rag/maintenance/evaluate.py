@@ -31,6 +31,7 @@ from customer_support_rag.maintenance.paths import require_directory
 from customer_support_rag.maintenance.release import (
     ActiveSnapshot,
     candidate_snapshot,
+    embedding_identity,
     ensure_unique_documents,
     workspace_lock,
 )
@@ -89,6 +90,7 @@ def evaluate_release(
             "rubric_version": suite["rubric_version"],
             "transport": snapshot.transport,
             "model_digest": snapshot.model_digest,
+            "embedding": embedding_identity(snapshot.model_digest),
             "query_transport": query_label,
             "mock_is_not_generation_evidence": True,
             "cases": cases,
@@ -115,12 +117,16 @@ def regression_matches_candidate(
     release_id: str,
     manifest_sha256: str,
     database_sha256: str,
+    transport: str,
+    model_digest: str,
 ) -> bool:
-    """Return whether this report belongs to this candidate's files.
+    """Return whether this report belongs to this candidate.
 
-    A regression copied from another release still has a file hash, a code SHA,
-    and a suite version. Those three are not enough. The report must name this
-    release and the manifest and database bytes that are on disk now.
+    A legal mock or Ollama JSON document is not enough. The report must name
+    this release, these manifest and database bytes, this transport, this
+    digest, and the only embedding identity that digest may use. It must also
+    name this suite, rubric, and code SHA. ``query_transport`` may still be
+    ``mock`` on an Ollama candidate; that label is not the candidate identity.
     """
     code_sha = report.get("code_sha")
     return (
@@ -129,6 +135,9 @@ def regression_matches_candidate(
         and report.get("database_sha256") == database_sha256
         and report.get("suite_version") == "dev-suite-v1"
         and report.get("rubric_version") == "semantic-rubric-v1"
+        and report.get("transport") == transport
+        and report.get("model_digest") == model_digest
+        and report.get("embedding") == embedding_identity(model_digest)
         and isinstance(code_sha, str)
         and len(code_sha) == 40
         and all(character in _CODE_SHA for character in code_sha)
