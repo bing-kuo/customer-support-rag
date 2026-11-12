@@ -175,7 +175,7 @@ uv run --locked python -m customer_support_rag.maintenance hashes \
 
 伺服器發出 32 個 hex 字元的 slot token，用來尋找這個程序裡的記憶。澄清最多兩次，再來是 `insufficient_information`。每個欄位最多 1000 個 Python 字元，問句與已試步驟合計最多 2000。商品只接受 `hp-a` 或 `hp-b`，不會從問句推斷。HTTP body 上限 16KiB。token 從建立起 900 秒有效，繼續對話不會延長。同時最多 32 個 slot；滿了回 `503` `slot_capacity`。未知或過期 token 回 `422` `invalid_slot`。只有 `reset` 會換成一張新的空 slot。這次回應仍是 `clarify`，但 attempt 是 1，並且算進最多兩次澄清。空的 `continue` 接著是 `clarify` attempt 2，再來是 `handoff` attempt 2，之後維持 handoff，不會出現第三次 `clarify`。reset 之後第一次 `continue` 若三個欄位都齊，仍會進入模型。`start` 不帶欄位仍是 `clarify` attempt 1、第二次 `clarify` attempt 2，然後 handoff。`start` 帶 token，或 `reset` 附帶欄位，都是 `invalid_request`。
 
-三個欄位都齊了才會進入模型，而且只會一次。之後的 `continue` 是 `reset_required`，回應不含上一則回答。還在澄清時更換商品會清掉先前的問題與步驟，已用掉的澄清次數保留。已經呼叫過模型之後再換商品，同樣是 `reset_required`。錯誤不重試。`user_statements_unverified` 固定為 true。handoff 的 `summary` 是繁體中文，錯誤 code 是英文。
+三個欄位都齊了才會進入模型，而且只會一次。`continue` 沒有帶到的欄位維持 slot 裡的舊值。JSON 把 `product_id`、`question` 或 `steps_tried` 設成 `null` 才是清空該欄；清空後若還缺欄位，不會拿被刪掉的舊值進入模型，而是再澄清或在兩次用完時 handoff。空字串不是清空，是 `invalid_request`。`reset` 只能帶 `action` 與 `slot_token`，連這三欄的 `null` 也不能帶。`answer` 與 `handoff` 都帶回同一個 slot token。對該 token 再 `continue` 不會再呼叫模型。新題只能 `reset`，或另一次不帶 token 的 `start`。之後的 `continue` 是 `reset_required`，回應不含上一則回答。還在澄清時更換商品會清掉先前的問題與步驟，已用掉的澄清次數保留。已經呼叫過模型之後再換商品，同樣是 `reset_required`。錯誤不重試。`user_statements_unverified` 固定為 true。handoff 的 `summary` 是繁體中文，錯誤 code 是英文。
 
 Host 與 Origin 規則和 `POST /ask` 相同。跨來源的 `POST /assist` 回 `422`，而且不會呼叫模型。這次變更沒有改 `web/`。
 

@@ -293,6 +293,202 @@ def test_expired_token_is_invalid_and_full_capacity_returns_503() -> None:
     assert stale.value.code == "invalid_slot"
 
 
+def test_handoff_token_does_not_answer_again(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def handoff(*_args: object, **_kwargs: object) -> AskResponse:
+        calls.append("called")
+        return AskResponse(
+            request_id="assist-test",
+            status="handoff",
+            answer=None,
+            reason="no_evidence",
+            sources=[],
+            usage=None,
+            usage_code=None,
+            usage_fields=[],
+        )
+
+    monkeypatch.setattr("customer_support_rag.api.answer_ask", handoff)
+    client = _client()
+    first = client.post(
+        "/assist",
+        json={
+            "action": "start",
+            "product_id": "hp-a",
+            "question": "refund",
+            "steps_tried": "none",
+        },
+    )
+    opened = first.json()
+    assert first.status_code == 200
+    assert opened["status"] == "handoff"
+    assert opened["reason"] == "no_evidence"
+    assert isinstance(opened["slot_token"], str)
+    assert len(opened["slot_token"]) == 32
+    again = client.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": opened["slot_token"],
+            "product_id": "hp-a",
+            "question": "refund",
+            "steps_tried": "none",
+        },
+    )
+    kept = again.json()
+    assert again.status_code == 200
+    assert kept["slot_token"] == opened["slot_token"]
+    assert kept["status"] == "handoff"
+    assert kept["reason"] == "reset_required"
+    assert kept["answer"] is None
+    assert calls == ["called"]
+    fresh = client.post(
+        "/assist", json={"action": "reset", "slot_token": opened["slot_token"]}
+    )
+    assert fresh.status_code == 200
+    restarted = client.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": fresh.json()["slot_token"],
+            "product_id": "hp-a",
+            "question": "refund",
+            "steps_tried": "none",
+        },
+    )
+    assert restarted.status_code == 200
+    assert restarted.json()["slot_token"] != opened["slot_token"]
+    assert calls == ["called", "called"]
+
+
+def test_explicit_null_clears_fields_before_the_model(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[object, object]] = []
+
+    async def record(
+        _config: object, product: object, question: object, _request: object
+    ):
+        seen.append((product, question))
+        return AskResponse(
+            request_id="assist-test",
+            status="handoff",
+            answer=None,
+            reason="no_evidence",
+            sources=[],
+            usage=None,
+            usage_code=None,
+            usage_fields=[],
+        )
+
+    monkeypatch.setattr("customer_support_rag.api.answer_ask", record)
+    client = _client()
+    started = client.post(
+        "/assist",
+        json={
+            "action": "start",
+            "question": "previous confirmed question",
+            "steps_tried": "previous steps",
+        },
+    )
+    assert started.status_code == 200
+    assert started.json()["status"] == "clarify"
+    token = started.json()["slot_token"]
+    cleared = client.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": token,
+            "product_id": "hp-a",
+            "question": None,
+            "steps_tried": None,
+        },
+    )
+    body = cleared.json()
+    assert cleared.status_code == 200
+    assert body["status"] == "clarify"
+    assert body["slot_token"] == token
+    assert body["product_id"] == "hp-a"
+    assert body["question"] is None
+    assert body["steps_tried"] is None
+    assert body["missing"] == ["question", "steps_tried"]
+    assert seen == []
+    blank = client.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": token,
+            "question": "   ",
+            "steps_tried": "new steps",
+        },
+    )
+    assert blank.status_code == 422
+    assert blank.json()["code"] == "invalid_request"
+    replaced = client.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": token,
+            "question": "new question",
+            "steps_tried": "new steps",
+        },
+    )
+    assert replaced.status_code == 200
+    assert replaced.json()["status"] == "handoff"
+    assert seen == [("hp-a", "new question")]
+    dirty_reset = client.post(
+        "/assist",
+        json={"action": "reset", "slot_token": token, "question": None},
+    )
+    assert dirty_reset.status_code == 422
+    assert dirty_reset.json()["code"] == "invalid_request"
+
+
+def test_omitted_continue_keeps_the_previous_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[object] = []
+
+    async def record(
+        _config: object, _product: object, question: object, _request: object
+    ):
+        seen.append(question)
+        return AskResponse(
+            request_id="assist-test",
+            status="handoff",
+            answer=None,
+            reason="no_evidence",
+            sources=[],
+            usage=None,
+            usage_code=None,
+            usage_fields=[],
+        )
+
+    monkeypatch.setattr("customer_support_rag.api.answer_ask", record)
+    client = _client()
+    started = client.post(
+        "/assist",
+        json={
+            "action": "start",
+            "question": "previous confirmed question",
+            "steps_tried": "previous steps",
+        },
+    )
+    token = started.json()["slot_token"]
+    follow = client.post(
+        "/assist",
+        json={"action": "continue", "slot_token": token, "product_id": "hp-a"},
+    )
+    assert follow.status_code == 200
+    assert follow.json()["status"] == "handoff"
+    assert follow.json()["question"] == "previous confirmed question"
+    assert follow.json()["steps_tried"] == "previous steps"
+    assert seen == ["previous confirmed question"]
+
+
 def _client() -> TestClient:
     unused = Path("unused-database")
     config = AskConfig(

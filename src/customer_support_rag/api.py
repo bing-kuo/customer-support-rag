@@ -364,24 +364,31 @@ async def _parse_assist(request: Request) -> _AssistInput:
         raise AskFailure(422, "invalid_request") from None
 
 
+_ASSIST_FIELDS = ("product_id", "question", "steps_tried")
+
+
 def _slot_view(request: Request, incoming: _AssistInput) -> AssistView:
     coordinator: SlotCoordinator = request.app.state.slots
-    fields = {
-        "product_id": incoming.product_id,
-        "question": incoming.question,
-        "steps_tried": incoming.steps_tried,
-    }
     if incoming.action == "start":
         if incoming.slot_token is not None:
             raise AssistError("invalid_request")
-        return coordinator.start(**fields)
+        return coordinator.start(
+            product_id=incoming.product_id,
+            question=incoming.question,
+            steps_tried=incoming.steps_tried,
+        )
     if incoming.slot_token is None:
         raise AssistError("invalid_slot")
     if incoming.action == "reset":
-        if any(value is not None for value in fields.values()):
+        if any(name in incoming.model_fields_set for name in _ASSIST_FIELDS):
             raise AssistError("invalid_request")
         return coordinator.reset(incoming.slot_token)
-    return coordinator.continue_slot(incoming.slot_token, **fields)
+    updates = {
+        name: getattr(incoming, name)
+        for name in _ASSIST_FIELDS
+        if name in incoming.model_fields_set
+    }
+    return coordinator.continue_slot(incoming.slot_token, **updates)
 
 
 def _assist_from_view(request_id: str, view: AssistView) -> AssistResponse:

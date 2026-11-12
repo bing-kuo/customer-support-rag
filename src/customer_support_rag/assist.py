@@ -19,6 +19,7 @@ MAX_TOTAL_CHARS = 2000
 TTL_SECONDS = 900
 MAX_SESSIONS = 32
 _PRODUCTS = frozenset({"hp-a", "hp-b"})
+_MISSING = object()
 
 
 class AssistError(Exception):
@@ -120,10 +121,15 @@ class SlotCoordinator:
         self,
         token: str,
         *,
-        product_id: str | None = None,
-        question: str | None = None,
-        steps_tried: str | None = None,
+        product_id: object = _MISSING,
+        question: object = _MISSING,
+        steps_tried: object = _MISSING,
     ) -> AssistView:
+        """Apply one continue step.
+
+        An omitted argument keeps the stored field. ``None`` clears that field
+        and must not leave the previous text for a later model call.
+        """
         with self._lock:
             self._purge()
             slot = self._live(token)
@@ -156,14 +162,20 @@ class SlotCoordinator:
         self,
         slot: _Slot,
         *,
-        product_id: str | None,
-        question: str | None,
-        steps_tried: str | None,
+        product_id: object,
+        question: object,
+        steps_tried: object,
     ) -> AssistView:
-        _validate_field(product_id, product=True)
-        _validate_field(question, product=False)
-        _validate_field(steps_tried, product=False)
-        switched = product_id is not None and slot.product_id not in {None, product_id}
+        if product_id is not _MISSING:
+            _validate_field(_text_or_none(product_id), product=True)
+        if question is not _MISSING:
+            _validate_field(_text_or_none(question), product=False)
+        if steps_tried is not _MISSING:
+            _validate_field(_text_or_none(steps_tried), product=False)
+        switched = isinstance(product_id, str) and slot.product_id not in {
+            None,
+            product_id,
+        }
         if slot.model_used or slot.exhausted:
             if switched:
                 slot.product_id = product_id
@@ -173,20 +185,20 @@ class SlotCoordinator:
             return self._closed_view(slot)
         prospective_question = None if switched else slot.question
         prospective_steps = None if switched else slot.steps_tried
-        if question is not None:
-            prospective_question = question
-        if steps_tried is not None:
-            prospective_steps = steps_tried
+        if question is not _MISSING:
+            prospective_question = _text_or_none(question)
+        if steps_tried is not _MISSING:
+            prospective_steps = _text_or_none(steps_tried)
         _validate_total(prospective_question, prospective_steps)
         if switched:
             slot.question = None
             slot.steps_tried = None
-        if product_id is not None:
-            slot.product_id = product_id
-        if question is not None:
-            slot.question = question
-        if steps_tried is not None:
-            slot.steps_tried = steps_tried
+        if product_id is not _MISSING:
+            slot.product_id = _text_or_none(product_id)
+        if question is not _MISSING:
+            slot.question = _text_or_none(question)
+        if steps_tried is not _MISSING:
+            slot.steps_tried = _text_or_none(steps_tried)
         missing = _missing(slot)
         if not missing:
             slot.model_used = True
@@ -257,6 +269,14 @@ def handoff_summary(
             f"原因：{reason}",
         )
     )
+
+
+def _text_or_none(value: object) -> str | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    raise AssistError("invalid_request")
 
 
 def _missing(slot: _Slot) -> tuple[str, ...]:
