@@ -25,7 +25,7 @@ uv run --locked pytest
 uv run --locked python scripts/rehearse_delivery.py
 ```
 
-腳本會建置／重用候選、檢查無變更 no-op、比對 FAQ 前後及政策 v1/v2、測試候選隔離、只在臨時 workspace 走明確 activate、重新讀取狀態，並驗證失敗切換保留舊 snapshot。它也用 `CUSTOMER_SUPPORT_RAG_RELEASE_ROOT` 接上暫存 API：未 activate 時回 `release_unavailable`；每次 status 確認後，以 mock query embedding、mock generator 和明確標示的假答案驗證 active snapshot serving。腳本會封鎖 Python socket 連線，不讀真 key、不啟 Ollama、不呼叫 Luna、不做 paid request；輸出 usage 為 `null`。腳本建立的 Marcus approval 僅是假夾具，不是人工審查或正式核准。成功不等於 P2、live 問答或知識發布已驗收。
+腳本會建置／重用候選、檢查無變更 no-op、比對 FAQ 前後及政策 v1/v2、測試候選隔離、只在臨時 workspace 走明確 activate、重新讀取狀態，並驗證失敗切換保留舊 snapshot。它也用 `CUSTOMER_SUPPORT_RAG_RELEASE_ROOT` 接上暫存 API：未 activate 時 `/ask` 與填完必要欄位的 `/assist` 都回 `release_unavailable`；每次 status 確認後，以 mock query embedding、mock generator 和明確標示的假答案驗證 active snapshot serving，並確認缺欄位的 assist 不呼叫 adapter。腳本會封鎖 Python socket 連線，不讀真 key、不啟 Ollama、不呼叫 Luna、不做 paid request；輸出 usage 為 `null`。腳本建立的 Marcus approval 僅是假夾具，不是人工審查或正式核准。成功不等於 P2、live 問答或知識發布已驗收。
 
 ## 本機 API 與頁面
 

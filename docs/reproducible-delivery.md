@@ -2,7 +2,7 @@
 
 ## 離線 rehearsal
 
-執行 `uv run --locked python scripts/rehearse_delivery.py`，從 repository root 使用已安裝的工具。腳本只呼叫既有 maintenance CLI，所有 knowledge、workspace、approval fixtures 與 fake `.env` 都位於自動清除的 temporary directory。文件及 release approval 會清楚標成 rehearsal fixture，不代表 reviewer 的真實核准。Serving check 只在此 temporary release root 設定環境，未 activate 前確認 API 回 `release_unavailable`，activate 後用 mock query embedding、mock generator 和標記為假答案的 response 驗證 active release；沒有呼叫 Ollama 或 Luna。
+執行 `uv run --locked python scripts/rehearse_delivery.py`，從 repository root 使用已安裝的工具。腳本只呼叫既有 maintenance CLI，所有 knowledge、workspace、approval fixtures 與 fake `.env` 都位於自動清除的 temporary directory。文件及 release approval 會清楚標成 rehearsal fixture，不代表 reviewer 的真實核准。Serving check 只在此 temporary release root 設定環境，未 activate 前確認 `/ask` 和完整欄位的 `/assist` 都回 `release_unavailable`；缺欄位 assist 先回 clarification，不呼叫 adapter。status 核准各次 active release 後，mock query embedding、mock generator 和標記為假答案的 response 再驗證 `/ask` 與 `/assist`；沒有呼叫 Ollama 或 Luna。
 
 腳本要求乾淨且已提交的 Git worktree，以當前 commit 作 evaluation `code_sha`。它複製合成知識，對 baseline、FAQ、return policy v1/v2 建立 mock 候選並 evaluate；重跑同一 build 必須是零 embedding no-op。generation 報告維持 `unverified`、`model_called=false`、usage 為未知。它只在暫存 workspace 消費假核准並 activate，確認 build 不會改 active pointer、failed pointer compare 保留舊 snapshot、重新讀取狀態可恢復，再用 status 確認過的 pointer hash 完成示範切換。
 

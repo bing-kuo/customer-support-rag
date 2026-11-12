@@ -448,6 +448,34 @@ def _assert_release_serving(
                     "question": "Synthetic serving release-root check",
                 },
             )
+            assist_start = client.post(
+                "/assist",
+                json={
+                    "action": "start",
+                    "question": "Synthetic assist release-root check",
+                },
+            )
+            assist_view = assist_start.json()
+            _require(
+                assist_start.status_code == 200
+                and assist_view.get("status") == "clarify"
+                and assist_view.get("missing") == ["product_id", "steps_tried"],
+                "assist should clarify required fields before retrieval",
+            )
+            _require(
+                query_calls == (0 if expected_release is None else 1)
+                and generation_calls == (0 if expected_release is None else 1),
+                "incomplete assist must not call serving adapters",
+            )
+            assist_answer = client.post(
+                "/assist",
+                json={
+                    "action": "continue",
+                    "slot_token": assist_view["slot_token"],
+                    "product_id": "hp-a",
+                    "steps_tried": "Synthetic troubleshooting step",
+                },
+            )
     if expected_release is None:
         _require(
             response.status_code == 503
@@ -456,6 +484,11 @@ def _assert_release_serving(
         )
         _require(
             query_calls == 0 and generation_calls == 0, "inactive root called adapters"
+        )
+        _require(
+            assist_answer.status_code == 503
+            and assist_answer.json().get("code") == "release_unavailable",
+            "completed assist should report an inactive release",
         )
     else:
         _require(
@@ -468,8 +501,15 @@ def _assert_release_serving(
             "serving did not return evidence from the active snapshot",
         )
         _require(
-            query_calls == 1 and generation_calls == 1,
-            "serving mock call count changed",
+            assist_answer.status_code == 200
+            and assist_answer.json().get("answer")
+            == "OFFLINE REHEARSAL MOCK ANSWER; NOT MODEL OUTPUT"
+            and bool(assist_answer.json().get("sources")),
+            "assist did not continue to active release serving",
+        )
+        _require(
+            query_calls == 2 and generation_calls == 2,
+            "ask/assist mock serving call count changed",
         )
     return {
         "active_release": expected_release,
