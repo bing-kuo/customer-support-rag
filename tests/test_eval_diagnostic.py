@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import shutil
 import socket
 from pathlib import Path
 
@@ -176,10 +177,10 @@ def test_live_path_capture_failure_stops_after_single_mock_exchange(
     recorder = diagnostic(REPO / ".data" / "test-eval-diagnostic-live-failure")
     calls = 0
 
-    def fail_write(_path: Path, _data: bytes) -> None:
+    def fail_write(_root_fd: int, _name: str, _data: bytes) -> None:
         raise OSError("synthetic disk failure")
 
-    monkeypatch.setattr(EvalDiagnostic, "_write_new", staticmethod(fail_write))
+    monkeypatch.setattr(eval_diagnostic_module, "_write_new_at", fail_write)
 
     async def mock_exchange(*_args: object, **_kwargs: object):
         nonlocal calls
@@ -262,6 +263,71 @@ def test_capture_rejects_root_replaced_by_symlink(tmp_path: Path) -> None:
     root.unlink()
 
 
+def test_opt_in_normalizes_dotdot_before_gitignored_boundary_check() -> None:
+    escaped = REPO / ".data" / ".." / ".venv" / "diagnostic-dotdot-fixture"
+    with pytest.raises(
+        DiagnosticCaptureError, match="diagnostic_root_not_gitignored_evidence"
+    ):
+        diagnostic(escaped)
+    assert not escaped.exists()
+
+
+def test_ancestor_replacement_cannot_redirect_capture_or_finish(
+    tmp_path: Path,
+) -> None:
+    capture_parent = REPO / ".data" / "diagnostic-ancestor-capture"
+    capture_root = capture_parent / "capture"
+    capture_pinned = capture_parent.with_name("diagnostic-ancestor-capture-pinned")
+    outside_capture = tmp_path / "outside-capture"
+    outside_capture.mkdir(mode=0o700)
+    if capture_parent.exists():
+        shutil.rmtree(capture_parent)
+    if capture_pinned.exists():
+        shutil.rmtree(capture_pinned)
+    recorder = diagnostic(capture_root)
+    capture_parent.rename(capture_pinned)
+    (outside_capture / "capture").mkdir(mode=0o700)
+    capture_parent.symlink_to(outside_capture, target_is_directory=True)
+    try:
+        with pytest.raises(
+            DiagnosticCaptureError, match="diagnostic_storage_unavailable"
+        ):
+            recorder.capture(b"{}", http_status=200, api_key="synthetic-secret")
+        assert list((outside_capture / "capture").iterdir()) == []
+    finally:
+        recorder.close()
+        capture_parent.unlink()
+        shutil.rmtree(capture_pinned)
+
+    finish_parent = REPO / ".data" / "diagnostic-ancestor-finish"
+    finish_root = finish_parent / "capture"
+    finish_pinned = finish_parent.with_name("diagnostic-ancestor-finish-pinned")
+    outside_finish = tmp_path / "outside-finish"
+    outside_finish.mkdir(mode=0o700)
+    if finish_parent.exists():
+        shutil.rmtree(finish_parent)
+    if finish_pinned.exists():
+        shutil.rmtree(finish_pinned)
+    recorder = diagnostic(finish_root)
+    metadata_path = recorder.capture(b"{}", http_status=200, api_key="synthetic-secret")
+    finish_parent.rename(finish_pinned)
+    (outside_finish / "capture").mkdir(mode=0o700)
+    finish_parent.symlink_to(outside_finish, target_is_directory=True)
+    try:
+        with pytest.raises(
+            DiagnosticCaptureError, match="diagnostic_storage_unavailable"
+        ):
+            recorder.finish(metadata_path, parser_stage="parsed", safe_code="parsed")
+        assert list((outside_finish / "capture").iterdir()) == []
+        pinned_metadata = finish_pinned / "capture" / metadata_path.name
+        metadata = json.loads(pinned_metadata.read_text(encoding="utf-8"))
+        assert metadata["parser_stage"] == "pending"
+    finally:
+        recorder.close()
+        finish_parent.unlink()
+        shutil.rmtree(finish_pinned)
+
+
 @pytest.mark.parametrize(
     "body",
     [
@@ -284,6 +350,152 @@ def test_capture_rejects_json_escape_key_shapes(body: bytes) -> None:
         recorder.capture(body, http_status=200, api_key="synthetic-secret")
     assert list(root.iterdir()) == []
     root.rmdir()
+
+
+@pytest.mark.parametrize(
+    ("body", "expected"),
+    [
+        (b"\xffsynthetic-secret", "diagnostic_secret_in_body"),
+        (b"\xffsafe-body", "diagnostic_body_encoding_invalid"),
+    ],
+)
+def test_non_utf8_capture_fails_closed_without_partial_records(
+    body: bytes, expected: str
+) -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-nonutf8"
+    if root.exists():
+        shutil.rmtree(root)
+    recorder = diagnostic(root)
+    with pytest.raises(DiagnosticCaptureError, match=expected):
+        recorder.capture(body, http_status=200, api_key="synthetic-secret")
+    assert list(root.iterdir()) == []
+    recorder.close()
+    root.rmdir()
+
+
+def test_secret_scan_escape_depth_limit_fails_closed_without_records() -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-escape-depth"
+    if root.exists():
+        shutil.rmtree(root)
+    recorder = diagnostic(root)
+    nested = r"\\u005c" + "u005c" * 10 + r"\u0061"
+    body = json.dumps({"note": nested}).encode("utf-8")
+    with pytest.raises(DiagnosticCaptureError, match="diagnostic_body_uninspectable"):
+        recorder.capture(body, http_status=200, api_key="synthetic-secret")
+    assert list(root.iterdir()) == []
+    recorder.close()
+    root.rmdir()
+
+
+def test_secret_scan_is_bounded_and_accepts_deep_valid_envelope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-deep-envelope"
+    if root.exists():
+        shutil.rmtree(root)
+    recorder = diagnostic(root)
+    request = prepare_answer("synthetic deep envelope", product_id="hp-a", hits=[])
+    envelope = {
+        "id": "resp_fixture",
+        "model": "gpt-6-luna",
+        "status": "completed",
+        "service_tier": "default",
+        "metadata": {"invented_note": "[" * 12000 + "0" + "]" * 12000},
+        "output": [
+            {
+                "type": "message",
+                "role": "assistant",
+                "status": "completed",
+                "content": [
+                    {
+                        "type": "output_text",
+                        "text": json.dumps(
+                            {
+                                "status": "handoff",
+                                "answer": None,
+                                "source_ids": [],
+                                "reason": "no_evidence",
+                            }
+                        ),
+                    }
+                ],
+            }
+        ],
+        "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20},
+    }
+    body = json.dumps(envelope).encode("utf-8")
+    assert len(body) <= MAX_DIAGNOSTIC_BODY
+    calls = 0
+
+    async def exchange(*_args: object, **_kwargs: object):
+        nonlocal calls
+        calls += 1
+        return body, 200, None
+
+    monkeypatch.setattr(luna, "_factory_transport", lambda _transport: True)
+    monkeypatch.setattr(luna, "_exchange", exchange)
+
+    async def run():
+        return await luna._post_live_once(
+            b"{}",
+            request,
+            api_key="synthetic-key",
+            transport=object(),  # type: ignore[arg-type]
+            request_id="synthetic-deep-envelope",
+            deadline=1,
+            diagnostic=recorder,
+        )
+
+    outcome, _usage, stopped = asyncio.run(run())
+    assert calls == 1
+    assert stopped is None
+    assert outcome is not None and outcome.status == "handoff"
+    response_path = next(root.glob("*.response.json"))
+    assert response_path.read_bytes() == body
+    recorder.close()
+    shutil.rmtree(root)
+
+
+def test_deep_response_parser_recursion_maps_to_safe_luna_error_once(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-deep-array"
+    if root.exists():
+        shutil.rmtree(root)
+    recorder = diagnostic(root)
+    body = b"[" * 1500 + b"0" + b"]" * 1500
+    calls = 0
+
+    async def exchange(*_args: object, **_kwargs: object):
+        nonlocal calls
+        calls += 1
+        return body, 200, None
+
+    monkeypatch.setattr(luna, "_factory_transport", lambda _transport: True)
+    monkeypatch.setattr(luna, "_exchange", exchange)
+    request = prepare_answer("synthetic deep array", product_id="hp-a", hits=[])
+
+    async def run():
+        return await luna._post_live_once(
+            b"{}",
+            request,
+            api_key="synthetic-key",
+            transport=object(),  # type: ignore[arg-type]
+            request_id="synthetic-deep-array",
+            deadline=1,
+            diagnostic=recorder,
+        )
+
+    with pytest.raises(LunaError) as caught:
+        asyncio.run(run())
+    assert str(caught.value) in {"invalid_response", "invalid_model_schema"}
+    assert calls == 1
+    metadata_path = next(root.glob("*.meta.json"))
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    assert metadata["safe_code"] in {"invalid_response", "invalid_model_schema"}
+    assert list(root.glob("*.response.json"))[0].read_bytes() == body
+    recorder.close()
+    shutil.rmtree(root)
 
 
 @pytest.mark.parametrize(

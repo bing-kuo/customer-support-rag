@@ -13,10 +13,12 @@ import re
 import stat
 import subprocess
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 MAX_DIAGNOSTIC_BODY = 64 * 1024
+MAX_SECRET_UNESCAPE_LAYERS = 8
+MAX_API_KEY_BYTES = 4096
 _CANDIDATES = frozenset({"baseline", "faq", "policy-v1", "policy-v2"})
 _CASES = frozenset(
     {
@@ -36,7 +38,7 @@ class DiagnosticCaptureError(Exception):
     """A bounded safe capture failed; the response must not be parsed onward."""
 
 
-@dataclass(frozen=True)
+@dataclass
 class EvalDiagnostic:
     root: Path
     candidate: str
@@ -46,6 +48,8 @@ class EvalDiagnostic:
     suite_sha256: str
     rubric_version: str
     rubric_sha256: str
+    _root_fd: int = field(repr=False)
+    _root_identity: tuple[int, int] = field(repr=False)
 
     @classmethod
     def opt_in(
@@ -62,8 +66,8 @@ class EvalDiagnostic:
     ) -> EvalDiagnostic:
         """Explicitly opt in after validating evidence identity and storage."""
         repo = Path(__file__).resolve().parents[2]
-        requested = root.expanduser()
-        evidence_root = repo / ".data"
+        requested = Path(os.path.abspath(root.expanduser()))
+        evidence_root = Path(os.path.abspath(repo / ".data"))
         if not _is_within_without_symlinks(requested, evidence_root):
             raise DiagnosticCaptureError("diagnostic_root_not_gitignored_evidence")
         try:
@@ -89,15 +93,9 @@ class EvalDiagnostic:
         ):
             raise DiagnosticCaptureError("diagnostic_identity_invalid")
         try:
-            _create_private_root(requested, evidence_root)
-            target = requested.absolute()
-            info = target.lstat()
-            if (
-                not stat.S_ISDIR(info.st_mode)
-                or info.st_uid != os.getuid()
-                or stat.S_IMODE(info.st_mode) != 0o700
-            ):
-                raise OSError
+            target = requested
+            root_fd = _create_private_root(target, evidence_root)
+            identity = _directory_identity(root_fd)
         except OSError:
             raise DiagnosticCaptureError("diagnostic_storage_unavailable") from None
         return cls(
@@ -109,7 +107,28 @@ class EvalDiagnostic:
             suite_sha256,
             rubric_version,
             rubric_sha256,
+            root_fd,
+            identity,
         )
+
+    def close(self) -> None:
+        """Release the pinned diagnostic directory descriptor."""
+        root_fd = getattr(self, "_root_fd", -1)
+        if root_fd >= 0:
+            self._root_fd = -1
+            os.close(root_fd)
+
+    def __enter__(self) -> EvalDiagnostic:
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except OSError:
+            pass
 
     def capture(self, body: bytes, *, http_status: int, api_key: str) -> Path:
         """Persist one already bounded body, never headers or credentials."""
@@ -139,14 +158,23 @@ class EvalDiagnostic:
             "headers_saved": False,
             "authorization_saved": False,
         }
+        root_fd = -1
         try:
-            _require_private_root(self.root)
-            self._write_new(raw_path, body)
-            self._write_new(meta_path, json.dumps(meta, sort_keys=True).encode())
+            root_fd = os.dup(self._root_fd)
+            _require_pinned_root(self.root, root_fd, self._root_identity)
+            _write_new_at(root_fd, raw_path.name, body)
+            _write_new_at(
+                root_fd, meta_path.name, json.dumps(meta, sort_keys=True).encode()
+            )
+            _require_pinned_root(self.root, root_fd, self._root_identity)
         except OSError:
-            _unlink_private_record(self.root, raw_path.name)
-            _unlink_private_record(self.root, meta_path.name)
+            if root_fd >= 0:
+                _unlink_private_at(root_fd, raw_path.name)
+                _unlink_private_at(root_fd, meta_path.name)
             raise DiagnosticCaptureError("diagnostic_storage_unavailable") from None
+        finally:
+            if root_fd >= 0:
+                os.close(root_fd)
         return meta_path
 
     def finish(
@@ -182,14 +210,18 @@ class EvalDiagnostic:
         path = metadata_path
         if path.parent != self.root or path.suffixes[-2:] != [".meta", ".json"]:
             raise DiagnosticCaptureError("diagnostic_record_missing")
-        if not path.is_file():
-            raise DiagnosticCaptureError("diagnostic_record_missing")
         root_fd = -1
         try:
-            root_fd = _open_verified_root(self.root)
-            record_fd = os.open(
-                path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=root_fd
-            )
+            root_fd = os.dup(self._root_fd)
+            _require_pinned_root(self.root, root_fd, self._root_identity)
+            try:
+                record_fd = os.open(
+                    path.name,
+                    os.O_RDONLY | os.O_NOFOLLOW,
+                    dir_fd=root_fd,
+                )
+            except FileNotFoundError:
+                raise DiagnosticCaptureError("diagnostic_record_missing") from None
             with os.fdopen(record_fd, "rb") as stream:
                 record = json.loads(stream.read().decode("utf-8"))
             record["parser_stage"] = parser_stage
@@ -200,7 +232,15 @@ class EvalDiagnostic:
             )
             os.replace(tmp.name, path.name, src_dir_fd=root_fd, dst_dir_fd=root_fd)
             os.chmod(path.name, 0o600, dir_fd=root_fd, follow_symlinks=False)
-        except Exception:
+            _require_pinned_root(self.root, root_fd, self._root_identity)
+        except DiagnosticCaptureError:
+            if root_fd >= 0:
+                try:
+                    os.unlink(path.with_suffix(".tmp").name, dir_fd=root_fd)
+                except OSError:
+                    pass
+            raise
+        except (OSError, UnicodeError, ValueError, TypeError, RecursionError):
             if root_fd >= 0:
                 try:
                     os.unlink(path.with_suffix(".tmp").name, dir_fd=root_fd)
@@ -211,19 +251,11 @@ class EvalDiagnostic:
             if root_fd >= 0:
                 os.close(root_fd)
 
-    @staticmethod
-    def _write_new(path: Path, data: bytes) -> None:
-        root_fd = _open_verified_root(path.parent)
-        try:
-            _write_new_at(root_fd, path.name, data)
-        finally:
-            os.close(root_fd)
-
 
 def _write_new_at(root_fd: int, name: str, data: bytes) -> None:
     fd = os.open(
         name,
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
+        os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
         0o600,
         dir_fd=root_fd,
     )
@@ -241,16 +273,24 @@ def _write_new_at(root_fd: int, name: str, data: bytes) -> None:
 
 
 def _open_verified_root(root: Path) -> int:
-    _require_private_root(root)
-    fd = os.open(
-        root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    )
+    """Open each absolute path component with dir_fd and O_NOFOLLOW."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("no no-follow directory opens")
+    root = Path(os.path.abspath(root))
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    fd = os.open(root.anchor, flags)
     try:
+        for component in root.parts[1:]:
+            next_fd = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
         opened = os.fstat(fd)
-        current = root.lstat()
-        if (opened.st_dev, opened.st_ino) != (current.st_dev, current.st_ino):
-            raise OSError("diagnostic root changed")
-        if not stat.S_ISDIR(opened.st_mode) or stat.S_IMODE(opened.st_mode) != 0o700:
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or opened.st_uid != os.getuid()
+            or stat.S_IMODE(opened.st_mode) != 0o700
+        ):
             raise OSError("unsafe diagnostic directory")
         return fd
     except BaseException:
@@ -258,126 +298,130 @@ def _open_verified_root(root: Path) -> int:
         raise
 
 
-def _unlink_private_record(root: Path, name: str) -> None:
+def _directory_identity(fd: int) -> tuple[int, int]:
+    info = os.fstat(fd)
+    return info.st_dev, info.st_ino
+
+
+def _require_pinned_root(root: Path, root_fd: int, identity: tuple[int, int]) -> None:
+    info = os.fstat(root_fd)
+    if (info.st_dev, info.st_ino) != identity:
+        raise OSError("diagnostic directory changed")
+    check_fd = _open_verified_root(root)
     try:
-        root_fd = _open_verified_root(root)
-    except OSError:
-        return
+        if _directory_identity(check_fd) != identity:
+            raise OSError("diagnostic path changed")
+    finally:
+        os.close(check_fd)
+
+
+def _unlink_private_at(root_fd: int, name: str) -> None:
     try:
         os.unlink(name, dir_fd=root_fd)
     except OSError:
         pass
-    finally:
-        os.close(root_fd)
 
 
 def _is_within_without_symlinks(path: Path, parent: Path) -> bool:
     """Check lexical containment and reject every existing symlink component."""
-    path = path.absolute()
-    parent = parent.absolute()
+    path = Path(os.path.abspath(path))
+    parent = Path(os.path.abspath(parent))
     try:
         path.relative_to(parent)
     except ValueError:
         return False
     current = Path(path.anchor)
-    for component in path.parts[1:]:
-        candidate = current / component
-        try:
-            info = candidate.lstat()
-        except FileNotFoundError:
+    try:
+        for component in path.parts[1:]:
+            candidate = current / component
+            try:
+                info = candidate.lstat()
+            except FileNotFoundError:
+                current = candidate
+                continue
+            if stat.S_ISLNK(info.st_mode):
+                return False
             current = candidate
-            continue
-        if stat.S_ISLNK(info.st_mode):
-            return False
-        current = candidate
+    except OSError:
+        return False
     return True
 
 
-def _create_private_root(path: Path, parent: Path) -> None:
-    """Create missing descendants without changing existing directory modes."""
-    relative = path.absolute().relative_to(parent.absolute())
-    current = parent.absolute()
+def _create_private_root(path: Path, parent: Path) -> int:
+    """Open/create private descendants using only descriptor-relative steps."""
+    path = Path(os.path.abspath(path))
+    parent = Path(os.path.abspath(parent))
+    relative = path.relative_to(parent)
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise OSError("no no-follow directory opens")
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow
+    fd = os.open(path.anchor, flags)
+    parent_components = parent.parts[1:]
+    target_components = relative.parts
     try:
-        current.mkdir(mode=0o700)
-    except FileExistsError:
-        info = current.lstat()
-        if (
-            not stat.S_ISDIR(info.st_mode)
-            or stat.S_ISLNK(info.st_mode)
-            or info.st_uid != os.getuid()
-            or stat.S_IMODE(info.st_mode) & 0o022
-        ):
-            raise OSError("unsafe diagnostic directory") from None
-    for component in relative.parts:
-        current = current / component
-        try:
-            current.mkdir(mode=0o700)
-        except FileExistsError:
-            info = current.lstat()
-            if (
-                not stat.S_ISDIR(info.st_mode)
-                or stat.S_ISLNK(info.st_mode)
-                or info.st_uid != os.getuid()
-                or (current == path.absolute() and stat.S_IMODE(info.st_mode) != 0o700)
-                or (current != path.absolute() and stat.S_IMODE(info.st_mode) & 0o022)
-            ):
-                raise OSError("unsafe diagnostic directory") from None
-
-
-def _require_private_root(root: Path) -> None:
-    info = root.lstat()
-    if (
-        stat.S_ISLNK(info.st_mode)
-        or not stat.S_ISDIR(info.st_mode)
-        or info.st_uid != os.getuid()
-        or stat.S_IMODE(info.st_mode) != 0o700
-    ):
-        raise OSError("unsafe diagnostic directory")
+        for index, component in enumerate((*parent_components, *target_components)):
+            is_private = index >= len(parent_components)
+            is_evidence_root = index == len(parent_components) - 1
+            if is_private or is_evidence_root:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=fd)
+                except FileExistsError:
+                    pass
+            next_fd = os.open(component, flags, dir_fd=fd)
+            os.close(fd)
+            fd = next_fd
+            if is_private or is_evidence_root:
+                info = os.fstat(fd)
+                if (
+                    not stat.S_ISDIR(info.st_mode)
+                    or info.st_uid != os.getuid()
+                    or (
+                        index == len(parent_components) + len(target_components) - 1
+                        and stat.S_IMODE(info.st_mode) != 0o700
+                    )
+                    or (
+                        index != len(parent_components) + len(target_components) - 1
+                        and stat.S_IMODE(info.st_mode) & 0o022
+                    )
+                ):
+                    raise OSError("unsafe diagnostic directory")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _contains_secret_shape(body: bytes, api_key: str) -> bool:
-    """Detect literal and JSON-escaped key text, including nested JSON strings."""
+    """Search bounded response bytes without recursively parsing JSON."""
+    try:
+        key_bytes = api_key.encode("ascii")
+    except UnicodeEncodeError:
+        raise DiagnosticCaptureError("diagnostic_body_uninspectable") from None
+    if len(key_bytes) > MAX_API_KEY_BYTES:
+        raise DiagnosticCaptureError("diagnostic_body_uninspectable")
+    if key_bytes in body:
+        return True
     try:
         text = body.decode("utf-8")
     except UnicodeDecodeError:
-        return False
-    pending = [text]
-    seen: set[str] = set()
-    while pending:
-        value = pending.pop()
-        if value in seen:
-            continue
-        seen.add(value)
-        if api_key in value:
-            return True
-        unescaped = re.sub(
-            r"\\u([0-9a-fA-F]{4})",
-            lambda match: chr(int(match.group(1), 16)),
-            value,
+        raise DiagnosticCaptureError("diagnostic_body_encoding_invalid") from None
+    if api_key in text:
+        return True
+    escaped_unicode = re.compile(r"\\+u([0-9a-fA-F]{4})")
+    value = text
+    for _ in range(MAX_SECRET_UNESCAPE_LAYERS):
+        unescaped = escaped_unicode.sub(
+            lambda match: chr(int(match.group(1), 16)), value
         )
-        if unescaped != value:
-            pending.append(unescaped)
-        try:
-            decoded = json.loads(value)
-        except (ValueError, TypeError):
-            continue
-        if isinstance(decoded, str):
-            pending.append(decoded)
-        elif isinstance(decoded, list):
-            pending.extend(_string_values(decoded))
-        elif isinstance(decoded, dict):
-            pending.extend(_string_values(decoded))
+        if unescaped == value:
+            return False
+        if api_key in unescaped:
+            return True
+        value = unescaped
+    if escaped_unicode.search(value):
+        raise DiagnosticCaptureError("diagnostic_body_uninspectable")
     return False
-
-
-def _string_values(value: object) -> list[str]:
-    if isinstance(value, str):
-        return [value]
-    if isinstance(value, dict):
-        return [item for pair in value.items() for item in _string_values(pair)]
-    if isinstance(value, (list, tuple)):
-        return [item for child in value for item in _string_values(child)]
-    return []
 
 
 def replay_parser_body(body: bytes, request: object):

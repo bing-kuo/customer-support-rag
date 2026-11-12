@@ -14,14 +14,22 @@ import subprocess
 import sys
 import tempfile
 from contextlib import redirect_stderr, redirect_stdout
+from dataclasses import replace
 from pathlib import Path
+from unittest.mock import patch
 
+import httpx
 from fastapi.testclient import TestClient
 
+from customer_support_rag import ask
 from customer_support_rag.api import create_app
+from customer_support_rag.knowledge.answering import GroundedDraft
+from customer_support_rag.knowledge.embedding import EMBEDDING_MODEL
+from customer_support_rag.luna_live import LiveCall
 from customer_support_rag.maintenance import cli as maintenance_cli
 from customer_support_rag.maintenance.hashes import describe_document
 from customer_support_rag.maintenance.json_text import human_json
+from customer_support_rag.maintenance.mock_embed import MOCK_EMBED_DIGEST, mock_vector
 from customer_support_rag.maintenance.release import release_hashes
 
 REPO = Path(__file__).resolve().parents[1]
@@ -63,6 +71,11 @@ def main(argv: list[str] | None = None) -> int:
         _require(
             json.loads(initial.stdout)["active"] is None, "fresh workspace is empty"
         )
+        serving = {
+            "before_activation": _assert_release_serving(
+                workspace, key_root, expected_release=None
+            )
+        }
 
         releases = _build_all(workspace, knowledge, approvals)
         _assert_case(workspace, releases["baseline"], "faq-absent-baseline")
@@ -86,6 +99,9 @@ def main(argv: list[str] | None = None) -> int:
             _status(workspace)["active"] == releases["baseline"],
             "baseline should be active before candidate switching",
         )
+        serving["baseline"] = _assert_release_serving(
+            workspace, key_root, expected_release=releases["baseline"]
+        )
 
         _consume_release_approval(workspace, approvals, releases["faq"])
         _activate_from_pointer(workspace, releases["faq"], baseline_pointer)
@@ -96,6 +112,9 @@ def main(argv: list[str] | None = None) -> int:
         _require(
             _restart_status(guard_root, workspace)["active"] == releases["faq"],
             "a fresh CLI process must load the active FAQ snapshot",
+        )
+        serving["faq"] = _assert_release_serving(
+            workspace, key_root, expected_release=releases["faq"]
         )
 
         _consume_release_approval(workspace, approvals, releases["policy-v1"])
@@ -126,6 +145,9 @@ def main(argv: list[str] | None = None) -> int:
             _status(workspace)["active"] == releases["policy-v1"],
             "status-confirmed pointer should allow the recovery switch",
         )
+        serving["policy-v1"] = _assert_release_serving(
+            workspace, key_root, expected_release=releases["policy-v1"]
+        )
         _require(
             (workspace / "releases" / releases["faq"]).is_dir(),
             "previous FAQ snapshot must remain after recovery",
@@ -139,9 +161,16 @@ def main(argv: list[str] | None = None) -> int:
                     "approvals": "fake fixtures only; not real approvals",
                     "releases": releases,
                     "outbound_connections": 0,
-                    "embedding_calls": 0,
+                    "ollama_embedding_calls": 0,
+                    "mock_query_embedding_calls": sum(
+                        item["mock_query_embedding_calls"] for item in serving.values()
+                    ),
                     "luna_calls": 0,
-                    "key": "fake-only; not read by the maintenance CLI",
+                    "mock_generation_calls": sum(
+                        item["mock_generation_calls"] for item in serving.values()
+                    ),
+                    "serving_release_checks": serving,
+                    "key": "fake-only; never read by rehearsal",
                     "usage": None,
                     "active_after_recovery": releases["policy-v1"],
                     "previous_snapshots_retained": True,
@@ -331,6 +360,122 @@ def _assert_local_startup() -> None:
         _require(client.get("/health").status_code == 200, "health endpoint failed")
         _require(client.get("/docs").status_code == 200, "API docs failed")
         _require(client.get("/").status_code == 200, "local page failed")
+
+
+def _assert_release_serving(
+    workspace: Path, key_root: Path, *, expected_release: str | None
+) -> dict[str, object]:
+    names = (
+        "CUSTOMER_SUPPORT_RAG_RELEASE_ROOT",
+        "CUSTOMER_SUPPORT_RAG_KEY_ROOT",
+        "CUSTOMER_SUPPORT_RAG_DATABASE",
+    )
+    previous = {name: os.environ.get(name) for name in names}
+    try:
+        os.environ["CUSTOMER_SUPPORT_RAG_RELEASE_ROOT"] = str(workspace)
+        os.environ["CUSTOMER_SUPPORT_RAG_KEY_ROOT"] = str(key_root)
+        os.environ.pop("CUSTOMER_SUPPORT_RAG_DATABASE", None)
+        config = ask.config_from_environment()
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    _require(config is not None, "release-root environment did not configure serving")
+    _require(config.release_root == workspace, "serving did not select release root")
+    status = _run(
+        "status",
+        "--workspace",
+        str(workspace),
+        expected=1 if expected_release is None else 0,
+    )
+    active = _json(status)["active"]
+    _require(
+        active == expected_release,
+        "maintenance status and expected serving release differ",
+    )
+    query_calls = 0
+    generation_calls = 0
+
+    def embedding_fixture(request: httpx.Request) -> httpx.Response:
+        nonlocal query_calls
+        if request.url.path == "/api/tags":
+            return httpx.Response(
+                200,
+                json={
+                    "models": [{"name": EMBEDDING_MODEL, "digest": MOCK_EMBED_DIGEST}]
+                },
+            )
+        if request.url.path != "/api/embed":
+            return httpx.Response(404)
+        payload = json.loads(request.content.decode("utf-8"))
+        texts = payload["input"]
+        query_calls += len(texts)
+        return httpx.Response(
+            200,
+            json={
+                "model": EMBEDDING_MODEL,
+                "embeddings": [mock_vector(text) for text in texts],
+            },
+        )
+
+    config = replace(config, embedding_transport=httpx.MockTransport(embedding_fixture))
+
+    async def fake_generation(_root: Path, request: object, **_kwargs: object):
+        nonlocal generation_calls
+        generation_calls += 1
+        if not getattr(request, "sources", ()):
+            raise RuntimeError("serving fixture expected an active candidate source")
+        return LiveCall(
+            draft=GroundedDraft(
+                status="answer",
+                answer="OFFLINE REHEARSAL MOCK ANSWER; NOT MODEL OUTPUT",
+                reason=None,
+                sources=(request.sources[0],),
+            ),
+            usage=None,
+            stopped=None,
+            usage_code="offline_rehearsal_mock",
+        )
+
+    with patch.object(ask, "post_prepared_answer", fake_generation):
+        with TestClient(create_app(config), base_url="http://localhost") as client:
+            response = client.post(
+                "/ask",
+                json={
+                    "product_id": "hp-a",
+                    "question": "Synthetic serving release-root check",
+                },
+            )
+    if expected_release is None:
+        _require(
+            response.status_code == 503
+            and response.json().get("code") == "release_unavailable",
+            "serving should report an unconfigured active release before activation",
+        )
+        _require(
+            query_calls == 0 and generation_calls == 0, "inactive root called adapters"
+        )
+    else:
+        _require(
+            response.status_code == 200, "active release did not serve the mock query"
+        )
+        payload = response.json()
+        _require(
+            payload.get("answer") == "OFFLINE REHEARSAL MOCK ANSWER; NOT MODEL OUTPUT"
+            and bool(payload.get("sources")),
+            "serving did not return evidence from the active snapshot",
+        )
+        _require(
+            query_calls == 1 and generation_calls == 1,
+            "serving mock call count changed",
+        )
+    return {
+        "active_release": expected_release,
+        "mock_query_embedding_calls": query_calls,
+        "mock_generation_calls": generation_calls,
+    }
 
 
 def _require_clean_head() -> None:

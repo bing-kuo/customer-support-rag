@@ -4,7 +4,7 @@
 
 ## 目前狀態
 
-截至 P3 Draft，知識維護 CLI、`POST /ask`、`POST /assist` 與本機頁面已在程式中。P2 尚未完成 acceptance：真實生成與完整 holdout 未通過；FAQ absent baseline 的舊錯誤根因未知；FAQ present、policy v1/v2 與 sealed 16 題尚未實跑；既有四個真 embedding 候選仍未核准或啟用。README、離線 rehearsal 與 P3 診斷修補正在同一個 PR 審查，不能據此宣稱產品驗收完成。
+截至 P3 Draft，知識維護 CLI、`POST /ask`、`POST /assist` 與本機頁面已在程式中。P2 尚未完成 acceptance：真實生成語意與完整 holdout 未通過；FAQ absent baseline 的舊錯誤根因未知；FAQ present、policy v1/v2 尚未跑完驗證。sealed 16 題也尚未完成驗收；既有紀錄為 5 pass、1 error、10 未跑，另有 11 題語意未驗，須保留既有錯誤／未送出狀態，不能改寫成全未跑或全通過。既有四個真 embedding 候選仍未核准或啟用。README、離線 rehearsal 與 P3 診斷修補正在同一個 PR 審查，不能據此宣稱產品驗收完成。
 
 P2 原有生成候選仍綁建置 commit `0cb3a9a`。P3 的診斷或固定 prompt 改動不會改標舊證據，也不會重算既有向量。任何後續評測都須用新 sidecar 記錄評測程式版本與實際送出／回應狀態；診斷真呼叫目前停止。
 
@@ -25,7 +25,7 @@ uv run --locked pytest
 uv run --locked python scripts/rehearse_delivery.py
 ```
 
-腳本會建置／重用候選、檢查無變更 no-op、比對 FAQ 前後及政策 v1/v2、測試候選隔離、只在臨時 workspace 走明確 activate、重新讀取狀態，並驗證失敗切換保留舊 snapshot。它會封鎖 Python socket 連線，不讀真 key、不啟 Ollama、不呼叫 Luna、不做 paid request；輸出 usage 為 `null`。腳本建立的 Marcus approval 僅是假夾具，不是人工審查或正式核准。成功不等於 P2、live 問答或知識發布已驗收。
+腳本會建置／重用候選、檢查無變更 no-op、比對 FAQ 前後及政策 v1/v2、測試候選隔離、只在臨時 workspace 走明確 activate、重新讀取狀態，並驗證失敗切換保留舊 snapshot。它也用 `CUSTOMER_SUPPORT_RAG_RELEASE_ROOT` 接上暫存 API：未 activate 時回 `release_unavailable`；每次 status 確認後，以 mock query embedding、mock generator 和明確標示的假答案驗證 active snapshot serving。腳本會封鎖 Python socket 連線，不讀真 key、不啟 Ollama、不呼叫 Luna、不做 paid request；輸出 usage 為 `null`。腳本建立的 Marcus approval 僅是假夾具，不是人工審查或正式核准。成功不等於 P2、live 問答或知識發布已驗收。
 
 ## 本機 API 與頁面
 
@@ -62,6 +62,8 @@ chmod 600 "$KEY_ROOT/.env"
 
 設定 `CUSTOMER_SUPPORT_RAG_KEY_ROOT` 指向這個目錄；程式只讀其中 `.env` 的 `OPENAI_API_KEY`。不要把真 `.env`、資料庫、approval 或私有評測資料加入 Git。key root 與 release/workspace 路徑由操作者在自己的機器設定；README 不提供機器專屬位置。
 
+使用已核准並啟用的 release serving 時，將 `CUSTOMER_SUPPORT_RAG_RELEASE_ROOT` 設為 maintenance workspace 路徑，並將 `CUSTOMER_SUPPORT_RAG_KEY_ROOT` 設為上述 key directory。兩者是啟動程序的環境變數；`.env.example` 只供 key root 使用，不是服務設定檔。release-root 模式由 `active.json` 載入快照，不需要舊 `CUSTOMER_SUPPORT_RAG_DATABASE`。
+
 ### 手動維護命令
 
 維護 CLI 預設使用 mock embedding，不需要 key。`--embed ollama` 會呼叫本機 Ollama；不要在離線 rehearsal 使用它。人工核准檔必須來自實際審查，腳本產生的假 approval 不可拿到此處使用。
@@ -74,6 +76,8 @@ uv run --locked python -m customer_support_rag.maintenance status \
 ```
 
 真實候選須先由授權 reviewer 核准文件 bytes 與 release manifest、資料庫及 regression hashes，再使用 `consume-document`／`consume-release`。只有已消費的真實 release approval 才可手動 `activate`。切換前讀取 `status`，`--expect` 必須是目前 `active.json` bytes 的 SHA-256；首次切換才使用 `--expect-none`。若結果為 `activated_unconfirmed`，先再查 `status`；若 pointer 已指向目標 release，不要以舊 `--expect` 重送。舊 snapshot 保留，除非另有明確授權，不要刪除。這些是真實環境操作說明，rehearsal 不會對真 workspace 執行。
+
+完整的初次 build、same-input no-op/reuse、FAQ 更新、evaluate、release 核准、activate 與 serving 啟動命令見[交付指南](docs/reproducible-delivery.md)。其中 `--embed ollama` 會呼叫本機 embedding model；範例是操作者參考流程，不是 P3 rehearsal，亦非本 PR 執行授權。真實生成與 holdout 仍未完成驗收，沒有呼叫 Luna 或啟用真候選。
 
 ## 故障與恢復
 

@@ -625,6 +625,15 @@ async def _post_live_once(
             body, api_key, _request_header
         )
         outcome = _live_outcome(payload, request)
+    except RecursionError:
+        if diagnostic is not None and record is not None:
+            _finish_diagnostic(
+                diagnostic,
+                record,
+                parser_stage="provider_envelope",
+                safe_code="invalid_response",
+            )
+        raise LunaError("invalid_response") from None
     except LunaError as exc:
         if diagnostic is not None and record is not None:
             stage = (
@@ -693,8 +702,6 @@ def _finish_diagnostic(
         }:
             code = "diagnostic_storage_unavailable"
         raise LunaError(code) from None
-    except Exception:
-        raise LunaError("diagnostic_storage_unavailable") from None
 
 
 def _require_deadline(deadline: float) -> None:
