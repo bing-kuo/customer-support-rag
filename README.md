@@ -158,7 +158,7 @@ GitHub Actions 會使用 `uv.lock` 安裝依賴，在 Python 3.12 與 3.13 執�
 
 `release_id` 是來源身份與 mock embedding 設定的 SHA-256，不含資料庫位元組。artifact key 也不含向量；啟用另外比對 manifest 裡的資料庫檔案 hash。mock digest 是字串 `customer-support-rag-mock-embed-v1` 的 SHA-256，manifest 的 transport 是 `mock`。已發布的 Ollama digest 仍是 `ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d`。這個 CLI 只建 mock 候選。
 
-候選先寫進暫時目錄，再 `os.rename` 成 `releases/<id>/`。失敗會清掉暫時目錄，並留下原本的 `active.json`。啟用會取得 workspace 的 flock，核對已消費的 release 核准、三個檔案 hash、mock regression 與資料庫裡的 key，再 fsync 並 `os.replace` 指標。`--expect` 必須是目前指標檔案的 SHA-256；第一次啟用用 `--expect-none`。預期不符就不會寫。replace 之前當機時，舊指標還在。flock 是這台機器、同一個檔案系統上的建議鎖。rename 已經成功之後，目錄 fsync 的失敗會被略過，以免把完成的候選報成失敗。作業系統若忽略 fsync，這段流程不能證明斷電安全。
+候選先寫進暫時目錄，再在真實的 `releases/` 裡 rename 成 `releases/<id>/`。`control/`、`document-approvals/`、`release-approvals/` 與 `releases/` 的任何一層若是 symlink，寫入會被拒絕，外面的目錄不會多出檔案。失敗會清掉暫時目錄，並留下原本的 `active.json`。啟用會取得 workspace 的 flock，核對已消費的 release 核准、三個檔案 hash，以及這份候選自己的 regression：`release_id`、manifest hash、資料庫 hash、`suite_version`、`rubric_version` 與 `code_sha` 都必須對上這份候選。別的候選的 regression 不能拿來啟用。還會核對資料庫裡的 key。複製既有向量前會核對來源 manifest、資料庫檔案 hash、mock digest 與文件身份，並把每個向量跟該 chunk 的 mock 向量比較；對不上就捨棄該來源、重新 embedding，不會沿用壞向量。`--expect` 必須是目前指標檔案的 SHA-256；第一次啟用用 `--expect-none`。預期不符就不會寫。`os.replace` 之前失敗時，舊指標還在，可以原命令重試。replace 已經成功、但指標目錄 fsync 失敗時，結果是 `activated_unconfirmed`（結束碼 0），並印出指標檔的 SHA-256。這時指標已經指向新 release，不能當成回滾。請先看 `status`；若已經是這份 release，不要再用舊的 `--expect` 重送。帶新的指標 hash 再執行一次 `activate` 會是 `noop`。候選 rename 成功之後的目錄 fsync 失敗仍會被略過。flock 是這台機器、同一個檔案系統上的建議鎖。作業系統若忽略 fsync，這段流程不能證明斷電安全。
 
 ```sh
 uv run --locked python -m customer_support_rag.maintenance hashes \
@@ -173,7 +173,7 @@ uv run --locked python -m customer_support_rag.maintenance hashes \
 
 `POST /assist` 與單次 `POST /ask` 分開。JSON 只有 `action`（`start`、`continue`、`reset`）、可省略的 `slot_token`、`product_id`、`question`、`steps_tried`。其他欄位，包括 role、history、release 與 attempt，都會被拒絕。
 
-伺服器發出 32 個 hex 字元的 slot token，用來尋找這個程序裡的記憶。澄清最多兩次，再來是 `insufficient_information`。每個欄位最多 1000 個 Python 字元，問句與已試步驟合計最多 2000。商品只接受 `hp-a` 或 `hp-b`，不會從問句推斷。HTTP body 上限 16KiB。token 從建立起 900 秒有效，繼續對話不會延長。同時最多 32 個 slot；滿了回 `503` `slot_capacity`。未知或過期 token 回 `422` `invalid_slot`。只有 `reset` 會換成一張新的空 slot，attempt 回到 0，而且不消耗澄清次數。`start` 帶 token，或 `reset` 附帶欄位，都是 `invalid_request`。
+伺服器發出 32 個 hex 字元的 slot token，用來尋找這個程序裡的記憶。澄清最多兩次，再來是 `insufficient_information`。每個欄位最多 1000 個 Python 字元，問句與已試步驟合計最多 2000。商品只接受 `hp-a` 或 `hp-b`，不會從問句推斷。HTTP body 上限 16KiB。token 從建立起 900 秒有效，繼續對話不會延長。同時最多 32 個 slot；滿了回 `503` `slot_capacity`。未知或過期 token 回 `422` `invalid_slot`。只有 `reset` 會換成一張新的空 slot。這次回應仍是 `clarify`，但 attempt 是 1，並且算進最多兩次澄清。空的 `continue` 接著是 `clarify` attempt 2，再來是 `handoff` attempt 2，之後維持 handoff，不會出現第三次 `clarify`。reset 之後第一次 `continue` 若三個欄位都齊，仍會進入模型。`start` 不帶欄位仍是 `clarify` attempt 1、第二次 `clarify` attempt 2，然後 handoff。`start` 帶 token，或 `reset` 附帶欄位，都是 `invalid_request`。
 
 三個欄位都齊了才會進入模型，而且只會一次。之後的 `continue` 是 `reset_required`，回應不含上一則回答。還在澄清時更換商品會清掉先前的問題與步驟，已用掉的澄清次數保留。已經呼叫過模型之後再換商品，同樣是 `reset_required`。錯誤不重試。`user_statements_unverified` 固定為 true。handoff 的 `summary` 是繁體中文，錯誤 code 是英文。
 

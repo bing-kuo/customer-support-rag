@@ -86,6 +86,32 @@ def evaluate_release(
         return destination
 
 
+def regression_matches_candidate(
+    report: dict[str, object],
+    *,
+    release_id: str,
+    manifest_sha256: str,
+    database_sha256: str,
+) -> bool:
+    """Return whether this report belongs to this candidate's files.
+
+    A regression copied from another release still has a file hash, a code SHA,
+    and a suite version. Those three are not enough. The report must name this
+    release and the manifest and database bytes that are on disk now.
+    """
+    code_sha = report.get("code_sha")
+    return (
+        report.get("release_id") == release_id
+        and report.get("manifest_sha256") == manifest_sha256
+        and report.get("database_sha256") == database_sha256
+        and report.get("suite_version") == "dev-suite-v1"
+        and report.get("rubric_version") == "semantic-rubric-v1"
+        and isinstance(code_sha, str)
+        and len(code_sha) == 40
+        and all(character in _CODE_SHA for character in code_sha)
+    )
+
+
 def require_mock_regression(report: dict[str, object]) -> None:
     """Reject an empty run, a failing control case, or a mock generation pass."""
     cases = report.get("cases")

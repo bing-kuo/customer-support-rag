@@ -96,7 +96,11 @@ class SlotCoordinator:
                 raise
 
     def reset(self, token: str) -> AssistView:
-        """Drop the named slot and open an empty one. This is explicit."""
+        """Drop the named slot and open an empty one. This is explicit.
+
+        The response stays ``clarify``, and the new slot already counts as
+        clarification 1. Two empty continuations are then clarify 2 and handoff.
+        """
         with self._lock:
             self._purge()
             slot = self._live(token)
@@ -104,7 +108,7 @@ class SlotCoordinator:
             if len(self._slots) >= MAX_SESSIONS:
                 raise AssistError("slot_capacity")
             fresh = secrets.token_hex(16)
-            opened = _Slot(token=fresh, created=self._now())
+            opened = _Slot(token=fresh, created=self._now(), clarifications=1)
             self._slots[fresh] = opened
             return self._view(
                 opened,

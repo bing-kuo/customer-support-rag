@@ -19,6 +19,7 @@ from customer_support_rag.maintenance.evaluate import evaluate_release
 from customer_support_rag.maintenance.hashes import (
     describe_document,
     scan_current_sources,
+    sha256_file,
 )
 from customer_support_rag.maintenance.json_text import human_json
 from customer_support_rag.maintenance.release import (
@@ -134,10 +135,20 @@ def _consume_release(args: argparse.Namespace) -> int:
     return 0
 
 
+_UNCONFIRMED_RECOVERY = (
+    "read status; if the pointer already names this release, "
+    "do not resend the old expect; a later activate with this pointer hash is noop"
+)
+
+
 def _activate(args: argparse.Namespace) -> int:
     expected = None if args.expect_none else args.expect
     outcome = activate(args.workspace, args.release, expected_previous=expected)
-    _print({"outcome": outcome})
+    payload: dict[str, object] = {"outcome": outcome}
+    if outcome == "activated_unconfirmed":
+        payload["pointer_sha256"] = sha256_file(args.workspace / "active.json")
+        payload["recovery"] = _UNCONFIRMED_RECOVERY
+    _print(payload)
     return 0
 
 

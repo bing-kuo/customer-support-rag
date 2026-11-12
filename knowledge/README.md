@@ -344,6 +344,6 @@ result = await hp_a_once(Path("."))
 
 `scan` 只描述本目錄目前的兩份現行文件。`drafts/hp-a/charging-faq.md` 是充電 FAQ。`drafts/hp-a/return-policy-v1.md` 與 `return-policy-v2.md` 共用 `document_id=hp-a-return-policy`，版本分別是 `1`（購買後 7 日）與 `2`（購買後 14 日）。兩份政策都寫明這是合成條款，退款仍由人工處理。同一個來源集合不能同時列入這兩個版本。`fixtures/injection-note.md` 的 `document_id` 是 `fixture-injection-note`，預設來源不包含它。
 
-維護程式是 `customer_support_rag.maintenance`。核准紀錄要先以檔案存在，reviewer 必須是 `marcus`，而且檔案位元組要與紀錄一致，才會複製進 workspace 的 `control/`。測試夾具只放在暫存目錄。artifact key 涵蓋 metadata、正文 hash 與 embedding 設定，不含向量內容；複製既有 artifact 時可能帶上同一把 key 的向量，所以啟用還要核對資料庫檔案 hash。mock 向量的 digest 是 `customer-support-rag-mock-embed-v1` 的 SHA-256，模型名稱仍是 `qwen3-embedding:0.6b`。這個 digest 與上面已發布的 Ollama digest 不同。
+維護程式是 `customer_support_rag.maintenance`。核准紀錄要先以檔案存在，reviewer 必須是 `marcus`，而且檔案位元組要與紀錄一致，才會複製進 workspace 的 `control/`。測試夾具只放在暫存目錄。artifact key 涵蓋 metadata、正文 hash 與 embedding 設定，不含向量內容。複製既有 artifact 前會再核對來源 manifest、資料庫檔案 hash、mock digest、文件身份，以及每個 chunk 的 mock 向量；任一項不符就重新 embedding。啟用還要核對資料庫檔案 hash，而且 regression 必須屬於這份候選。mock 向量的 digest 是 `customer-support-rag-mock-embed-v1` 的 SHA-256，模型名稱仍是 `qwen3-embedding:0.6b`。這個 digest 與上面已發布的 Ollama digest 不同。
 
-`active.json` 只在 `activate` 且預期中的前一份指標 hash 相符時替換。候選建立失敗不會留下 `.partial-*`。目錄 fsync 在 rename 成功後若失敗，該錯誤會被略過。作業系統若忽略 fsync，這不能證明斷電安全。`/assist` 的欄位、slot 與 release root 見根目錄 README。
+`active.json` 只在 `activate` 且預期中的前一份指標 hash 相符時替換。replace 之前的失敗會留下舊指標。replace 成功但指標目錄 fsync 失敗時，結果是 `activated_unconfirmed`，指標已換成新 release，不能當成尚未切換。候選建立失敗不會留下 `.partial-*`。候選目錄 fsync 在 rename 成功後若失敗，該錯誤會被略過。作業系統若忽略 fsync，這不能證明斷電安全。`/assist` 的欄位、slot 與 release root 見根目錄 README。`reset` 仍回 `clarify`，attempt 從 1 起算，並算進兩次澄清上限。

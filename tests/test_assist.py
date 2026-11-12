@@ -92,9 +92,26 @@ def test_two_clarifications_then_handoff_and_explicit_reset(
     opened = reset.json()
     assert reset.status_code == 200
     assert opened["status"] == "clarify"
-    assert opened["attempt"] == 0
+    assert opened["attempt"] == 1
     assert opened["missing"] == ["product_id", "question", "steps_tried"]
     assert opened["slot_token"] != token
+    empty = client.post(
+        "/assist", json={"action": "continue", "slot_token": opened["slot_token"]}
+    )
+    assert empty.status_code == 200
+    assert empty.json()["status"] == "clarify"
+    assert empty.json()["attempt"] == 2
+    closed = client.post(
+        "/assist", json={"action": "continue", "slot_token": opened["slot_token"]}
+    )
+    assert closed.json()["status"] == "handoff"
+    assert closed.json()["attempt"] == 2
+    assert closed.json()["reason"] == "insufficient_information"
+    stayed = client.post(
+        "/assist", json={"action": "continue", "slot_token": opened["slot_token"]}
+    )
+    assert stayed.json()["status"] == "handoff"
+    assert stayed.json()["attempt"] == 2
     stale = client.post(
         "/assist", json={"action": "continue", "slot_token": token, **body}
     )
@@ -200,6 +217,31 @@ def test_extra_fields_and_cross_origin_do_not_call_the_model(
     assert len(starts) == 1
 
 
+def test_reset_counts_toward_the_clarification_cap() -> None:
+    slots = SlotCoordinator(now=lambda: 0.0)
+    original = slots.start()
+    assert (original.status, original.attempt) == ("clarify", 1)
+    fresh = slots.reset(original.token)
+    assert (fresh.status, fresh.attempt) == ("clarify", 1)
+    second = slots.continue_slot(fresh.token)
+    assert (second.status, second.attempt) == ("clarify", 2)
+    third = slots.continue_slot(fresh.token)
+    assert third.status == "handoff"
+    assert third.attempt == 2
+    assert third.reason == "insufficient_information"
+    fourth = slots.continue_slot(fresh.token)
+    assert (fourth.status, fourth.attempt) == ("handoff", 2)
+    ready = slots.reset(fourth.token)
+    completed = slots.continue_slot(
+        ready.token,
+        product_id="hp-a",
+        question="可以用水洗嗎？",
+        steps_tried="還沒有",
+    )
+    assert completed.status == "ready"
+    assert completed.needs_model is True
+
+
 def test_reset_rejects_fields_and_unknown_tokens_do_not_open_slots(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -244,7 +286,8 @@ def test_expired_token_is_invalid_and_full_capacity_returns_503() -> None:
         fresh.start()
     assert full.value.code == "slot_capacity"
     reset = fresh.reset(tokens[0])
-    assert reset.attempt == 0
+    assert reset.status == "clarify"
+    assert reset.attempt == 1
     with pytest.raises(AssistError) as stale:
         fresh.continue_slot(tokens[0])
     assert stale.value.code == "invalid_slot"

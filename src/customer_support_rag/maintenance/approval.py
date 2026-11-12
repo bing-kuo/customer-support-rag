@@ -7,12 +7,15 @@ workspace and are not demo approvals.
 """
 
 import hashlib
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from customer_support_rag.maintenance.errors import MaintenanceError
 from customer_support_rag.maintenance.hashes import describe_document, sha256_file
 from customer_support_rag.maintenance.json_text import human_json, load_object
-from customer_support_rag.maintenance.paths import require_directory
+from customer_support_rag.maintenance.paths import (
+    ensure_real_directory,
+    require_directory,
+)
 
 DOCUMENT_SCHEMA = "synthetic-document-approval"
 RELEASE_SCHEMA = "synthetic-release-approval"
@@ -177,12 +180,21 @@ def _control_file(workspace: Path, kind: str, name: str) -> Path:
         raise MaintenanceError("approval is invalid")
     if any(character not in "0123456789abcdef" for character in name):
         raise MaintenanceError("approval is invalid")
-    directory = workspace / "control" / kind
-    directory.mkdir(parents=True, exist_ok=True)
+    if kind not in {"document-approvals", "release-approvals"}:
+        raise MaintenanceError("approval is invalid")
+    directory = ensure_real_directory(workspace, PurePosixPath("control") / kind)
     path = directory / f"{name}.json"
     if path.is_symlink():
         raise MaintenanceError("symlink is not allowed")
+    _must_parent_stay(workspace, path)
     return path
+
+
+def _must_parent_stay(workspace: Path, path: Path) -> None:
+    try:
+        path.parent.resolve().relative_to(workspace)
+    except (OSError, ValueError):
+        raise MaintenanceError("path escapes the root") from None
 
 
 def _existing_control(workspace: Path, kind: str, name: str) -> Path:

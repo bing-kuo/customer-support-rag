@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import socket
+import sqlite3
 from pathlib import Path
 
 import httpx
@@ -34,7 +36,11 @@ from customer_support_rag.maintenance.hashes import (
     sha256_file,
 )
 from customer_support_rag.maintenance.json_text import human_json, load_object
-from customer_support_rag.maintenance.mock_embed import MOCK_EMBED_DIGEST, MockEmbedder
+from customer_support_rag.maintenance.mock_embed import (
+    MOCK_EMBED_DIGEST,
+    MockEmbedder,
+    mock_vector,
+)
 from customer_support_rag.maintenance.release import (
     activate,
     build_candidate,
@@ -293,6 +299,164 @@ def test_expected_previous_mismatch_keeps_the_pointer(tmp_path: Path) -> None:
     assert sha256_file(workspace / "active.json") == moved
 
 
+def test_symlinks_write_zero_bytes_outside(tmp_path: Path) -> None:
+    control = _workspace(tmp_path / "symlink-control")
+    outside_control = _workspace(tmp_path / "outside-control")
+    (control / "control").symlink_to(outside_control, target_is_directory=True)
+    source = tmp_path / "doc-approval.json"
+    _write_document_approval(KNOWLEDGE, BASELINE[0], source)
+    with pytest.raises(MaintenanceError, match="symlink"):
+        consume_document_approval(control, KNOWLEDGE, source)
+    assert _regular_file_bytes(outside_control) == 0
+
+    releases = _workspace(tmp_path / "symlink-releases")
+    _approve(releases, BASELINE)
+    outside_releases = _workspace(tmp_path / "outside-releases")
+    (releases / "releases").symlink_to(outside_releases, target_is_directory=True)
+    with pytest.raises(MaintenanceError, match="symlink"):
+        build_candidate(releases, KNOWLEDGE, BASELINE)
+    assert _regular_file_bytes(outside_releases) == 0
+    assert (releases / "releases").is_symlink()
+
+    nested = _workspace(tmp_path / "nested-parent")
+    (nested / "control").mkdir()
+    outside_nested = _workspace(tmp_path / "outside-nested")
+    (nested / "control" / "document-approvals").symlink_to(
+        outside_nested, target_is_directory=True
+    )
+    with pytest.raises(MaintenanceError, match="symlink"):
+        consume_document_approval(nested, KNOWLEDGE, source)
+    assert _regular_file_bytes(outside_nested) == 0
+
+
+def test_transplanted_regression_cannot_authorize_another_candidate(
+    tmp_path: Path,
+) -> None:
+    workspace = _workspace(tmp_path / "transplant")
+    baseline = _activate_sources(tmp_path / "base-review", workspace, BASELINE)
+    before = _pointer_sha(workspace)
+    faq = _build_evaluated(workspace, FAQ)
+    old_report = workspace / "releases" / baseline / "regression.json"
+    new_report = workspace / "releases" / faq / "regression.json"
+    new_report.write_bytes(old_report.read_bytes())
+    with pytest.raises(
+        MaintenanceError, match="regression does not match the candidate"
+    ):
+        _approve_release(tmp_path / "new-review", workspace, faq)
+    assert _pointer_sha(workspace) == before
+    assert load_active(workspace) == baseline
+
+    swapped = _workspace(tmp_path / "swapped")
+    base = _activate_sources(tmp_path / "swap-base", swapped, BASELINE)
+    faq_id = _build_evaluated(swapped, FAQ)
+    _approve_release(tmp_path / "swap-faq", swapped, faq_id)
+    current = _pointer_sha(swapped)
+    (swapped / "releases" / faq_id / "regression.json").write_bytes(
+        (swapped / "releases" / base / "regression.json").read_bytes()
+    )
+    with pytest.raises(
+        MaintenanceError, match="regression does not match the candidate"
+    ):
+        activate(swapped, faq_id, expected_previous=current)
+    assert _pointer_sha(swapped) == current
+    assert load_active(swapped) == base
+
+
+def test_damaged_vectors_are_embedded_again(tmp_path: Path) -> None:
+    workspace = _workspace(tmp_path / "damaged")
+    _approve(workspace, FAQ)
+    baseline = build_candidate(workspace, KNOWLEDGE, BASELINE)
+    selected = _tamper_vectors(workspace / "releases" / baseline.release_id)
+    with pytest.raises(MaintenanceError):
+        candidate_snapshot(workspace, baseline.release_id)
+    built = build_candidate(workspace, KNOWLEDGE, FAQ)
+    assert built.copied == 0
+    assert built.embedded == 3
+    _assert_mock_vectors(workspace, built.release_id)
+    assert not _vector_is_tampered(workspace, built.release_id, selected)
+
+    laundered = _workspace(tmp_path / "laundered")
+    _approve(laundered, FAQ)
+    source = build_candidate(laundered, KNOWLEDGE, BASELINE)
+    _tamper_vectors(laundered / "releases" / source.release_id)
+    directory = laundered / "releases" / source.release_id
+    manifest_path = directory / "manifest.json"
+    manifest = load_object(manifest_path, manifest_path.read_bytes())
+    database_record = manifest["database"]
+    assert isinstance(database_record, dict)
+    database_record["sha256"] = sha256_file(directory / "knowledge.sqlite")
+    manifest_path.write_text(human_json(manifest), encoding="utf-8")
+    candidate_snapshot(laundered, source.release_id)
+    copied = build_candidate(laundered, KNOWLEDGE, FAQ)
+    assert copied.copied == 0
+    assert copied.embedded == 3
+    _assert_mock_vectors(laundered, copied.release_id)
+
+
+def test_pointer_fsync_failure_stays_unconfirmed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    workspace = _workspace(tmp_path)
+    baseline = _activate_sources(tmp_path / "base", workspace, BASELINE)
+    faq = _build_evaluated(workspace, FAQ)
+    _approve_release(tmp_path / "faq", workspace, faq)
+    before = _pointer_sha(workspace)
+
+    def boom(_path: Path) -> None:
+        raise MaintenanceError("injected directory fsync failure")
+
+    monkeypatch.setattr(
+        "customer_support_rag.maintenance.release._fsync_directory", boom
+    )
+    code = main(
+        [
+            "activate",
+            "--workspace",
+            str(workspace),
+            "--release",
+            faq,
+            "--expect",
+            before,
+        ]
+    )
+    assert code == 0
+    printed = json.loads(capsys.readouterr().out)
+    assert printed["outcome"] == "activated_unconfirmed"
+    assert printed["pointer_sha256"] == _pointer_sha(workspace)
+    assert printed["pointer_sha256"] != before
+    assert "noop" in str(printed["recovery"])
+    assert load_active(workspace) == faq
+    assert load_active(workspace) != baseline
+    with pytest.raises(MaintenanceError, match="active pointer does not match"):
+        activate(workspace, faq, expected_previous=before)
+    assert _pointer_sha(workspace) == printed["pointer_sha256"]
+    assert (
+        activate(workspace, faq, expected_previous=printed["pointer_sha256"]) == "noop"
+    )
+
+
+def test_replace_failure_keeps_the_old_pointer(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = _workspace(tmp_path)
+    baseline = _activate_sources(tmp_path / "base", workspace, BASELINE)
+    faq = _build_evaluated(workspace, FAQ)
+    _approve_release(tmp_path / "faq", workspace, faq)
+    before = _pointer_sha(workspace)
+    real_replace = os.replace
+
+    def fail(src: str, dst: str, *args: object, **kwargs: object) -> None:
+        if Path(dst).name == "active.json":
+            raise OSError("injected replace failure")
+        real_replace(src, dst, *args, **kwargs)
+
+    monkeypatch.setattr("customer_support_rag.maintenance.release.os.replace", fail)
+    with pytest.raises(MaintenanceError, match="could not be written"):
+        activate(workspace, faq, expected_previous=before)
+    assert _pointer_sha(workspace) == before
+    assert load_active(workspace) == baseline
+
+
 def test_evaluate_writes_cases_and_refuses_an_empty_run(tmp_path: Path) -> None:
     workspace = _workspace(tmp_path)
     release_id = _build_evaluated(workspace, BASELINE)
@@ -544,6 +708,77 @@ def _pointer_bytes(workspace: Path) -> bytes | None:
     if not path.exists():
         return None
     return path.read_bytes()
+
+
+def _regular_file_bytes(root: Path) -> int:
+    total = 0
+    for path in root.rglob("*"):
+        if path.is_symlink() or not path.is_file():
+            continue
+        total += path.stat().st_size
+    return total
+
+
+def _tamper_vectors(directory: Path) -> str:
+    database = directory / "knowledge.sqlite"
+    connection = sqlite3.connect(database)
+    rows = connection.execute(
+        "select artifact_key, payload_json from embedding_documents"
+    ).fetchall()
+    selected = None
+    for key, raw in rows:
+        payload = json.loads(raw)
+        for chunk in payload["chunks"]:
+            if chunk["vector"] is not None:
+                chunk["vector"] = [1.0] + [0.0] * 1023
+        connection.execute(
+            "update embedding_documents set payload_json=? where artifact_key=?",
+            (
+                json.dumps(
+                    payload,
+                    ensure_ascii=False,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                key,
+            ),
+        )
+        selected = key
+    connection.commit()
+    connection.close()
+    assert isinstance(selected, str)
+    return selected
+
+
+def _assert_mock_vectors(workspace: Path, release_id: str) -> None:
+    directory = workspace / "releases" / release_id
+    manifest = load_object(
+        directory / "manifest.json", (directory / "manifest.json").read_bytes()
+    )
+    documents = manifest["documents"]
+    assert isinstance(documents, list)
+    store = EmbeddingStore.open_readonly(directory / "knowledge.sqlite")
+    try:
+        for item in documents:
+            assert isinstance(item, dict)
+            loaded = store.get_document(str(item["artifact_key"]))
+            assert loaded is not None
+            assert loaded.embedded_chunks
+            for embedded in loaded.embedded_chunks:
+                assert embedded.vector == tuple(mock_vector(embedded.chunk.text))
+    finally:
+        store.close()
+
+
+def _vector_is_tampered(workspace: Path, release_id: str, artifact_key: str) -> bool:
+    database = workspace / "releases" / release_id / "knowledge.sqlite"
+    store = EmbeddingStore.open_readonly(database)
+    try:
+        loaded = store.get_document(artifact_key)
+        assert loaded is not None
+        return loaded.embedded_chunks[0].vector == (1.0,) + (0.0,) * 1023
+    finally:
+        store.close()
 
 
 def _pointer_sha(workspace: Path) -> str:

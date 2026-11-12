@@ -1,13 +1,16 @@
 """Immutable candidate releases and one active pointer.
 
 A candidate is a new directory. Build never writes the active pointer.
-Activation fsyncs the candidate first, then replaces ``active.json`` on the
-same filesystem. A crash before that replace leaves the previous pointer.
+Activation replaces ``active.json`` only after the previous pointer matches.
+A failure before that replace leaves the previous pointer. If the replace
+succeeds and the pointer directory fsync then fails, activation returns
+``activated_unconfirmed``: the pointer already names the new release.
 The writer lock is ``flock`` in this process; it is not a distributed lock.
 
 Same-bytes rebuild returns the existing directory and does not embed again.
-Artifact keys do not cover vectors, so activation also checks the database
-file hash stored in the manifest.
+Artifact keys do not cover vectors. Copying them requires the source manifest,
+database file hash, mock digest, document identity, and a mock vector for
+every chunk. Activation also checks that file hash.
 """
 
 from __future__ import annotations
@@ -20,7 +23,7 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 from customer_support_rag.knowledge.embedding import (
     EMBEDDING_DIMENSIONS,
@@ -31,6 +34,7 @@ from customer_support_rag.knowledge.storage import (
     CHUNKING_PROFILE,
     INPUT_PROFILE,
     EmbeddingStore,
+    StorageError,
     document_embedding_key,
 )
 from customer_support_rag.maintenance.approval import document_approval_for
@@ -45,8 +49,17 @@ from customer_support_rag.maintenance.json_text import (
     human_json,
     load_object,
 )
-from customer_support_rag.maintenance.mock_embed import MOCK_EMBED_DIGEST, MockEmbedder
-from customer_support_rag.maintenance.paths import release_directory, require_directory
+from customer_support_rag.maintenance.mock_embed import (
+    MOCK_EMBED_DIGEST,
+    MockEmbedder,
+    mock_vector,
+)
+from customer_support_rag.maintenance.paths import (
+    ensure_real_directory,
+    release_directory,
+    rename_within,
+    require_directory,
+)
 
 _MAX_CHARS = 1200
 _POINTER_NAME = "active.json"
@@ -98,14 +111,17 @@ def build_candidate(
     with workspace_lock(workspace) as root:
         described = _approved_sources(root, knowledge_root, sources)
         identity, release_id = _identity(described)
-        final = root / "releases" / release_id
+        releases = ensure_real_directory(root, PurePosixPath("releases"))
+        final = releases / release_id
+        if final.is_symlink():
+            raise MaintenanceError("symlink is not allowed")
         if final.exists():
             if _matches_existing(final, release_id, identity):
                 return BuildResult(release_id, True, 0, 0)
             raise MaintenanceError("release already exists")
         selected = MockEmbedder() if embedder is None else embedder
-        partial = root / "releases" / f".partial-{uuid.uuid4().hex}"
-        partial.mkdir(parents=True)
+        partial_name = f".partial-{uuid.uuid4().hex}"
+        partial = ensure_real_directory(root, PurePosixPath("releases") / partial_name)
         try:
             embedded, copied = _write_database(root, partial, described, selected)
             database_sha = sha256_file(partial / "knowledge.sqlite")
@@ -114,17 +130,18 @@ def build_candidate(
                 partial / "manifest.json", human_json(manifest).encode("utf-8")
             )
             _fsync_directory(partial)
-            final.parent.mkdir(parents=True, exist_ok=True)
-            os.rename(partial, final)
+            if releases.is_symlink() or final.is_symlink():
+                raise MaintenanceError("symlink is not allowed")
+            rename_within(releases, partial_name, release_id)
             try:
-                _fsync_directory(final.parent)
+                _fsync_directory(releases)
             except MaintenanceError:
                 pass
         except MaintenanceError:
-            shutil.rmtree(partial, ignore_errors=True)
+            _discard_partial(root, partial)
             raise
         except Exception:  # noqa: BLE001 - remove a partial candidate after any failure
-            shutil.rmtree(partial, ignore_errors=True)
+            _discard_partial(root, partial)
             raise MaintenanceError("candidate could not be written") from None
         return BuildResult(release_id, False, embedded, copied)
 
@@ -146,7 +163,10 @@ def activate(
     """Replace the active pointer, or return ``noop`` when it already matches.
 
     ``expected_previous`` is the SHA-256 of the current pointer bytes. ``None``
-    means the pointer must be absent. A mismatch does not write.
+    means the pointer must be absent. A mismatch does not write. The return is
+    ``activated`` when the pointer and its directory fsync both finish, or
+    ``activated_unconfirmed`` when the pointer is already replaced and only the
+    directory fsync failed. ``noop`` means the pointer already matched.
     """
     with workspace_lock(workspace) as root:
         approval = _activation_approval(root, release_id)
@@ -160,7 +180,13 @@ def activate(
             or approval["database_sha256"] != database_sha
         ):
             raise MaintenanceError("release approval does not match the candidate")
-        _require_regression(directory, approval)
+        _require_regression(
+            directory,
+            approval,
+            release_id=release_id,
+            manifest_sha256=manifest_sha,
+            database_sha256=database_sha,
+        )
         snapshot = _verified_directory(
             root, directory, release_id, manifest_sha, database_sha
         )
@@ -175,8 +201,7 @@ def activate(
         if expected_previous != current:
             raise MaintenanceError("active pointer does not match")
         _open_keys(snapshot)
-        _install_pointer(pointer, snapshot)
-        return "activated"
+        return _install_pointer(pointer, snapshot)
 
 
 def candidate_snapshot(workspace: Path, release_id: str) -> ActiveSnapshot:
@@ -205,13 +230,24 @@ def release_hashes(workspace: Path, release_id: str) -> dict[str, str]:
         report = load_object(regression_path, regression_path.read_bytes())
     except OSError:
         raise MaintenanceError("regression is unavailable") from None
+    manifest_sha256 = sha256_file(manifest_path)
+    database_sha256 = sha256_file(database_path)
+    from customer_support_rag.maintenance.evaluate import regression_matches_candidate
+
+    if not regression_matches_candidate(
+        report,
+        release_id=release_id,
+        manifest_sha256=manifest_sha256,
+        database_sha256=database_sha256,
+    ):
+        raise MaintenanceError("regression does not match the candidate")
     code_sha = report.get("code_sha")
     suite_version = report.get("suite_version")
     if not isinstance(code_sha, str) or not isinstance(suite_version, str):
         raise MaintenanceError("regression is invalid")
     return {
-        "manifest_sha256": sha256_file(manifest_path),
-        "database_sha256": sha256_file(database_path),
+        "manifest_sha256": manifest_sha256,
+        "database_sha256": database_sha256,
         "regression_sha256": sha256_file(regression_path),
         "code_sha": code_sha,
         "suite_version": suite_version,
@@ -330,31 +366,86 @@ def _reusable_embeddings(
     workspace: Path, artifact_key: str, body: str
 ) -> object | None:
     releases = workspace / "releases"
-    if not releases.is_dir():
+    if releases.is_symlink() or not releases.is_dir():
+        return None
+    try:
+        releases.resolve().relative_to(workspace)
+    except (OSError, ValueError):
         return None
     for child in sorted(releases.iterdir()):
-        if not child.is_dir() or child.is_symlink() or child.name.startswith("."):
+        if child.is_symlink() or not child.is_dir() or child.name.startswith("."):
             continue
-        database = child / "knowledge.sqlite"
-        manifest = child / "manifest.json"
-        if (
-            database.is_symlink()
-            or manifest.is_symlink()
-            or not database.is_file()
-            or not manifest.is_file()
-        ):
-            continue
-        store = EmbeddingStore.open_readonly(database)
-        try:
-            loaded = store.get_document(artifact_key)
-        finally:
-            store.close()
-        if loaded is None or loaded.document.body != body:
-            continue
-        if loaded.model_digest != MOCK_EMBED_DIGEST:
-            continue
-        return loaded.embedded_chunks
+        reusable = _embeddings_from_release(child, artifact_key, body)
+        if reusable is not None:
+            return reusable
     return None
+
+
+def _embeddings_from_release(
+    directory: Path, artifact_key: str, body: str
+) -> object | None:
+    database = directory / "knowledge.sqlite"
+    manifest_path = directory / "manifest.json"
+    if (
+        database.is_symlink()
+        or manifest_path.is_symlink()
+        or not database.is_file()
+        or not manifest_path.is_file()
+    ):
+        return None
+    try:
+        manifest = load_object(manifest_path, manifest_path.read_bytes())
+    except (OSError, MaintenanceError):
+        return None
+    embedding = manifest.get("embedding")
+    database_record = manifest.get("database")
+    documents = manifest.get("documents")
+    if (
+        manifest.get("transport") != "mock"
+        or not isinstance(embedding, dict)
+        or embedding.get("model_digest") != MOCK_EMBED_DIGEST
+        or not isinstance(database_record, dict)
+        or database_record.get("sha256") != sha256_file(database)
+        or not isinstance(documents, list)
+    ):
+        return None
+    identity = next(
+        (
+            item
+            for item in documents
+            if isinstance(item, dict) and item.get("artifact_key") == artifact_key
+        ),
+        None,
+    )
+    if not isinstance(identity, dict):
+        return None
+    if identity.get("body_sha256") != hashlib.sha256(body.encode("utf-8")).hexdigest():
+        return None
+    try:
+        store = EmbeddingStore.open_readonly(database)
+    except (OSError, StorageError):
+        return None
+    try:
+        loaded = store.get_document(artifact_key)
+    except (OSError, StorageError):
+        return None
+    finally:
+        store.close()
+    if loaded is None or loaded.document.body != body:
+        return None
+    if loaded.model_digest != MOCK_EMBED_DIGEST or not loaded.embedded_chunks:
+        return None
+    metadata = loaded.document.metadata
+    if (
+        identity.get("document_id") != metadata.document_id
+        or identity.get("product_id") != metadata.product_id
+        or identity.get("version") != metadata.version
+    ):
+        return None
+    for item in loaded.embedded_chunks:
+        if item.vector != tuple(mock_vector(item.chunk.text)):
+            return None
+    return loaded.embedded_chunks
 
 
 def _manifest(
@@ -566,14 +657,31 @@ def _pointer_bytes(release_id: str, manifest_sha: str, database_sha: str) -> byt
     return human_json(payload).encode("utf-8")
 
 
-def _require_regression(directory: Path, approval: dict[str, object]) -> None:
-    from customer_support_rag.maintenance.evaluate import require_mock_regression
+def _require_regression(
+    directory: Path,
+    approval: dict[str, object],
+    *,
+    release_id: str,
+    manifest_sha256: str,
+    database_sha256: str,
+) -> None:
+    from customer_support_rag.maintenance.evaluate import (
+        regression_matches_candidate,
+        require_mock_regression,
+    )
 
     path = _regular_file(directory / "regression.json")
     try:
         report = load_object(path, path.read_bytes())
     except OSError:
         raise MaintenanceError("regression is unavailable") from None
+    if not regression_matches_candidate(
+        report,
+        release_id=release_id,
+        manifest_sha256=manifest_sha256,
+        database_sha256=database_sha256,
+    ):
+        raise MaintenanceError("regression does not match the candidate")
     if sha256_file(path) != approval.get("regression_sha256"):
         raise MaintenanceError("release approval does not match the candidate")
     if report.get("code_sha") != approval.get("code_sha"):
@@ -581,14 +689,30 @@ def _require_regression(directory: Path, approval: dict[str, object]) -> None:
     require_mock_regression(report)
 
 
-def _install_pointer(pointer: Path, snapshot: ActiveSnapshot) -> None:
+def _install_pointer(pointer: Path, snapshot: ActiveSnapshot) -> str:
     if pointer.is_symlink():
         raise MaintenanceError("symlink is not allowed")
     payload = _pointer_bytes(
         snapshot.release_id, snapshot.manifest_sha256, snapshot.database_sha256
     )
     _durable_bytes(pointer, payload)
-    _fsync_directory(pointer.parent)
+    try:
+        _fsync_directory(pointer.parent)
+    except MaintenanceError:
+        return "activated_unconfirmed"
+    return "activated"
+
+
+def _discard_partial(root: Path, partial: Path) -> None:
+    if partial.is_symlink() or not partial.exists() or not partial.is_dir():
+        return
+    if not partial.name.startswith(".partial-"):
+        return
+    try:
+        partial.resolve().relative_to(root)
+    except (OSError, ValueError):
+        return
+    shutil.rmtree(partial)
 
 
 def _regular_file(path: Path) -> Path:
