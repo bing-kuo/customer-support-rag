@@ -364,6 +364,62 @@ def test_handoff_token_does_not_answer_again(
     assert calls == ["called", "called"]
 
 
+def test_first_handoff_stays_closed_after_a_second_start(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls: list[str] = []
+
+    async def handoff(*_args: object, **_kwargs: object) -> AskResponse:
+        calls.append("called")
+        return AskResponse(
+            request_id="assist-test",
+            status="handoff",
+            answer=None,
+            reason="no_evidence",
+            sources=[],
+            usage=None,
+            usage_code=None,
+            usage_fields=[],
+        )
+
+    monkeypatch.setattr("customer_support_rag.api.answer_ask", handoff)
+    client = _client()
+    start = {
+        "action": "start",
+        "product_id": "hp-a",
+        "question": "refund",
+        "steps_tried": "none",
+    }
+    first = client.post("/assist", json=start)
+    opened = first.json()
+    assert first.status_code == 200
+    assert opened["status"] == "handoff"
+    assert opened["reason"] == "no_evidence"
+    second = client.post("/assist", json=start)
+    reopened = second.json()
+    assert second.status_code == 200
+    assert reopened["status"] == "handoff"
+    assert reopened["slot_token"] != opened["slot_token"]
+    assert calls == ["called", "called"]
+    kept = client.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": opened["slot_token"],
+            "product_id": "hp-a",
+            "question": "refund",
+            "steps_tried": "none",
+        },
+    )
+    closed = kept.json()
+    assert kept.status_code == 200
+    assert closed["slot_token"] == opened["slot_token"]
+    assert closed["status"] == "handoff"
+    assert closed["reason"] == "reset_required"
+    assert closed["answer"] is None
+    assert calls == ["called", "called"]
+
+
 def test_explicit_null_clears_fields_before_the_model(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
