@@ -442,10 +442,26 @@ def _contains_secret_shape(body: bytes, api_key: str) -> bool:
         for decoded in tokens:
             if api_key in decoded:
                 return True
-            if _complete_json_string_tokens(decoded) is not None:
+            nested_tokens = _complete_json_string_tokens(decoded)
+            if nested_tokens is not None:
                 if layer >= MAX_SECRET_UNESCAPE_LAYERS:
                     raise DiagnosticCaptureError("diagnostic_body_uninspectable")
                 pending.append((decoded, layer + 1, True))
+                continue
+            # Invalid or prose text is not reinterpreted as a JSON document,
+            # but individually complete JSON string tokens still get decoded
+            # so a key cannot hide behind a non-JSON prefix such as NBSP.
+            fragments = _json_string_tokens(decoded)
+            if fragments is not None:
+                for fragment in fragments:
+                    if api_key in fragment:
+                        return True
+                    if _complete_json_string_tokens(fragment) is not None:
+                        if layer >= MAX_SECRET_UNESCAPE_LAYERS:
+                            raise DiagnosticCaptureError(
+                                "diagnostic_body_uninspectable"
+                            )
+                        pending.append((fragment, layer + 1, True))
     return False
 
 
@@ -487,15 +503,64 @@ def _complete_json_string_tokens(text: str) -> list[str] | None:
     JSON exceeds the library parser's stack, scan its bounded string tokens
     without recursively parsing the document.
     """
+    start = 0
+    while start < len(text) and text[start] in " \t\r\n":
+        start += 1
     try:
-        _value, end = json.JSONDecoder().raw_decode(text)
+        decoder = json.JSONDecoder(parse_int=str, parse_float=str)
+        _value, end = decoder.raw_decode(text, start)
     except json.JSONDecodeError:
         return None
     except RecursionError:
-        return _json_string_tokens(text)
-    if text[end:].strip():
+        return _deep_json_string_tokens(text, start)
+    if any(character not in " \t\r\n" for character in text[end:]):
         return None
-    return _json_string_tokens(text)
+    return _json_string_tokens(text[start:end])
+
+
+def _deep_json_string_tokens(text: str, start: int) -> list[str] | None:
+    """Bound deeply nested JSON string scanning and honor its exact end."""
+    if start >= len(text) or text[start] not in "[{":
+        return None
+    expected: list[str] = []
+    strings: list[str] = []
+    index = start
+    while index < len(text):
+        character = text[index]
+        if character == '"':
+            token_start = index
+            index += 1
+            while index < len(text):
+                if text[index] == "\\":
+                    index += 2
+                elif text[index] == '"':
+                    index += 1
+                    break
+                else:
+                    index += 1
+            else:
+                return None
+            try:
+                value = json.loads(text[token_start:index])
+            except (json.JSONDecodeError, RecursionError):
+                return None
+            if not isinstance(value, str):
+                return None
+            strings.append(value)
+            continue
+        if character == "[":
+            expected.append("]")
+        elif character == "{":
+            expected.append("}")
+        elif character in "]}":
+            if not expected or expected.pop() != character:
+                return None
+            if not expected:
+                if any(char not in " \t\r\n" for char in text[index + 1 :]):
+                    return None
+                return strings
+        index += 1
+    return None
 
 
 def replay_parser_body(body: bytes, request: object):

@@ -399,6 +399,100 @@ def test_capture_rejects_key_wrapped_inside_json_string() -> None:
 
 
 @pytest.mark.parametrize(
+    ("leading", "trailing"),
+    [
+        (leading, trailing)
+        for leading in ("", " ", "\t", "\n", "\r", " \r\n\t")
+        for trailing in ("", " ", "\t", "\n", "\r", " \r\n\t")
+    ],
+)
+def test_nested_key_scan_accepts_only_complete_json_whitespace(
+    leading: str, trailing: str
+) -> None:
+    key = "synthetic/secret"
+    encoded_inner = json.dumps({"token": key}).replace("/", r"\/")
+    nested = leading + encoded_inner + trailing
+    assert key in eval_diagnostic_module._complete_json_string_tokens(nested)
+    body = json.dumps({"wrapped": nested}).encode("utf-8")
+    assert eval_diagnostic_module._contains_secret_shape(body, key)
+
+
+@pytest.mark.parametrize(
+    ("leading", "trailing"),
+    [("\u00a0", ""), ("", "\u00a0"), ("\u2003", ""), ("", "\u2003")],
+)
+def test_non_json_whitespace_does_not_hide_nested_key(
+    leading: str, trailing: str
+) -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-non-json-whitespace"
+    if root.exists():
+        shutil.rmtree(root)
+    key = "synthetic/secret"
+    nested = leading + json.dumps({"token": key}).replace("/", r"\/") + trailing
+    assert eval_diagnostic_module._complete_json_string_tokens(nested) is None
+    recorder = diagnostic(root)
+    with pytest.raises(DiagnosticCaptureError, match="diagnostic_secret_in_body"):
+        recorder.capture(
+            json.dumps({"wrapped": nested}).encode("utf-8"),
+            http_status=200,
+            api_key=key,
+        )
+    assert list(root.iterdir()) == []
+    recorder.close()
+    root.rmdir()
+
+
+def test_non_json_trailing_text_does_not_hide_nested_key() -> None:
+    key = "synthetic/secret"
+    nested = json.dumps({"token": key}).replace("/", r"\/") + " trailing text"
+    assert eval_diagnostic_module._complete_json_string_tokens(nested) is None
+    assert eval_diagnostic_module._contains_secret_shape(
+        json.dumps({"wrapped": nested}).encode(), key
+    )
+
+
+def test_deep_nested_document_honors_trailing_boundary_and_scans_keys() -> None:
+    key = "synthetic/secret"
+    nested = (
+        " \t\r\n"
+        + "[" * 1500
+        + json.dumps({"token": key}).replace("/", r"\/")
+        + "]" * 1500
+        + "\r\n\t "
+    )
+    assert key in eval_diagnostic_module._complete_json_string_tokens(nested)
+    assert eval_diagnostic_module._contains_secret_shape(
+        json.dumps({"wrapped": nested}).encode(), key
+    )
+    assert eval_diagnostic_module._complete_json_string_tokens(nested + " junk") is None
+
+
+@pytest.mark.parametrize(
+    "number",
+    ["0", "-12", "9" * 5000, "-" + "8" * 5000, "1.25", "-3.5e+12", "1e10000"],
+)
+def test_nested_json_numeric_metadata_is_scanned_without_integer_conversion(
+    number: str,
+) -> None:
+    key = "synthetic/secret"
+    nested = " \r\n" + '{"number":' + number + ',"token":"synthetic\\/secret"}\t '
+    assert key in eval_diagnostic_module._complete_json_string_tokens(nested)
+    assert eval_diagnostic_module._contains_secret_shape(
+        json.dumps({"wrapped": nested}).encode(), key
+    )
+
+
+def test_nested_big_integer_metadata_without_secrets_remains_inspectable() -> None:
+    nested = '{"metadata_number":' + "7" * 5000 + "}"
+    assert eval_diagnostic_module._complete_json_string_tokens(nested) == [
+        "metadata_number"
+    ]
+    assert not eval_diagnostic_module._contains_secret_shape(
+        json.dumps({"wrapped": nested}).encode(), "synthetic-absent-key"
+    )
+
+
+@pytest.mark.parametrize(
     ("body", "expected"),
     [
         (b"\xffsynthetic-secret", "diagnostic_secret_in_body"),
