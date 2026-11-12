@@ -545,6 +545,235 @@ def test_omitted_continue_keeps_the_previous_question(
     assert seen == ["previous confirmed question"]
 
 
+def test_null_product_does_not_carry_the_old_question(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[object, object]] = []
+
+    async def record(
+        _config: object, product: object, question: object, _request: object
+    ):
+        seen.append((product, question))
+        return AskResponse(
+            request_id="assist-test",
+            status="handoff",
+            answer=None,
+            reason="no_evidence",
+            sources=[],
+            usage=None,
+            usage_code=None,
+            usage_fields=[],
+        )
+
+    monkeypatch.setattr("customer_support_rag.api.answer_ask", record)
+    client = _client()
+    started = client.post(
+        "/assist",
+        json={
+            "action": "start",
+            "product_id": "hp-a",
+            "question": "old hp-a question",
+        },
+    )
+    assert started.status_code == 200
+    assert started.json()["status"] == "clarify"
+    token = started.json()["slot_token"]
+    cleared = client.post(
+        "/assist",
+        json={"action": "continue", "slot_token": token, "product_id": None},
+    )
+    assert cleared.status_code == 200
+    assert cleared.json()["status"] == "clarify"
+    assert cleared.json()["product_id"] is None
+    assert cleared.json()["question"] is None
+    assert cleared.json()["steps_tried"] is None
+    switched = client.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": token,
+            "product_id": "hp-b",
+            "steps_tried": "none",
+        },
+    )
+    assert switched.status_code == 200
+    assert switched.json()["status"] == "handoff"
+    assert switched.json()["reason"] == "insufficient_information"
+    assert switched.json()["question"] is None
+    assert switched.json()["product_id"] == "hp-b"
+    assert seen == []
+
+    same = _client()
+    opened = same.post(
+        "/assist",
+        json={
+            "action": "start",
+            "product_id": "hp-a",
+            "question": "old hp-a question",
+        },
+    ).json()
+    same.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": opened["slot_token"],
+            "product_id": None,
+        },
+    )
+    returned = same.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": opened["slot_token"],
+            "product_id": "hp-a",
+            "steps_tried": "none",
+        },
+    )
+    assert returned.status_code == 200
+    assert returned.json()["question"] is None
+    assert returned.json()["status"] == "handoff"
+    assert seen == []
+
+    direct = _client()
+    first = direct.post(
+        "/assist",
+        json={
+            "action": "start",
+            "product_id": "hp-a",
+            "question": "old hp-a question",
+        },
+    ).json()
+    changed = direct.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": first["slot_token"],
+            "product_id": "hp-b",
+        },
+    )
+    assert changed.status_code == 200
+    assert changed.json()["question"] is None
+    assert changed.json()["steps_tried"] is None
+    assert changed.json()["status"] == "clarify"
+    assert seen == []
+
+    unbound = _client()
+    asked = unbound.post(
+        "/assist",
+        json={
+            "action": "start",
+            "question": "retained question",
+            "steps_tried": "retained steps",
+        },
+    ).json()
+    kept = unbound.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": asked["slot_token"],
+            "product_id": None,
+        },
+    )
+    assert kept.status_code == 200
+    assert kept.json()["question"] == "retained question"
+    assert kept.json()["steps_tried"] == "retained steps"
+    bound = unbound.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": asked["slot_token"],
+            "product_id": "hp-a",
+        },
+    )
+    assert bound.status_code == 200
+    assert bound.json()["status"] == "handoff"
+    assert seen == [("hp-a", "retained question")]
+
+    seen.clear()
+    replaced = _client()
+    prior = replaced.post(
+        "/assist",
+        json={
+            "action": "start",
+            "product_id": "hp-a",
+            "question": "old hp-a question",
+        },
+    ).json()
+    fresh = replaced.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": prior["slot_token"],
+            "product_id": None,
+            "question": "new question",
+            "steps_tried": "new steps",
+        },
+    )
+    assert fresh.status_code == 200
+    assert fresh.json()["question"] == "new question"
+    assert fresh.json()["product_id"] is None
+    moved = replaced.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": prior["slot_token"],
+            "product_id": "hp-b",
+        },
+    )
+    assert moved.status_code == 200
+    assert seen == [("hp-b", "new question")]
+
+    seen.clear()
+    repeated = _client()
+    again = repeated.post(
+        "/assist",
+        json={
+            "action": "start",
+            "product_id": "hp-a",
+            "question": "old hp-a question",
+        },
+    ).json()
+    held = repeated.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": again["slot_token"],
+            "product_id": "hp-a",
+            "steps_tried": "none",
+        },
+    )
+    assert held.status_code == 200
+    assert held.json()["question"] == "old hp-a question"
+    assert seen == [("hp-a", "old hp-a question")]
+
+    seen.clear()
+    finished = _client()
+    done = finished.post(
+        "/assist",
+        json={
+            "action": "start",
+            "product_id": "hp-a",
+            "question": "old hp-a question",
+            "steps_tried": "none",
+        },
+    )
+    assert done.json()["status"] == "handoff"
+    closed = finished.post(
+        "/assist",
+        json={
+            "action": "continue",
+            "slot_token": done.json()["slot_token"],
+            "product_id": None,
+        },
+    )
+    assert closed.status_code == 200
+    assert closed.json()["status"] == "handoff"
+    assert closed.json()["reason"] == "reset_required"
+    assert closed.json()["product_id"] == "hp-a"
+    assert closed.json()["question"] == "old hp-a question"
+    assert seen == [("hp-a", "old hp-a question")]
+
+
 def _client() -> TestClient:
     unused = Path("unused-database")
     config = AskConfig(

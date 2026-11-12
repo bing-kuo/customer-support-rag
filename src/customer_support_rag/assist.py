@@ -128,7 +128,8 @@ class SlotCoordinator:
         """Apply one continue step.
 
         An omitted argument keeps the stored field. ``None`` clears that field
-        and must not leave the previous text for a later model call.
+        and must not leave the previous text for a later model call. Clearing a
+        product that was already selected also clears its question and steps.
         """
         with self._lock:
             self._purge()
@@ -176,6 +177,8 @@ class SlotCoordinator:
             None,
             product_id,
         }
+        cleared_product = product_id is None and slot.product_id is not None
+        drop_dependents = switched or cleared_product
         if slot.model_used or slot.exhausted:
             if switched:
                 slot.product_id = product_id
@@ -183,14 +186,14 @@ class SlotCoordinator:
                 slot.steps_tried = None
                 slot.terminal_reason = "reset_required"
             return self._closed_view(slot)
-        prospective_question = None if switched else slot.question
-        prospective_steps = None if switched else slot.steps_tried
+        prospective_question = None if drop_dependents else slot.question
+        prospective_steps = None if drop_dependents else slot.steps_tried
         if question is not _MISSING:
             prospective_question = _text_or_none(question)
         if steps_tried is not _MISSING:
             prospective_steps = _text_or_none(steps_tried)
         _validate_total(prospective_question, prospective_steps)
-        if switched:
+        if drop_dependents:
             slot.question = None
             slot.steps_tried = None
         if product_id is not _MISSING:
