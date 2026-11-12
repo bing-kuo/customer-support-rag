@@ -398,7 +398,8 @@ def _contains_secret_shape(body: bytes, api_key: str) -> bool:
     This is a string-token scan rather than a recursive JSON parse so valid
     provider metadata can be arbitrarily deep without exhausting Python's
     parser stack. Decoded string values are rescanned a bounded number of
-    times to cover JSON text wrapped inside JSON strings.
+    times to cover complete JSON documents wrapped inside JSON strings, while
+    treating ordinary decoded metadata prose as data.
     """
     try:
         key_bytes = api_key.encode("ascii")
@@ -412,14 +413,14 @@ def _contains_secret_shape(body: bytes, api_key: str) -> bool:
         text = body.decode("utf-8")
     except UnicodeDecodeError:
         raise DiagnosticCaptureError("diagnostic_body_encoding_invalid") from None
-    pending = [(text, 0)]
-    inspected: set[str] = set()
+    pending = [(text, 0, False)]
+    inspected: set[tuple[str, bool]] = set()
     escaped_unicode = re.compile(r"\\+u([0-9a-fA-F]{4})")
     while pending:
-        value, layer = pending.pop()
-        if value in inspected:
+        value, layer, is_json_document = pending.pop()
+        if (value, is_json_document) in inspected:
             continue
-        inspected.add(value)
+        inspected.add((value, is_json_document))
         if api_key in value:
             return True
         unescaped = value
@@ -431,16 +432,20 @@ def _contains_secret_shape(body: bytes, api_key: str) -> bool:
                 return True
         if escaped_unicode.search(unescaped):
             raise DiagnosticCaptureError("diagnostic_body_uninspectable")
-        tokens = _json_string_tokens(value)
+        tokens = (
+            _complete_json_string_tokens(value)
+            if is_json_document
+            else _json_string_tokens(value)
+        )
         if tokens is None:
             raise DiagnosticCaptureError("diagnostic_body_uninspectable")
         for decoded in tokens:
             if api_key in decoded:
                 return True
-            if '"' in decoded:
+            if _complete_json_string_tokens(decoded) is not None:
                 if layer >= MAX_SECRET_UNESCAPE_LAYERS:
                     raise DiagnosticCaptureError("diagnostic_body_uninspectable")
-                pending.append((decoded, layer + 1))
+                pending.append((decoded, layer + 1, True))
     return False
 
 
@@ -473,6 +478,24 @@ def _json_string_tokens(text: str) -> list[str] | None:
         else:
             return None
     return values
+
+
+def _complete_json_string_tokens(text: str) -> list[str] | None:
+    """Return string values only when text is one complete JSON document.
+
+    Ordinary decoded prose containing quote marks is ignored. If deeply nested
+    JSON exceeds the library parser's stack, scan its bounded string tokens
+    without recursively parsing the document.
+    """
+    try:
+        _value, end = json.JSONDecoder().raw_decode(text)
+    except json.JSONDecodeError:
+        return None
+    except RecursionError:
+        return _json_string_tokens(text)
+    if text[end:].strip():
+        return None
+    return _json_string_tokens(text)
 
 
 def replay_parser_body(body: bytes, request: object):

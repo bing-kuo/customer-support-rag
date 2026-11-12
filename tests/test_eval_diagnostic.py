@@ -433,8 +433,19 @@ def test_secret_scan_escape_depth_limit_fails_closed_without_records() -> None:
     root.rmdir()
 
 
-def test_secret_scan_is_bounded_and_accepts_deep_valid_envelope(
-    monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize(
+    "metadata_note",
+    [
+        pytest.param("[" * 12000 + "0" + "]" * 12000, id="deep-bracket-text"),
+        pytest.param('The display is 6" wide.', id="inch-quote-prose"),
+        pytest.param(
+            'The note says "measure 6\\"" and keeps C:\\manuals\\front as text.',
+            id="quotes-and-backslashes-prose",
+        ),
+    ],
+)
+def test_secret_scan_is_bounded_and_accepts_metadata_text(
+    monkeypatch: pytest.MonkeyPatch, metadata_note: str
 ) -> None:
     root = REPO / ".data" / "test-eval-diagnostic-deep-envelope"
     if root.exists():
@@ -446,7 +457,7 @@ def test_secret_scan_is_bounded_and_accepts_deep_valid_envelope(
         "model": "gpt-6-luna",
         "status": "completed",
         "service_tier": "default",
-        "metadata": {"invented_note": "[" * 12000 + "0" + "]" * 12000},
+        "metadata": {"invented_note": metadata_note},
         "output": [
             {
                 "type": "message",
