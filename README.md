@@ -147,3 +147,59 @@ GitHub Actions 會使用 `uv.lock` 安裝依賴，在 Python 3.12 與 3.13 執�
 離線回答草稿把 caller 已經選好的 hits 收成有界 evidence request，再解析一份假的自然回答。固定 policy 與模型看得到的 JSON 資料分開。HP-A 的來源對照、mock HTTP 自然草稿與無證據 handoff 在 [`knowledge/README.md`](knowledge/README.md)。那是 mock，沒有呼叫 Luna，也還沒有核准啟用。
 
 `hp_a_once` 仍是固定的 HP-A 相容入口，只讀呼叫者指定專案根的 key，準備同一題與既有保養 chunk，最多送一次。`POST /ask` 和它共用同一個 key-only 送出與 parser，差別是 `/ask` 接受一般的單次問句。兩條路徑都不讀 policy、不開舊 ledger，也不用費率、token 成本或預留當作准入。`max_output_tokens` 只限制這一次的輸出長度。429 會立刻停，並依 provider code 分成 `insufficient_quota` 或 `rate_limit`；認不出的 429 不是超額。認不出的計費欄位不會丟掉已通過模型、狀態與來源檢查的回答，也不會把 usage 填成 0。說明與邊界見 [`knowledge/README.md`](knowledge/README.md)。
+
+## 知識維護（mock 切片，尚未核准啟用）
+
+這一支把合成草稿、候選 release、mock 回歸與明確啟用接到現有的 `POST /ask`。Marcus 仍須以 exact bytes 核准文件與 release 之後，那些紀錄才能被消費。本目錄沒有已核准的正式紀錄。測試只在暫存 workspace 寫 reviewer 為 `marcus` 的夾具，那些夾具不是 demo 核准，也不能當作生成驗收。
+
+`scan` 只描述 `knowledge/hp-a/headphone-care.md` 與 `knowledge/hp-b/connection-troubleshooting.md`。`knowledge/drafts/` 的充電 FAQ、退貨政策 v1（7 日）與 v2（14 日）留在草稿。`knowledge/fixtures/injection-note.md` 是未入選的注入範例。一份 release 要列出完整來源集合。
+
+文件核准 schema 是 `synthetic-document-approval`，綁文件身份、路徑、檔案 hash 與正文 hash。release 核准 schema 是 `synthetic-release-approval`，綁 `release_id`、manifest、資料庫、regression、40 字元 code SHA 與 suite version。兩種紀錄不能互換。CLI 沒有 `approve`。消費時 reviewer 必須恰好是 `marcus`，多出來的欄位會被拒絕。這是同一 OS 帳號上的程序隔離。
+
+`release_id` 是來源身份與 mock embedding 設定的 SHA-256，不含資料庫位元組。artifact key 也不含向量；啟用另外比對 manifest 裡的資料庫檔案 hash。mock digest 是字串 `customer-support-rag-mock-embed-v1` 的 SHA-256，manifest 的 transport 是 `mock`。已發布的 Ollama digest 仍是 `ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d`。這個 CLI 只建 mock 候選。
+
+候選先寫進暫時目錄，再 `os.rename` 成 `releases/<id>/`。失敗會清掉暫時目錄，並留下原本的 `active.json`。啟用會取得 workspace 的 flock，核對已消費的 release 核准、三個檔案 hash、mock regression 與資料庫裡的 key，再 fsync 並 `os.replace` 指標。`--expect` 必須是目前指標檔案的 SHA-256；第一次啟用用 `--expect-none`。預期不符就不會寫。replace 之前當機時，舊指標還在。flock 是這台機器、同一個檔案系統上的建議鎖。rename 已經成功之後，目錄 fsync 的失敗會被略過，以免把完成的候選報成失敗。作業系統若忽略 fsync，這段流程不能證明斷電安全。
+
+```sh
+uv run --locked python -m customer_support_rag.maintenance hashes \
+  --root knowledge --path drafts/hp-a/charging-faq.md
+```
+
+子命令還有 `scan`、`consume-document`、`build`、`evaluate`、`consume-release`、`activate` 與 `status`。`evaluate` 要帶 `--code-sha`。`eval/dev-suite.json` 的 suite version 是 `dev-suite-v1`。檢索案例只在候選的來源路徑集合與該案例的 source set 相同時執行，否則記 `not_applicable`。生成案例的結果維持 `unverified`，`model_called` 為 false。激活會拒絕一份把生成結果寫成 pass 的 regression。字符 bigram baseline 用 Dice，平手時先比 artifact key，再比 chunk index，`top_k` 是 4。這份回歸記錄控制流程。sealed holdout 由 Marcus 另外準備。
+
+設定 `CUSTOMER_SUPPORT_RAG_RELEASE_ROOT` 之後，`POST /ask` 只讀該 workspace 的 active snapshot。這時程序仍要有 `CUSTOMER_SUPPORT_RAG_KEY_ROOT`。指標壞掉回 `503` `release_unavailable`。未設定 release root 時，既有的資料庫與範例 artifact key 路徑維持原樣。
+
+## 有界追問
+
+`POST /assist` 與單次 `POST /ask` 分開。JSON 只有 `action`（`start`、`continue`、`reset`）、可省略的 `slot_token`、`product_id`、`question`、`steps_tried`。其他欄位，包括 role、history、release 與 attempt，都會被拒絕。
+
+伺服器發出 32 個 hex 字元的 slot token，用來尋找這個程序裡的記憶。澄清最多兩次，再來是 `insufficient_information`。每個欄位最多 1000 個 Python 字元，問句與已試步驟合計最多 2000。商品只接受 `hp-a` 或 `hp-b`，不會從問句推斷。HTTP body 上限 16KiB。token 從建立起 900 秒有效，繼續對話不會延長。同時最多 32 個 slot；滿了回 `503` `slot_capacity`。未知或過期 token 回 `422` `invalid_slot`。只有 `reset` 會換成一張新的空 slot，attempt 回到 0，而且不消耗澄清次數。`start` 帶 token，或 `reset` 附帶欄位，都是 `invalid_request`。
+
+三個欄位都齊了才會進入模型，而且只會一次。之後的 `continue` 是 `reset_required`，回應不含上一則回答。還在澄清時更換商品會清掉先前的問題與步驟，已用掉的澄清次數保留。已經呼叫過模型之後再換商品，同樣是 `reset_required`。錯誤不重試。`user_statements_unverified` 固定為 true。handoff 的 `summary` 是繁體中文，錯誤 code 是英文。
+
+Host 與 Origin 規則和 `POST /ask` 相同。跨來源的 `POST /assist` 回 `422`，而且不會呼叫模型。這次變更沒有改 `web/`。
+
+澄清一步的形狀：
+
+```json
+{
+  "request_id": "assist-example",
+  "status": "clarify",
+  "slot_token": "slot-example",
+  "attempt": 1,
+  "missing": ["product_id"],
+  "product_id": null,
+  "question": "可以用水洗嗎？",
+  "steps_tried": null,
+  "summary": null,
+  "user_statements_unverified": true,
+  "answer": null,
+  "reason": null,
+  "sources": [],
+  "usage": null,
+  "usage_code": null,
+  "usage_fields": []
+}
+```
+
+欄位齊全且模型回了引用時，`status` 為 `answer`，`sources` 與 `POST /ask` 相同。模型轉人工時，`status` 為 `handoff`，`summary` 帶上該次 reason。缺欄位超過兩次時，reason 是 `insufficient_information`。

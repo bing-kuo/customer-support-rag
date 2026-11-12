@@ -39,6 +39,8 @@ from customer_support_rag.knowledge.retrieval import (
 from customer_support_rag.knowledge.storage import EmbeddingStore, StorageError
 from customer_support_rag.luna import LunaError, Usage
 from customer_support_rag.luna_live import post_prepared_answer
+from customer_support_rag.maintenance.errors import MaintenanceError
+from customer_support_rag.maintenance.release import load_active_snapshot
 
 PUBLISHED_DIGEST = "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"
 HP_A_CARE_ARTIFACT = "9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad"
@@ -152,6 +154,7 @@ class AskConfig:
     model_digest: str
     key_root: Path
     embedding_transport: httpx.MockTransport | None = None
+    release_root: Path | None = None
 
 
 @dataclass(frozen=True)
@@ -161,9 +164,20 @@ class _Prepared:
 
 
 def config_from_environment() -> AskConfig | None:
-    """Read the database path and key root. This does not open either one."""
+    """Read process paths. This does not open a database or a release."""
     database = os.environ.get(DATABASE_ENV)
     key_root = os.environ.get(KEY_ROOT_ENV)
+    release = os.environ.get("CUSTOMER_SUPPORT_RAG_RELEASE_ROOT")
+    if release:
+        if not key_root:
+            return None
+        return AskConfig(
+            database=Path(database or release),
+            artifact_keys=(),
+            model_digest=PUBLISHED_DIGEST,
+            key_root=Path(key_root),
+            release_root=Path(release),
+        )
     if not database or not key_root:
         return None
     return AskConfig(
@@ -221,21 +235,31 @@ async def answer_ask(
 
 
 def _prepare(config: AskConfig, product_id: str, question: str) -> _Prepared:
-    store = EmbeddingStore.open_readonly(config.database)
+    if config.release_root is not None:
+        try:
+            snapshot = load_active_snapshot(config.release_root)
+        except MaintenanceError:
+            raise AskFailure(503, "release_unavailable") from None
+        database = snapshot.database
+        artifact_keys = snapshot.artifact_keys
+        model_digest = snapshot.model_digest
+    else:
+        database = config.database
+        artifact_keys = config.artifact_keys
+        model_digest = config.model_digest
+    store = EmbeddingStore.open_readonly(database)
     try:
         try:
             index = ExactCosineIndex.from_store(
                 store,
-                artifact_keys=config.artifact_keys,
-                expected_model_digest=config.model_digest,
+                artifact_keys=artifact_keys,
+                expected_model_digest=model_digest,
             )
         except ValueError:
             raise AskFailure(503, "dependency_unavailable") from None
         adapter = OllamaEmbeddingAdapter(config.embedding_transport)
         try:
-            query = adapter.embed_query(
-                question, expected_model_digest=config.model_digest
-            )
+            query = adapter.embed_query(question, expected_model_digest=model_digest)
             hits = index.search(query, product_id=product_id, top_k=_TOP_K)
         finally:
             adapter.close()
