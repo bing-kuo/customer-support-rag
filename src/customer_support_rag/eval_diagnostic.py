@@ -432,13 +432,13 @@ def _contains_secret_shape(body: bytes, api_key: str) -> bool:
                 return True
         if escaped_unicode.search(unescaped):
             raise DiagnosticCaptureError("diagnostic_body_uninspectable")
-        tokens = (
-            _complete_json_string_tokens(value)
-            if is_json_document
-            else _json_string_tokens(value)
-        )
-        if tokens is None:
-            raise DiagnosticCaptureError("diagnostic_body_uninspectable")
+        if is_json_document:
+            tokens = _complete_json_string_tokens(value)
+            if tokens is None:
+                raise DiagnosticCaptureError("diagnostic_body_uninspectable")
+            fragments: list[str] = []
+        else:
+            tokens, fragments = _scan_json_string_tokens(value)
         for decoded in tokens:
             if api_key in decoded:
                 return True
@@ -451,23 +451,33 @@ def _contains_secret_shape(body: bytes, api_key: str) -> bool:
             # Invalid or prose text is not reinterpreted as a JSON document,
             # but individually complete JSON string tokens still get decoded
             # so a key cannot hide behind a non-JSON prefix such as NBSP.
-            fragments = _json_string_tokens(decoded)
-            if fragments is not None:
-                for fragment in fragments:
-                    if api_key in fragment:
-                        return True
-                    if _complete_json_string_tokens(fragment) is not None:
-                        if layer >= MAX_SECRET_UNESCAPE_LAYERS:
-                            raise DiagnosticCaptureError(
-                                "diagnostic_body_uninspectable"
-                            )
-                        pending.append((fragment, layer + 1, True))
+            decoded_tokens, decoded_fragments = _scan_json_string_tokens(decoded)
+            for fragment in decoded_tokens:
+                if api_key in fragment:
+                    return True
+                if _complete_json_string_tokens(fragment) is not None:
+                    if layer >= MAX_SECRET_UNESCAPE_LAYERS:
+                        raise DiagnosticCaptureError("diagnostic_body_uninspectable")
+                    pending.append((fragment, layer + 1, True))
+            for fragment in decoded_fragments:
+                if _fragment_contains_key(fragment, api_key):
+                    return True
+        for fragment in fragments:
+            if _fragment_contains_key(fragment, api_key):
+                return True
     return False
 
 
 def _json_string_tokens(text: str) -> list[str] | None:
     """Decode each complete JSON string token without descending into objects."""
+    tokens, fragments = _scan_json_string_tokens(text)
+    return tokens if not fragments else None
+
+
+def _scan_json_string_tokens(text: str) -> tuple[list[str], list[str]]:
+    """Keep complete string tokens even when later text is malformed."""
     values: list[str] = []
+    fragments: list[str] = []
     index = 0
     while index < len(text):
         if text[index] != '"':
@@ -478,22 +488,77 @@ def _json_string_tokens(text: str) -> list[str] | None:
         while index < len(text):
             character = text[index]
             if character == "\\":
+                if index + 1 >= len(text):
+                    fragments.append(text[start + 1 :])
+                    return values, fragments
                 index += 2
             elif character == '"':
                 index += 1
                 try:
                     decoded = json.loads(text[start:index])
                 except (json.JSONDecodeError, RecursionError):
-                    return None
-                if not isinstance(decoded, str):
-                    return None
-                values.append(decoded)
+                    fragments.append(text[start + 1 : index - 1])
+                else:
+                    if isinstance(decoded, str):
+                        values.append(decoded)
+                    else:
+                        fragments.append(text[start + 1 : index - 1])
                 break
             else:
                 index += 1
         else:
-            return None
-    return values
+            fragments.append(text[start + 1 :])
+            return values, fragments
+    return values, fragments
+
+
+def _decode_json_escapes(text: str) -> str:
+    """Decode standard JSON escapes in a fragment, preserving invalid pairs."""
+    escapes = {
+        '"': '"',
+        "\\": "\\",
+        "/": "/",
+        "b": "\b",
+        "f": "\f",
+        "n": "\n",
+        "r": "\r",
+        "t": "\t",
+    }
+    output: list[str] = []
+    index = 0
+    while index < len(text):
+        if text[index] != "\\" or index + 1 >= len(text):
+            output.append(text[index])
+            index += 1
+            continue
+        escape = text[index + 1]
+        if escape in escapes:
+            output.append(escapes[escape])
+            index += 2
+        elif escape == "u" and index + 6 <= len(text):
+            digits = text[index + 2 : index + 6]
+            if re.fullmatch(r"[0-9a-fA-F]{4}", digits):
+                output.append(chr(int(digits, 16)))
+                index += 6
+            else:
+                output.append(text[index : index + 2])
+                index += 2
+        else:
+            output.append(text[index : index + 2])
+            index += 2
+    return "".join(output)
+
+
+def _fragment_contains_key(fragment: str, api_key: str) -> bool:
+    """Search an incomplete token through the bounded JSON escape layers."""
+    for _ in range(MAX_SECRET_UNESCAPE_LAYERS + 1):
+        if api_key in fragment:
+            return True
+        decoded = _decode_json_escapes(fragment)
+        if decoded == fragment:
+            return False
+        fragment = decoded
+    return api_key in fragment
 
 
 def _complete_json_string_tokens(text: str) -> list[str] | None:

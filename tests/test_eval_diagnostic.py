@@ -399,6 +399,36 @@ def test_capture_rejects_key_wrapped_inside_json_string() -> None:
 
 
 @pytest.mark.parametrize(
+    "nested",
+    [
+        "prefix junk " + json.dumps({"token": "synthetic/secret"}).replace("/", r"\/"),
+        json.dumps({"token": "synthetic/secret"}).replace("/", r"\/") + ' trailing "',
+        json.dumps({"token": "synthetic/secret"}).replace("/", r"\/")
+        + " trailing "
+        + chr(92),
+        json.dumps({"note": "safe"})
+        + " middle junk "
+        + json.dumps({"token": "synthetic/secret"}).replace("/", r"\/"),
+        '{"note":"safe"} trailing "synthetic\\/secret',
+        '{"note":"safe"} trailing "bad\\q synthetic\\/secret"',
+    ],
+)
+def test_capture_keeps_scanning_completed_tokens_across_malformed_fragments(
+    nested: str,
+) -> None:
+    root = REPO / ".data" / "test-eval-diagnostic-malformed-fragments"
+    if root.exists():
+        shutil.rmtree(root)
+    recorder = diagnostic(root)
+    body = json.dumps({"wrapped": nested}).encode("utf-8")
+    with pytest.raises(DiagnosticCaptureError, match="diagnostic_secret_in_body"):
+        recorder.capture(body, http_status=200, api_key="synthetic/secret")
+    assert list(root.iterdir()) == []
+    recorder.close()
+    root.rmdir()
+
+
+@pytest.mark.parametrize(
     ("leading", "trailing"),
     [
         (leading, trailing)
