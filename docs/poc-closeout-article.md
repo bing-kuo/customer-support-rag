@@ -43,11 +43,11 @@ flowchart LR
 
 PoC 也展示了知識如何從文件掃描、核對內容身分、建立候選、比較結果，走到暫存環境中的切換與重啟讀回。對 FAQ 或政策文字做更新時，候選以輸入內容和向量身分區分；失敗切換會保留舊 snapshot，讓流程可以檢查目前指向哪個版本。這有助於追問「草稿依據哪一版」，也讓失敗時能辨認應保留的狀態。
 
-但目前交付指南中的完整 rehearsal 使用暫存目錄、mock embedding、mock generation 與假核准資料，並封鎖外部連線。它驗證的是本機控制流程及版本切換，不是對真實文件重做向量、正式發布候選或證明更新後答案更好。PR #15 的離線檢查與 review 也沒有重跑真生成或啟用候選。FAQ baseline 舊錯誤的根因仍未知；FAQ 與政策版本的驗證仍未完成。這些差距不能靠一次成功的 mock rehearsal 填平。
+但目前交付指南中的完整 rehearsal 使用暫存目錄、mock embedding、mock generation 與假核准資料，並封鎖外部連線。它驗證的是本機控制流程及版本切換，不是對真實文件重做向量、正式發布候選或證明更新後答案更好。PR #15 最終合併版本的離線檢查與 review 沒有重跑真生成或啟用候選。FAQ baseline 舊錯誤的根因仍未知；FAQ 與政策版本的驗證仍未完成。這些差距不能靠一次成功的 mock rehearsal 填平。
 
 ## 歷史 live 小樣本與 mock 證據分開看
 
-公開的 PR #11 記錄了舊版單題入口的一次 live 回答；同一 PR 的前一次送出停在未知計費欄位錯誤，沒有回答。PR #12 則記錄另一個較後、但仍早於目前主線的舊 SHA，對一題 `POST /ask` 回覆 HTTP 200 並帶來源引用。兩筆成功記錄的 `usage` 都是 `null`，用量未知，不應寫成零或推算費用。它們是兩個不同版本、不同入口上的單題觀察，不合併成成功率，也不外推為目前版本品質、完整評測或 P2 驗收通過。[PR #11](https://github.com/bing-kuo/customer-support-rag/pull/11) · [PR #12](https://github.com/bing-kuo/customer-support-rag/pull/12)
+本 repo 內的 PR #11 記錄了舊版單題入口的一次 live 回答；同一 PR 的前一次送出停在未知計費欄位錯誤，沒有回答。PR #12 則記錄另一個較後、但仍早於目前主線的舊 SHA，對一題 `POST /ask` 回覆 HTTP 200 並帶來源引用。兩筆成功記錄的 `usage` 都是 `null`，用量未知，不應寫成零或推算費用。較早的 PR #15 核准版本 [`09e24d1`](https://github.com/bing-kuo/customer-support-rag/commit/09e24d1e48ac71768dab08600feb8b47d04e17ce) 另有四個合成 dev 案例的歷史生成結果，四案當時均取得回答、用量均未知。這些結果分屬不同舊版，不合併計算成功率或外推為目前版本品質、完整評測或 P2 驗收通過；PR #15 最終合併版本沒有重跑 live 問答。由於本 repo 為 private，以上 PR／commit 連結僅供具 repo 存取權的讀者查看，外部讀者可能無法開啟。[PR #11](https://github.com/bing-kuo/customer-support-rag/pull/11) · [PR #12](https://github.com/bing-kuo/customer-support-rag/pull/12)
 
 較新的離線 mock 測試和 PR #15 合併版本的 review 展示另一種證據：程式可以在假 transport 下檢查來源完整性、未知引用、容量停止與輸出契約，也可以重現某些結構合法但語意錯誤的例子。它們能驗證程式控制流程和邊界處理，不能替代真模型生成的人工評分，更不能把舊失敗改標成通過。[PR #15 合併版本](https://github.com/bing-kuo/customer-support-rag/commit/f7ec860a01ad447a9cb639fcb474b597b62f4fc6) · [PR #15 討論](https://github.com/bing-kuo/customer-support-rag/pull/15)
 
