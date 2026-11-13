@@ -40,7 +40,7 @@ from customer_support_rag.luna_live import (
 
 KNOWLEDGE = Path(__file__).parents[1] / "knowledge"
 KEY = "synthetic-key-not-live"
-BODY_HASH = "ac5a515cdc5406c15906b913788cd895190564128b48c8117bb9fe97847fe36f"
+BODY_HASH = "eb700a95e50e837eeb90c1783eab3845390d8ba4b7d718034dc18946cf1bc67e"
 ANSWER = "使用後以乾燥柔軟的布擦拭耳罩。請勿將耳機浸入水中，也不要使用溶劑清潔。"
 
 
@@ -70,10 +70,10 @@ def test_hp_a_wire_is_one_fixed_body() -> None:
         request.sources[0].hit.chunk.char_end,
     ) == (1, 71)
     assert parts.policy_bytes == 623
-    assert parts.data_bytes == 415
+    assert parts.data_bytes == 377
     assert parts.schema_bytes == 677
-    assert parts.framing_bytes == 409
-    assert parts.total_bytes == 2124
+    assert parts.framing_bytes == 405
+    assert parts.total_bytes == 2082
     assert parts.total_bytes <= MAX_WIRE_BYTES
     assert body["max_output_tokens"] == 512
     assert body["model"] == MODEL
@@ -91,7 +91,7 @@ def test_check_reports_the_key_without_opening_a_ledger(
     assert report.key_present is True
     assert report.failures == ()
     assert report.wire is not None
-    assert report.wire.total_bytes == 2124
+    assert report.wire.total_bytes == 2082
     missing = hp_a_check(tmp_path / "empty", knowledge=KNOWLEDGE)
     assert missing.key_present is False
     assert "key_missing" in missing.failures

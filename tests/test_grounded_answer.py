@@ -267,7 +267,6 @@ def test_hp_a_mock_chain_uses_search_and_keeps_the_database(
     assert set(data) == {
         "evidence",
         "product_id",
-        "prompt_revision",
         "question",
     }
     assert data["evidence"] == [
@@ -509,7 +508,6 @@ def test_hostile_strings_remain_json_data(monkeypatch: pytest.MonkeyPatch) -> No
     assert set(data) == {
         "evidence",
         "product_id",
-        "prompt_revision",
         "question",
     }
     assert draft.sources[0].hit.chunk.text == text

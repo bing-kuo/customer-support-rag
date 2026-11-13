@@ -43,6 +43,7 @@ from customer_support_rag.knowledge.retrieval import ExactCosineIndex, Retrieval
 from customer_support_rag.knowledge.storage import EmbeddingStore
 from customer_support_rag.luna import (
     DRAFT_SCHEMA,
+    MAX_INPUT_TOKENS,
     MAX_RESPONSE_BYTES,
     MODEL,
     WIRE_FUDGE,
@@ -53,6 +54,7 @@ from customer_support_rag.luna import (
     parse_usage,
     responses_client,
     wire_bytes,
+    wire_composition,
 )
 
 KNOWLEDGE = Path(__file__).parents[1] / "knowledge"
@@ -394,7 +396,8 @@ def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
     assert sent["instructions"] == GROUNDED_POLICY
     model_data = json.loads(sent["input"][0]["content"][0]["text"])
     assert model_data == json.loads(request.model_data_json())
-    assert model_data["prompt_revision"] == PROMPT_REVISION == "grounded-draft-v4"
+    assert "prompt_revision" not in model_data
+    assert request.prompt_revision == PROMPT_REVISION == "grounded-draft-v4"
     for instruction in (
         "handoff",
         "claims=[]",
@@ -425,6 +428,36 @@ def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
     else:
         assert isinstance(result, LunaError)
         assert result.code == expected
+
+
+def test_policy_v2_complete_evidence_fits_the_existing_wire_bound() -> None:
+    sources = (
+        ("a" * 64, "drafts/hp-a/return-policy-v2.md"),
+        ("b" * 64, "hp-a/headphone-care.md"),
+    )
+    hits = []
+    for artifact_key, relative_path in sources:
+        document = read_document(KNOWLEDGE, relative_path)
+        chunks = [chunk for chunk in chunk_document(document) if chunk.text.strip()]
+        assert len(chunks) == 1
+        hits.append(
+            RetrievalHit(artifact_key=artifact_key, chunk=chunks[0], raw_score=0.2)
+        )
+
+    request = prepare_answer(
+        "未拆封商品可在購買後14日內申請退貨嗎？",
+        product_id="hp-a",
+        hits=hits,
+    )
+    wire = wire_composition(request)
+    model_data = json.loads(request.model_data_json())
+
+    assert wire.total_bytes + WIRE_FUDGE <= MAX_INPUT_TOKENS
+    assert model_data["question"] == "未拆封商品可在購買後14日內申請退貨嗎？"
+    assert model_data["product_id"] == "hp-a"
+    assert [item["text"] for item in model_data["evidence"]] == [
+        hit.chunk.text for hit in hits
+    ]
 
 
 def test_empty_hits_do_not_reserve_or_call_http(tmp_path: Path) -> None:

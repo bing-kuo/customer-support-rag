@@ -106,7 +106,7 @@ class AnswerRequest(BaseModel):
         return copied
 
     def model_data_json(self) -> str:
-        """Serialize the model-visible data. Policy and hit metadata stay out."""
+        """Serialize evidence data; policy and internal prompt version stay out."""
         _reject_if_diverged(self)
         return _encode_model_data(
             question=self.question,
@@ -369,7 +369,6 @@ def _encode_model_data(
             {"source_id": item.source_id, "text": item.text} for item in evidence
         ],
         "product_id": product_id,
-        "prompt_revision": PROMPT_REVISION,
         "question": question,
     }
     try:

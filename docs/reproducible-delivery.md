@@ -192,4 +192,4 @@ synthetic source A：「終端只使用公開演示目錄；不得輸入訪客�
 
 這輪從舊 parser 移除 marker-based 限制覆蓋、模型自報 limit IDs 與 bigram-based 人工分支。固定 instruction 保留生成要求，但不以模型自稱已涵蓋作為證明。測試分開記錄自動結構檢查與作者設定的 synthetic 人工 rubric；後者不是獨立 reviewer 對真生成的品質驗收。真生成改善尚未驗證，D24–D26 的語意品質不能標 pass。P2 acceptance-open/security hold、候選 build SHA `0cb3a9a`、09e 歷史評估及其錯誤／污染狀態均未改寫、重算或啟用。
 
-固定 HP-A wire fixture 在 v4 policy/schema 下為 2,124 bytes；policy 623、data 415、schema 677、framing 409 bytes。byte-based reservation headroom 仍為 436 units。較長 evidence 仍會依原界線拒絕或在證據準備階段 fail closed；沒有提高預留或自動截斷。
+固定 HP-A wire fixture 在 v4 policy/schema 下為 2,082 bytes；policy 623、data 377、schema 677、framing 405 bytes。模型輸入保留 `question`、`product_id` 與完整 `evidence`；`prompt_revision` 仍由程式在送出前驗證，但不再當作模型資料傳送。byte-based reservation headroom 為 478 units。policy-v2 合成問題的完整政策及保養文件共 181 字元；省略這個內部版本標籤後 wire 為 2,531 bytes，含既有 1,024-unit 預留共 3,555／3,584，餘 29 units。相稱單元回歸已驗證沒有截斷或省略 evidence；clean-HEAD 完整 rehearsal 尚待核准提交後重跑。較長 evidence 仍會依原界線拒絕或在證據準備階段 fail closed；沒有提高預留或自動截斷。
