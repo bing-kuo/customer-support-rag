@@ -1,73 +1,46 @@
 # 客服 RAG
 
-以合成資料驗證客服檢索增強生成（RAG）的 proof of concept。此 repository 目前處於早期開發階段，尚未核准用於正式環境。
+以合成客服知識驗證檢索增強生成（RAG）的 proof of concept。程式碼使用 MIT License（見 [LICENSE](LICENSE)）；第三方套件保留各自授權（見 [NOTICE](NOTICE)）。`knowledge/`、`knowledge/drafts/` 與評測 suite 是合成資料，不含客戶紀錄。
 
-## 開發環境
+## 目前狀態
 
-- CI 已驗證 Python 3.12 與 3.13
-- `uv.lock` 固定應用程式與開發依賴的完整版本及雜湊
-- FastAPI 提供 HTTP routing，Pydantic 定義並驗證健康檢查回應，Uvicorn 在本機啟動 ASGI app
-- Starlette 固定在相容版本。HTTPX `0.28.1` 是 runtime dependency，供本機 embedding adapter 使用，也支援 FastAPI `TestClient`。NumPy `2.3.5` 是 runtime dependency，只用於已載入向量的 float64 exact cosine。pytest 執行測試，Ruff 負責格式與 lint
+截至 P3 Draft，知識維護 CLI、`POST /ask`、`POST /assist` 與本機頁面已在程式中。P2 尚未完成 acceptance：真實生成語意與完整 holdout 未通過；FAQ absent baseline 的舊錯誤根因未知；FAQ present、policy v1/v2 尚未跑完驗證。sealed 16 題也尚未完成驗收；既有紀錄為 5 pass、1 error、10 未跑，另有 11 題語意未驗，須保留既有錯誤／未送出狀態，不能改寫成全未跑或全通過。既有四個真 embedding 候選仍未核准或啟用。README、離線 rehearsal 與 P3 診斷修補正在同一個 PR 審查，不能據此宣稱產品驗收完成。
 
-Clone 後在獨立 repository checkout 執行一次，啟用 staged secret scan：
+本輪依 D-018 調整自然 RAG 草稿的保證範圍：程式驗來源／版本／hash、引用 ID、字元 span、answer 範圍完整覆蓋、輸出 schema 與 handoff 欄位一致；這些檢查只能確認結構和定位，不能證明每個主張被來源語意支持、所有必要限制完整，或 status 符合人工處置意圖。模型 instruction 會要求保留條件、禁止、必做與停止指示，但這不是可機械保證。來源文件按已核對的原始 chunks 整份送入；超過既有 4 個 evidence／1200 字元／wire 界線就不送 Luna，回現有 handoff。錯誤或相反建議即使結構合法，仍須人工依來源判讀；目前 UI 沒有強制放行閘門。
 
-```sh
-python3 scripts/install_git_hooks.py
-```
+P2 原有生成候選仍綁建置 commit `0cb3a9a`。本輪程式／prompt/schema 變更不會改標舊證據，也不會重算既有向量。診斷與真生成呼叫仍停止；後續 live 評測須另獲明確授權，舊失敗與 holdout 狀態保留。
 
-安裝器只設定此 clone 的 local `core.hooksPath`。它會保留既有自訂 hooks，並拒絕在 linked worktree、已有 hooks 設定或其他 linked worktrees 存在時覆寫；請在建立 linked worktrees 前執行。安裝後一般 `git commit` 會執行 project-local Gitleaks hook。
+## 從乾淨 checkout 開始
+
+需要 Python 3.12 或 3.13，以及已安裝的 `uv`。在 repository 根目錄執行：
 
 ```sh
 uv sync --locked --extra dev
-```
-
-## 本機檢查
-
-```sh
 uv run --locked ruff format --check .
 uv run --locked ruff check .
 uv run --locked pytest
 ```
 
-## 啟動 API
+離線 lifecycle rehearsal 使用臨時目錄、mock embedding 與明示的假 approval fixtures：
 
 ```sh
-uv run --locked uvicorn customer_support_rag.api:app --host 127.0.0.1 --port 8000 --no-proxy-headers
+uv run --locked python scripts/rehearse_delivery.py
 ```
 
-本機啟動必須綁 `127.0.0.1`。`--no-proxy-headers` 避免 `X-Forwarded-Host` 改寫 Host。`GET http://127.0.0.1:8000/health` 回傳服務狀態、應用程式名稱與版本。這個端點只回報 API 程序狀態，不檢查模型、知識庫或儲存服務。`GET /docs` 同樣不讀 key、不開資料庫、也不送問句。
+腳本會建置／重用候選、檢查無變更 no-op、比對 FAQ 前後及政策 v1/v2、測試候選隔離、只在臨時 workspace 走明確 activate、重新讀取狀態，並驗證失敗切換保留舊 snapshot。它先從政策 v1 執行 compare-failure recovery，再明確 activate policy v2；restart/status 後，active serving 的 `/ask` 與 `/assist` 引用版本都核為 v2，policy-v1 舊 snapshot 仍保留。它也用 `CUSTOMER_SUPPORT_RAG_RELEASE_ROOT` 接上暫存 API：未 activate 時 `/ask` 與填完必要欄位的 `/assist` 都回 `release_unavailable`；active snapshot serving 使用 mock query embedding、mock generator 和明確標示的假答案，並確認缺欄位 assist 不呼叫 adapter。腳本會封鎖 Python socket 連線，不讀真 key、不啟 Ollama、不呼叫 Luna、不做 paid request；輸出 usage 為 `null`。腳本建立的 Marcus approval 僅是假夾具，不是人工審查或正式核准。成功不等於 P2、live 問答或知識發布已驗收。
 
-## 本機頁面
+## 本機 API 與頁面
 
-同一 FastAPI 程序在 `GET /` 供應 repository 根目錄的 `web/index.html`，固定資產為 `GET /assets/style.css` 與 `GET /assets/app.js`。啟動後以瀏覽器開啟 `http://127.0.0.1:8000/`。程式用套件位置定位 `web/`，請求不能指定 web 根目錄或 key 根目錄。檔案不是一般檔、或名稱不在上述清單時回 JSON 404。未知路徑與未知 POST 維持 JSON／HTTP 錯誤，不會 fallback 成 HTML 首頁。暫時測試用的 web tree 不是產品 UI。
-
-目前頁面是合成耳機 PoC 的單次問答草稿：選 `hp-a`／`hp-b`、送一次 `POST /ask`、以純文字顯示回答或轉人工摘要。這還沒有通過 agent-browser 的最終畫面／鍵盤／窄版驗收，不能當成 P1 完成或 live 問答。
-
-`POST /ask` 的 Host 必須是 loopback（`127.0.0.1`、`localhost`、`::1`，可含 port）。沒有 Origin 的 CLI 可以送一次。瀏覽器若帶 Origin，必須與該次請求的 scheme、host、port 相同。`Origin: null` 與非同源會被拒絕，回應仍是固定 code 與 `request_id`。沒有 wildcard CORS。Host／Origin 被拒絕時不會讀 key 或呼叫模型。`GET /`、`GET /assets/*`、`GET /health` 與 `GET /docs` 也不讀 key、不開資料庫、不送問句。
-
-## 單次問答
-
-`POST /ask` 接受一個沒有對話狀態的 JSON：
-
-```json
-{"product_id": "hp-a", "question": "HP-A 耳機可以用水洗嗎？"}
-```
-
-`product_id` 只接受 `hp-a` 或 `hp-b`。`question` 必須是非空白字串，最多 1000 個 Python 字元，並保留原問句。history、路徑、URL、artifact key、模型、endpoint、system prompt、`top_k` 和其他額外欄位都會被拒絕。HTTP body 以實際讀到的 bytes 計算，上限 16KiB；超過回 `413`，格式或型別錯誤回 `422`。這兩種錯誤只回固定 code，不回顯問句或多餘欄位的值。非法輸入不會檢索、讀 key 或呼叫模型。
-
-伺服器使用程序設定，不接受請求覆寫：
+預設可不設定 key 或資料庫啟動本機服務，用於查看程序健康、API 文件與靜態頁面：
 
 ```sh
-export CUSTOMER_SUPPORT_RAG_DATABASE=.data/embeddings.sqlite
-export CUSTOMER_SUPPORT_RAG_KEY_ROOT=.
-uv run --locked uvicorn customer_support_rag.api:app --host 127.0.0.1 --port 8000 --no-proxy-headers
+uv run --locked uvicorn customer_support_rag.api:app \
+  --host 127.0.0.1 --port 8000 --no-proxy-headers
 ```
 
-`CUSTOMER_SUPPORT_RAG_DATABASE` 必須是已經存在的 SQLite。這個程序只讀開啟它，缺檔時不會自己建立，也不會寫 schema。預設載入的 artifact keys 是 HP-A care `9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad` 與 HP-B connection `18812b328a8e3614c4c83a849c2bfcd108e695453c8eaf9d57cf87200cefafae`，digest 固定為 `ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d`。key 仍只讀這個 key root 的 `.env` 裡既有的 `OPENAI_API_KEY`。請不要把真的 `.env` 或資料庫提交進 git。
+開啟 `http://127.0.0.1:8000/` 查看頁面，`/docs` 查看 OpenAPI，`/health` 查看程序狀態。Health 只證明 API 程序可回應，不檢查 active release、資料庫、Ollama、key 或 Luna 是否可用。請求須使用 loopback Host；瀏覽器 Origin 必須與本機頁面同源。未知路徑不會回退成首頁。
 
-一次成功的呼叫會對本機 Ollama 做問句 embedding（前後各核一次 digest），再用 exact cosine 在該商品的既有向量裡取最多四個整段 chunk。證據合計超過 1200 字時留下排序在前、仍放得進界線的完整 chunk，不截斷原文。長度選取之前先看這次全部候選：同一文件有兩個版本就停，不送 Luna。單一 chunk 超過界線也會停。沒有該商品的候選時直接 `no_evidence`，不呼叫 Luna。有候選才送一次 Luna。cosine 只用來排序，沒有相似度門檻，也不能當成拒答或退款決定。
-
-本機範例：
+真實 `POST /ask` 需要已核准的 active release 或相容的既有 SQLite 設定、可用的本機 Ollama embedding，以及 OpenAI key。查詢會先用 Ollama 產生問句向量，再以既有向量檢索；在有來源且完整 bundle 可放入既有界線時，才送一次 `gpt-6-luna` 請求。沒有檢索來源或 bundle 無法完整、安全地提供時，API 回現有 handoff；它不會判斷一般語意何時必須交人工。`POST /assist` 收集必要欄位後也可能進入模型。回答是供客服打開來源核對的自然草稿，並非無人監督客服；現有 UI 沒有強制人工放行功能。下列請求範例只供操作者在已核准的環境手動執行，非測試命令：
 
 ```sh
 curl -sS http://127.0.0.1:8000/ask \
@@ -75,131 +48,47 @@ curl -sS http://127.0.0.1:8000/ask \
   -d '{"product_id":"hp-a","question":"HP-A 耳機可以用水洗嗎？"}'
 ```
 
-下面四個 JSON 是說明用的形狀，不是這次變更的 live 回應。引用文字和 offsets 來自本機已存 chunk；回答是模型草稿。`request_id` 每次請求都新產生，不是 `hp_a_once` 的固定 ID，也不表示跨請求去重。
+模型與來源：embedding adapter 固定使用 `qwen3-embedding:0.6b`、1024 維及已記錄 digest `ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d`；模型來源是 [Qwen3-Embedding-0.6B](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B)，該模型頁標示 Apache-2.0。Ollama 本機 embedding API 介面依 [Ollama Embed API](https://docs.ollama.com/api/embed)。digest 來自既有記錄，本次 README／rehearsal 沒有啟動模型重查。生成 adapter 的固定 API model 名稱為 `gpt-6-luna`；它是服務端模型，不由本 repository 下載。模型可用性與帳務依實際 provider 設定，不能由 `/health` 推定。
 
-有引用的回答：
+### Key 設定
 
-```json
-{
-  "request_id": "ask-example",
-  "status": "answer",
-  "answer": "請用乾燥的軟布擦拭，耳機不可泡水，也別用溶劑清潔。",
-  "reason": null,
-  "sources": [
-    {
-      "source_id": "ev:9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad:1",
-      "document_id": "hp-a-care",
-      "product_id": "hp-a",
-      "version": "1",
-      "title": "HP-A 耳機日常保養",
-      "chunk_index": 1,
-      "heading": "日常保養",
-      "char_start": 1,
-      "char_end": 71,
-      "text": "# 日常保養\n\n使用後以乾燥柔軟的布擦拭耳罩。請勿將耳機浸入水中，也不要使用溶劑清潔。\n\n如需檢查保固條件，請聯絡購買通路並備妥購買證明。\n"
-    }
-  ],
-  "usage": {"input_tokens": 12, "output_tokens": 8, "total_tokens": 20, "cached_tokens": null, "cache_write_tokens": null, "ttl_30m_tokens": null, "ttl_12h_tokens": null, "reasoning_tokens": null},
-  "usage_code": null,
-  "usage_fields": []
-}
-```
-
-這一筆的 `artifact_key` 是 `9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad`，與 `source_id` 的中段相同。
-
-沒有候選：
-
-```json
-{"request_id": "ask-example", "status": "handoff", "answer": null, "reason": "no_evidence", "sources": [], "usage": null, "usage_code": null, "usage_fields": []}
-```
-
-模型有回答但計費形狀無法辨識時，回傳和上面的回答相同，`sources` 仍是實際引用的來源。差別只有 `usage` 為 null、`usage_code` 為 `unknown_billing_component`，以及 `usage_fields` 列出安全欄位名，例如 `usage.priority_processing`。不把 usage 填成 0，也不丟掉答案。失敗只回 code 和這次的 request id，例如 `{"code": "rate_limit", "request_id": "ask-example"}`。
-
-| code | HTTP | 意義 |
-| --- | --- | --- |
-| `invalid_request` | 422 | JSON、型別、商品、空白或超長問句 |
-| `body_too_large` | 413 | body 超過 16KiB |
-| `ask_not_configured` | 503 | 程序沒有資料庫或 key root 設定 |
-| `dependency_unavailable` | 503 | 資料庫缺檔、缺 key、schema 或 digest 不合 |
-| `evidence_unavailable` | 503 | 單一來源超界或文件版本衝突 |
-| `embedding_unavailable` | 502 | 本機 embedding 失敗；不會再呼叫 Luna |
-| `paid_blocked` | 503 | key 無法使用；沒有送出 |
-| `insufficient_quota`、`rate_limit`、`provider_capacity` | 429 | provider 拒絕；立刻停止 |
-| `logical_timeout`、`provider_transport_error` | 504 | 這一次逾時或連線失敗 |
-| `output_refusal`、`invalid_model_schema`、`unknown_citation`、`provider_service_unavailable` | 502 | 沒有可回的答案 |
-
-失敗不會附上原始 exception、provider body、key、本機路徑或半成品答案。沒有 retry、fallback 或自動重送；使用者再送是下一次獨立請求。
-
-送去 Luna 的內容只有這次問題和被選中的 evidence。沒被選到的文件和整份資料庫不會送出。問句或文件裡的 URL、SQL、shell、HTML 和指令只當資料，不會改 endpoint、商品或 artifact scope。schema 與來源檢查不是已經證明的語意防注入。
-
-知識文件仍是合成資料，這個端點沒有啟用正式知識，也沒有在這次變更對 Ollama 或 Luna 做 live 呼叫。mock 測試不需要真的 key：
+[`.env.example`](.env.example) 只有一行非秘密 placeholder。將它複製到你自行選擇、repository 外的 key directory，替換成自己的 key，並限制目錄與檔案權限：
 
 ```sh
-uv run --locked pytest tests/test_ask.py
+KEY_ROOT=/path/to/your/private-key-directory
+mkdir -p "$KEY_ROOT"
+chmod 700 "$KEY_ROOT"
+cp .env.example "$KEY_ROOT/.env"
+chmod 600 "$KEY_ROOT/.env"
 ```
 
-GitHub Actions 會使用 `uv.lock` 安裝依賴，在 Python 3.12 與 3.13 執行相同的格式、lint 與測試檢查，並以 Gitleaks 掃描 secrets。
+設定 `CUSTOMER_SUPPORT_RAG_KEY_ROOT` 指向這個目錄；程式只讀其中 `.env` 的 `OPENAI_API_KEY`。不要把真 `.env`、資料庫、approval 或私有評測資料加入 Git。key root 與 release/workspace 路徑由操作者在自己的機器設定；README 不提供機器專屬位置。
 
-目前包含最小 FastAPI app、健康檢查端點，以及以 TOML front matter 標記的少量合成知識文件範例（見 [`knowledge/README.md`](knowledge/README.md)）。文件讀取成功不等於人工審查、核准或啟用於線上 RAG。
+使用已核准並啟用的 release serving 時，將 `CUSTOMER_SUPPORT_RAG_RELEASE_ROOT` 設為 maintenance workspace 路徑，並將 `CUSTOMER_SUPPORT_RAG_KEY_ROOT` 設為上述 key directory。兩者是啟動程序的環境變數；`.env.example` 只供 key root 使用，不是服務設定檔。release-root 模式由 `active.json` 載入快照，不需要舊 `CUSTOMER_SUPPORT_RAG_DATABASE`。
 
-本機 embedding 只做同步 adapter：既有 chunk 的原文送到固定的本機 Ollama 位址。呼叫者可以再把一份文件的來源與向量放進自己指定的 SQLite 檔，之後用同一個 key 讀回；store 不會自己呼叫模型。問句向量與離線 exact cosine 也在同一份說明。呼叫方式、HP-A mock 範例與保存格式見 [`knowledge/README.md`](knowledge/README.md)。這個 README 的範例沒有在本變更中對 Ollama 執行。
+### 手動維護命令
 
-離線回答草稿把 caller 已經選好的 hits 收成有界 evidence request，再解析一份假的自然回答。固定 policy 與模型看得到的 JSON 資料分開。HP-A 的來源對照、mock HTTP 自然草稿與無證據 handoff 在 [`knowledge/README.md`](knowledge/README.md)。那是 mock，沒有呼叫 Luna，也還沒有核准啟用。
-
-`hp_a_once` 仍是固定的 HP-A 相容入口，只讀呼叫者指定專案根的 key，準備同一題與既有保養 chunk，最多送一次。`POST /ask` 和它共用同一個 key-only 送出與 parser，差別是 `/ask` 接受一般的單次問句。兩條路徑都不讀 policy、不開舊 ledger，也不用費率、token 成本或預留當作准入。`max_output_tokens` 只限制這一次的輸出長度。429 會立刻停，並依 provider code 分成 `insufficient_quota` 或 `rate_limit`；認不出的 429 不是超額。認不出的計費欄位不會丟掉已通過模型、狀態與來源檢查的回答，也不會把 usage 填成 0。說明與邊界見 [`knowledge/README.md`](knowledge/README.md)。
-
-## 知識維護（mock 切片，尚未核准啟用）
-
-這一支把合成草稿、候選 release、mock 回歸與明確啟用接到現有的 `POST /ask`。Marcus 仍須以 exact bytes 核准文件與 release 之後，那些紀錄才能被消費。本目錄沒有已核准的正式紀錄。測試只在暫存 workspace 寫 reviewer 為 `marcus` 的夾具，那些夾具不是 demo 核准，也不能當作生成驗收。
-
-`scan` 只描述 `knowledge/hp-a/headphone-care.md` 與 `knowledge/hp-b/connection-troubleshooting.md`。`knowledge/drafts/` 的充電 FAQ、退貨政策 v1（7 日）與 v2（14 日）留在草稿。`knowledge/fixtures/injection-note.md` 是未入選的注入範例。一份 release 要列出完整來源集合。
-
-文件核准 schema 是 `synthetic-document-approval`，綁文件身份、路徑、檔案 hash 與正文 hash。release 核准 schema 是 `synthetic-release-approval`，綁 `release_id`、manifest、資料庫、regression、40 字元 code SHA 與 suite version。兩種紀錄不能互換。CLI 沒有 `approve`。消費時 reviewer 必須恰好是 `marcus`，多出來的欄位會被拒絕。這是同一 OS 帳號上的程序隔離。
-
-`release_id` 是來源身份與 embedding 設定的 SHA-256，不含資料庫位元組。artifact key 也不含向量。snapshot、重建 no-op、evaluate 與 activate 用同一份檢查：manifest 的模型、digest、維度、文件 profile、chunking profile、`max_chars`、query profile 與 transport，必須等於這份固定身份，也必須等於資料庫裡該文件 payload 的模型、digest、維度、文件 profile 與 chunking profile。query profile 寫在 manifest 與 regression，不在 sqlite。mock digest 是字串 `customer-support-rag-mock-embed-v1` 的 SHA-256，manifest 的 transport 是 `mock`。已發布的 Ollama digest 仍是 `ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d`，對應的 transport 是 `ollama`。兩種身份不會共用 `release_id`。預設 `build` 與 `evaluate` 不開網路。`--embed ollama` 才使用既有的 Ollama adapter：固定模型、`truncate: false`、不 retry，並在 embed 前後核對已發布 digest。digest 不符、逾時或部分結果會停掉這一批，清掉暫時目錄。mock 向量不會被改標成這個 digest。
-
-候選先寫進暫時目錄，再在真實的 `releases/` 裡 rename 成 `releases/<id>/`。`control/`、`document-approvals/`、`release-approvals/` 與 `releases/` 的任何一層若是 symlink，寫入會被拒絕，外面的目錄不會多出檔案。失敗會清掉暫時目錄，並留下原本的 `active.json`。啟用會取得 workspace 的 flock，核對已消費的 release 核准、三個檔案 hash，以及這份候選自己的 regression：`release_id`、manifest hash、資料庫 hash、`suite_version`、`rubric_version`、`code_sha`、transport、digest 與同一份 embedding 身份都必須對上這份候選。一份內部合法的 mock JSON 不能啟用 ollama 候選。`query_transport` 為 `mock` 仍只是離線測試標記。別的候選的 regression 不能拿來啟用。還會核對資料庫裡的 key。複製既有向量前會核對來源 manifest、資料庫檔案 hash、transport、digest 與文件身份。mock 候選還會把每個向量跟該 chunk 的 mock 向量比較；對不上就捨棄該來源、重新 embedding，不會沿用壞向量。ollama 候選只重用另一個 ollama 候選裡相同已發布 digest 的文件，不會從 mock 候選複製。同時改寫 sqlite payload digest 與 manifest 的本機攻擊，這條沒有第二份向量可對，不在這次檢查裡。`--expect` 必須是目前指標檔案的 SHA-256；第一次啟用用 `--expect-none`。預期不符就不會寫。`os.replace` 之前失敗時，舊指標還在，可以原命令重試。replace 已經成功、但指標目錄 fsync 失敗時，結果是 `activated_unconfirmed`（結束碼 0），並印出指標檔的 SHA-256。這時指標已經指向新 release，不能當成回滾。請先看 `status`；若已經是這份 release，不要再用舊的 `--expect` 重送。帶新的指標 hash 再執行一次 `activate` 會是 `noop`。候選 rename 成功之後的目錄 fsync 失敗仍會被略過。flock 是這台機器、同一個檔案系統上的建議鎖。作業系統若忽略 fsync，這段流程不能證明斷電安全。
+維護 CLI 預設使用 mock embedding，不需要 key。`--embed ollama` 會呼叫本機 Ollama；不要在離線 rehearsal 使用它。人工核准檔必須來自實際審查，腳本產生的假 approval 不可拿到此處使用。
 
 ```sh
-uv run --locked python -m customer_support_rag.maintenance hashes \
-  --root knowledge --path drafts/hp-a/charging-faq.md
+uv run --locked python -m customer_support_rag.maintenance --help
+uv run --locked python -m customer_support_rag.maintenance scan --root knowledge
+uv run --locked python -m customer_support_rag.maintenance status \
+  --workspace /path/to/your/authorized-release-workspace
 ```
 
-子命令還有 `scan`、`consume-document`、`build`、`evaluate`、`consume-release`、`activate` 與 `status`。`evaluate` 要帶 `--code-sha`。預設不呼叫 Ollama 或 Luna。mock 候選用 mock query。ollama 候選在預設下直接停止，必須明示 `--embed ollama` 才會用真實 adapter 做檢索 query；生成案例即使如此仍是 `unverified`，`model_called` 為 false。`POST /ask` 仍是既有的生成入口，這份回歸不會改走它。`eval/dev-suite.json` 的 suite version 是 `dev-suite-v1`。檢索案例只在候選的來源路徑集合與該案例的 source set 相同時執行，否則記 `not_applicable`。激活會拒絕一份把生成結果寫成 pass 的 regression。字符 bigram baseline 用 Dice，平手時先比 artifact key，再比 chunk index，`top_k` 是 4。這份回歸記錄控制流程。sealed holdout 由 Marcus 另外準備。
+真實候選須先由授權 reviewer 核准文件 bytes 與 release manifest、資料庫及 regression hashes，再使用 `consume-document`／`consume-release`。只有已消費的真實 release approval 才可手動 `activate`。切換前讀取 `status`，`--expect` 必須是目前 `active.json` bytes 的 SHA-256；首次切換才使用 `--expect-none`。若結果為 `activated_unconfirmed`，先再查 `status`；若 pointer 已指向目標 release，不要以舊 `--expect` 重送。舊 snapshot 保留，除非另有明確授權，不要刪除。這些是真實環境操作說明，rehearsal 不會對真 workspace 執行。
 
-設定 `CUSTOMER_SUPPORT_RAG_RELEASE_ROOT` 之後，`POST /ask` 只讀該 workspace 的 active snapshot。這時程序仍要有 `CUSTOMER_SUPPORT_RAG_KEY_ROOT`。指標壞掉回 `503` `release_unavailable`。未設定 release root 時，既有的資料庫與範例 artifact key 路徑維持原樣。
+完整的初次 build、same-input no-op/reuse、FAQ 更新、evaluate、release 核准、activate 與 serving 啟動命令見[交付指南](docs/reproducible-delivery.md)。其中 `--embed ollama` 會呼叫本機 embedding model；範例是操作者參考流程，不是 P3 rehearsal，亦非本 PR 執行授權。真實生成與 holdout 仍未完成驗收，沒有呼叫 Luna 或啟用真候選。
 
-## 有界追問
+## 故障與恢復
 
-`POST /assist` 與單次 `POST /ask` 分開。JSON 只有 `action`（`start`、`continue`、`reset`）、可省略的 `slot_token`、`product_id`、`question`、`steps_tried`。其他欄位，包括 role、history、release 與 attempt，都會被拒絕。
+- `paid_blocked`：key 缺少、格式或權限不符，或程序未提供所需設定。確認 key directory 內只有正確的 `OPENAI_API_KEY`、檔案 mode 為 `0600`；不要輸出或貼上 key。
+- `dependency_unavailable`／`release_unavailable`：本機資料庫、schema、artifact 或 active snapshot 不可用。先確認設定指向操作者的正確 workspace，並用 maintenance `status` 查看目前 pointer；不要把檔案錯誤當成無證據。
+- `embedding_unavailable`：本機 Ollama／模型 digest／embedding 回應未符合固定契約。查明本機模型狀態後再決定下一步；本程式不自動重試。
+- `429`（`insufficient_quota`、`rate_limit`、`provider_capacity`）：停止該請求，不自動重送；辨明 provider 回報後才決定是否由操作者發起新請求。
+- timeout、client 取消或連線中斷：不代表上游已停止，也不代表沒有計費。先查 provider 狀態與用量，不要因為本機沒收到答案就重送。
+- 成功答案但 `usage` 為 `null`：未知用量不是 0；保留答案與 `usage_code`，先查 provider usage，不要重送原問題以猜測帳務。
+- pointer 已更新但狀態未確認：執行 `status` 核對目標 release。不要重播舊 expected hash，也不要刪除舊 snapshot。
 
-伺服器發出 32 個 hex 字元的 slot token，用來尋找這個程序裡的記憶。澄清最多兩次，再來是 `insufficient_information`。每個欄位最多 1000 個 Python 字元，問句與已試步驟合計最多 2000。商品只接受 `hp-a` 或 `hp-b`，不會從問句推斷。HTTP body 上限 16KiB。token 從建立起 900 秒有效，繼續對話不會延長。同時最多 32 個 slot；滿了回 `503` `slot_capacity`。未知或過期 token 回 `422` `invalid_slot`。只有 `reset` 會換成一張新的空 slot。這次回應仍是 `clarify`，但 attempt 是 1，並且算進最多兩次澄清。空的 `continue` 接著是 `clarify` attempt 2，再來是 `handoff` attempt 2，之後維持 handoff，不會出現第三次 `clarify`。reset 之後第一次 `continue` 若三個欄位都齊，仍會進入模型。`start` 不帶欄位仍是 `clarify` attempt 1、第二次 `clarify` attempt 2，然後 handoff。`start` 帶 token，或 `reset` 附帶欄位，都是 `invalid_request`。
-
-三個欄位都齊了才會進入模型，而且只會一次。`continue` 沒有帶到的欄位維持 slot 裡的舊值。JSON 把 `product_id`、`question` 或 `steps_tried` 設成 `null` 才是清空該欄；清空後若還缺欄位，不會拿被刪掉的舊值進入模型，而是再澄清或在兩次用完時 handoff。已選過的商品再被設成 `null` 時，當時的問題與已試步驟一起清掉；同一份請求裡明示的新問題或新步驟才留下。商品本來是空的，這個 `null` 不會清掉尚未綁定的問題。省略商品或送回同一個商品，都保留原問題與步驟。空字串不是清空，是 `invalid_request`。`reset` 只能帶 `action` 與 `slot_token`，連這三欄的 `null` 也不能帶。`answer` 與 `handoff` 都帶回同一個 slot token。對該 token 再 `continue` 不會再呼叫模型。新題只能 `reset`，或另一次不帶 token 的 `start`。之後的 `continue` 是 `reset_required`，回應不含上一則回答。還在澄清時更換商品會清掉先前的問題與步驟，已用掉的澄清次數保留。已經呼叫過模型之後再換商品，同樣是 `reset_required`。錯誤不重試。`user_statements_unverified` 固定為 true。handoff 的 `summary` 是繁體中文，錯誤 code 是英文。
-
-Host 與 Origin 規則和 `POST /ask` 相同。跨來源的 `POST /assist` 回 `422`，而且不會呼叫模型。這次變更沒有改 `web/`。
-
-澄清一步的形狀：
-
-```json
-{
-  "request_id": "assist-example",
-  "status": "clarify",
-  "slot_token": "slot-example",
-  "attempt": 1,
-  "missing": ["product_id"],
-  "product_id": null,
-  "question": "可以用水洗嗎？",
-  "steps_tried": null,
-  "summary": null,
-  "user_statements_unverified": true,
-  "answer": null,
-  "reason": null,
-  "sources": [],
-  "usage": null,
-  "usage_code": null,
-  "usage_fields": []
-}
-```
-
-欄位齊全且模型回了引用時，`status` 為 `answer`，`sources` 與 `POST /ask` 相同。模型轉人工時，`status` 為 `handoff`，`summary` 帶上該次 reason。缺欄位超過兩次時，reason 是 `insufficient_information`。
+診斷保存維持明確 opt-in；一般 serving 不會自動保存 provider body。診斷失敗會安全停止，不洩漏 raw exception 或重送。細節與 offline regression 證據由本 PR 及其測試追蹤。

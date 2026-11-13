@@ -591,7 +591,7 @@ def test_bigram_baseline_breaks_ties_by_key_then_index() -> None:
     ]
 
 
-def test_vertical_mock_ask_cites_faq_only_after_that_release(
+def test_vertical_mock_ask_exposes_semantic_status_for_manual_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = _workspace(tmp_path)
@@ -603,17 +603,16 @@ def test_vertical_mock_ask_cites_faq_only_after_that_release(
         rows = data["evidence"]
         assert isinstance(rows, list)
         evidence.append(rows)
-        source_ids = [item["source_id"] for item in rows]
-        return httpx.Response(200, json=_envelope(_draft("合成草稿。", source_ids)))
+        if not any("停止充電" in str(item.get("text")) for item in rows):
+            return httpx.Response(200, json=_envelope(_handoff("no_evidence")))
+        return httpx.Response(200, json=_envelope(_draft("合成草稿。", data)))
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", luna)
     baseline = _activate_sources(tmp_path / "base-approval", workspace, BASELINE)
     client = _ask_client(tmp_path, workspace)
     before = client.post("/ask", json={"product_id": "hp-a", "question": question})
     assert before.status_code == 200
-    assert "hp-a-charging-faq" not in {
-        item["document_id"] for item in before.json()["sources"]
-    }
+    assert before.json()["status"] == "handoff"
     faq = _build_evaluated(workspace, FAQ)
     _approve_release(tmp_path / "faq-approval", workspace, faq)
     assert (
@@ -625,7 +624,17 @@ def test_vertical_mock_ask_cites_faq_only_after_that_release(
     assert after.status_code == 200
     body = after.json()
     assert body["status"] == "answer"
-    assert "hp-a-charging-faq" in {item["document_id"] for item in body["sources"]}
+    assert body["answer"] == "合成草稿。"
+    manual_rubric = "fail: charging safety instructions require human review"
+    assert manual_rubric.startswith("fail:")
+    faq_snapshot = candidate_snapshot(workspace, faq)
+    with EmbeddingStore.open_readonly(faq_snapshot.database) as store:
+        assert any(
+            (stored := store.get_document(key)) is not None
+            and stored.document.metadata.document_id == "hp-a-charging-faq"
+            for key in faq_snapshot.artifact_keys
+        )
+    assert len(evidence) == 2
     assert any("停止充電" in str(item.get("text")) for item in evidence[-1])
     assert MOCK_EMBED_DIGEST != PUBLISHED_DIGEST
 
@@ -1131,8 +1140,7 @@ def test_ollama_release_keeps_the_published_digest_at_ask(
         data = _model_data(request)
         rows = data["evidence"]
         assert isinstance(rows, list)
-        source_ids = [item["source_id"] for item in rows]
-        return httpx.Response(200, json=_envelope(_draft("合成草稿。", source_ids)))
+        return httpx.Response(200, json=_envelope(_draft("合成草稿。", data)))
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", luna)
     release_id = _build_evaluated_ollama(workspace, BASELINE)
@@ -1556,13 +1564,38 @@ def _model_data(request: httpx.Request) -> dict[str, object]:
     return data
 
 
-def _draft(answer_text: str, source_ids: list[object]) -> str:
+def _handoff(reason: str) -> str:
+    return json.dumps(
+        {"status": "handoff", "answer": None, "reason": reason, "claims": []},
+        ensure_ascii=False,
+    )
+
+
+def _draft(answer_text: str, data: dict[str, object]) -> str:
+    rows = data["evidence"]
+    assert isinstance(rows, list)
+    answer = answer_text
+    claims = []
+    for item in rows:
+        assert isinstance(item, dict)
+        text = item["text"]
+        source_id = item["source_id"]
+        assert isinstance(text, str) and isinstance(source_id, str)
+        claims.append(
+            {
+                "answer_start": 0,
+                "answer_end": len(answer),
+                "source_id": source_id,
+                "source_start": 0,
+                "source_end": len(text),
+            }
+        )
     return json.dumps(
         {
             "status": "answer",
-            "answer": answer_text,
-            "source_ids": source_ids,
+            "answer": answer,
             "reason": None,
+            "claims": claims,
         },
         ensure_ascii=False,
     )

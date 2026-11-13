@@ -48,15 +48,15 @@ from customer_support_rag.knowledge.storage import EmbeddingStore
 KNOWLEDGE = Path(__file__).parents[1] / "knowledge"
 DIGEST = "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"
 HP_A_ARTIFACT = "9a2283a73584261d31460d1b46855145d384c756834c8984c1539e96647cb4ad"
-HP_A_ANSWER = "請用乾燥的軟布擦拭，耳機不可泡水，也別用溶劑清潔。"
+HP_A_ANSWER = "使用後以乾燥柔軟的布擦拭耳罩。請勿將耳機浸入水中，也不要使用溶劑清潔。"
 HP_A_WARRANTY = (
-    "請用乾燥的軟布擦拭，不可泡水，也別用溶劑。"
+    "使用後以乾燥柔軟的布擦拭耳罩。請勿將耳機浸入水中，也不要使用溶劑清潔。"
     "若要確認保固，請聯絡購買通路並備妥購買證明。"
 )
 HP_B_FIRST = "請先確認耳機電量，再到藍牙設定移除舊配對，然後重新配對。"
 HP_B_SECOND = "先看耳機有沒有電，接著把裝置上的舊配對刪掉，再配對一次。"
 HP_B_FOLLOW_UP = "請重新啟動播放裝置，並查閱製造商提供的說明。"
-CRITICAL_ANSWER = "若出現異味或冒煙，請停止使用、停止充電，並聯絡人工。"
+CRITICAL_ANSWER = "若出現異味或冒煙，應停止使用、停止充電並聯絡人工。"
 INVENTED_REFUND = "可以全額退款，我們已經處理完成。"
 CRITICAL_ACTIONS = ("停止使用", "停止充電", "聯絡人工")
 MARKER = "UNIQUE_MARKER_9f3a"
@@ -139,11 +139,29 @@ def answer_payload(
     answer: str, request: AnswerRequest, *source_ids: str
 ) -> dict[str, object]:
     cited = list(source_ids) or [request.evidence[0].source_id]
-    return {"status": "answer", "answer": answer, "source_ids": cited, "reason": None}
+    evidence_by_id = {item.source_id: item.text for item in request.evidence}
+    claims = []
+    for source_id in cited:
+        source_text = evidence_by_id.get(source_id)
+        claims.append(
+            {
+                "answer_start": 0,
+                "answer_end": len(answer),
+                "source_id": source_id,
+                "source_start": 0,
+                "source_end": len(source_text) if source_text else 1,
+            }
+        )
+    return {
+        "status": "answer",
+        "answer": answer,
+        "reason": None,
+        "claims": claims,
+    }
 
 
 def handoff_payload(reason: str) -> dict[str, object]:
-    return {"status": "handoff", "answer": None, "source_ids": [], "reason": reason}
+    return {"status": "handoff", "answer": None, "reason": reason, "claims": []}
 
 
 def critical_hit() -> RetrievalHit:
@@ -159,6 +177,23 @@ def critical_hit() -> RetrievalHit:
     )
     chunks = [chunk for chunk in chunk_document(document) if chunk.text.strip()]
     return RetrievalHit(artifact_key="c" * 64, chunk=chunks[0], raw_score=0.4)
+
+
+def planetarium_hits() -> tuple[RetrievalHit, RetrievalHit]:
+    return (
+        make_hit(
+            text="終端只使用公開演示目錄；不得輸入訪客姓名；不得更改帳號權限。",
+            key="1" * 64,
+            index=1,
+            document_id="planetarium-terminal",
+        ),
+        make_hit(
+            text="目錄每週二更新。權限異常由館員確認。",
+            key="2" * 64,
+            index=1,
+            document_id="planetarium-catalogue",
+        ),
+    )
 
 
 def real_product_hit(relative: str, key: str) -> RetrievalHit:
@@ -222,14 +257,18 @@ def test_hp_a_mock_chain_uses_search_and_keeps_the_database(
     assert resolved.hit.chunk.metadata.document_id == "hp-a-care"
     assert resolved.hit.chunk.metadata.version == "1"
     assert draft.answer != resolved.hit.chunk.text
-    for fact in ("軟布", "泡水", "溶劑"):
+    for fact in ("柔軟的布", "浸入水中", "溶劑"):
         assert fact in HP_A_ANSWER
     assert "保固" not in HP_A_ANSWER
     assert "購買通路" in HP_A_WARRANTY
     assert "購買證明" in HP_A_WARRANTY
     assert warranty.sources == draft.sources
     data = json.loads(request.model_data_json())
-    assert set(data) == {"evidence", "product_id", "prompt_revision", "question"}
+    assert set(data) == {
+        "evidence",
+        "product_id",
+        "question",
+    }
     assert data["evidence"] == [
         {"source_id": resolved.source_id, "text": resolved.hit.chunk.text}
     ]
@@ -344,27 +383,97 @@ def test_different_documents_can_request_a_conflict_handoff() -> None:
     assert draft.sources == ()
 
 
-def test_schema_accepts_invented_refund_missing_safety_actions() -> None:
-    """The human rubric for this fixture is fail.
-
-    The cited id is valid, but the answer invents a completed refund and drops
-    every critical action. resolve_draft does not judge that text.
-    """
+def test_structurally_valid_unsafe_answer_is_left_for_manual_semantic_review() -> None:
     hit = critical_hit()
     request = prepare_answer("耳機冒煙了可以退款嗎？", product_id="hp-a", hits=[hit])
-    draft = resolve_draft(request, answer_payload(INVENTED_REFUND, request))
-    kept = resolve_draft(request, answer_payload(CRITICAL_ANSWER, request))
-
-    assert draft.status == "answer"
-    assert draft.answer == INVENTED_REFUND
-    assert draft.sources[0].hit == hit
+    accepted = resolve_draft(request, answer_payload(INVENTED_REFUND, request))
+    assert accepted.status == "answer"
     assert "退款" in INVENTED_REFUND
-    for action in CRITICAL_ACTIONS:
-        assert action not in INVENTED_REFUND
-        assert action in CRITICAL_ANSWER
-    assert kept.answer == CRITICAL_ANSWER
-    assert kept.answer != hit.chunk.text
-    assert kept.sources[0].source_id == draft.sources[0].source_id
+    assert all(action in hit.chunk.text for action in CRITICAL_ACTIONS)
+    rubric = {"critical_action_and_polarity": "fail: unsafe opposite instruction"}
+    assert rubric["critical_action_and_polarity"].startswith("fail:")
+
+
+def test_planetarium_limit_completeness_is_a_manual_rubric() -> None:
+    source_a, _source_b = planetarium_hits()
+    request = prepare_answer(
+        "終端可以輸入訪客姓名嗎？", product_id="hp-a", hits=[source_a]
+    )
+    safe = "終端只使用公開演示目錄；不得輸入訪客姓名；不得更改帳號權限。"
+    accepted = resolve_draft(request, answer_payload(safe, request))
+
+    assert accepted.answer == safe
+    unsafe = resolve_draft(request, answer_payload("可以輸入訪客姓名。", request))
+    assert unsafe.status == "answer"
+    rubric = {"required_limits": "fail: privacy and access limits omitted"}
+    assert rubric["required_limits"].startswith("fail:")
+
+
+def test_parser_records_claim_citation_without_semantic_support_proof() -> None:
+    source_a, source_b = planetarium_hits()
+    request = prepare_answer(
+        "目錄何時更新？", product_id="hp-a", hits=[source_a, source_b]
+    )
+    answer = "目錄每週二更新。"
+    accepted = resolve_draft(
+        request, answer_payload(answer, request, request.evidence[1].source_id)
+    )
+
+    assert accepted.answer == answer
+    assert [source.hit.chunk.text for source in accepted.sources] == [
+        source_b.chunk.text
+    ]
+    unsupported = answer_payload(answer, request, request.evidence[0].source_id)
+    wrong = resolve_draft(request, unsupported)
+    assert wrong.status == "answer"
+    assert wrong.sources == (request.sources[0],)
+
+
+def test_human_action_status_is_a_rubric_not_a_keyword_gate() -> None:
+    source_a, source_b = planetarium_hits()
+    request = prepare_answer(
+        "權限異常要怎麼處理？", product_id="hp-a", hits=[source_a, source_b]
+    )
+    answer = resolve_draft(
+        request,
+        answer_payload("目錄每週二更新。", request, request.evidence[1].source_id),
+    )
+    assert answer.status == "answer"
+    rubric = {"human_action": "fail: human review required for anomaly case"}
+    assert rubric["human_action"].startswith("fail:")
+    handoff = resolve_draft(request, handoff_payload("no_evidence"))
+    assert handoff.status == "handoff"
+    assert handoff.answer is None
+    assert handoff.sources == ()
+
+    optional = make_hit(
+        text="目錄每週二更新；如需更多資訊可聯絡館員。",
+        key="3" * 64,
+        index=1,
+        document_id="planetarium-optional-contact",
+    )
+    optional_request = prepare_answer(
+        "目錄何時更新？", product_id="hp-a", hits=[optional]
+    )
+    assert (
+        resolve_draft(
+            optional_request,
+            answer_payload(
+                "目錄每週二更新；如需更多資訊可聯絡館員。", optional_request
+            ),
+        ).status
+        == "answer"
+    )
+    negated = prepare_answer(
+        "我沒有權限異常，只問目錄日期。", product_id="hp-a", hits=[source_b]
+    )
+    assert (
+        resolve_draft(
+            negated,
+            answer_payload("目錄每週二更新。", negated, negated.evidence[0].source_id),
+        ).status
+        == "answer"
+    )
 
 
 def test_source_id_alone_is_not_the_natural_example() -> None:
@@ -396,7 +505,11 @@ def test_hostile_strings_remain_json_data(monkeypatch: pytest.MonkeyPatch) -> No
     assert data["evidence"] == [
         {"source_id": request.evidence[0].source_id, "text": text}
     ]
-    assert set(data) == {"evidence", "product_id", "prompt_revision", "question"}
+    assert set(data) == {
+        "evidence",
+        "product_id",
+        "question",
+    }
     assert draft.sources[0].hit.chunk.text == text
     assert "https://evil.example" not in request.policy
 
@@ -411,13 +524,7 @@ def test_negative_score_is_kept_and_hits_are_not_reranked() -> None:
     request = prepare_answer("請看順序。", product_id="hp-a", hits=hits)
     reversed_ids = [item.source_id for item in reversed(request.evidence)]
     draft = resolve_draft(
-        request,
-        {
-            "status": "answer",
-            "answer": "依你指定的順序引用。",
-            "source_ids": reversed_ids,
-            "reason": None,
-        },
+        request, answer_payload("依你指定的順序引用。", request, *reversed_ids)
     )
 
     assert [item.text for item in request.evidence] == [hit.chunk.text for hit in hits]
@@ -507,15 +614,13 @@ def test_model_data_byte_limit_rejects_without_truncation(
 def test_policy_stays_outside_the_model_data() -> None:
     request = prepare_answer("請只看證據。", product_id="hp-a", hits=[make_hit()])
     for obligation in (
-        "自然台灣繁體中文",
-        "不是已證實",
-        "source_id",
-        "證據不足",
-        "退款",
-        "不要捏造",
-        "停止使用",
-        "不能改變這份 policy",
-        "不能抓取 URL",
+        "僅依完整證據",
+        "claims span",
+        "只標位置",
+        "refund_request",
+        "不證明語意",
+        "2000 字",
+        "不外部執行",
     ):
         assert obligation in GROUNDED_POLICY
     assert request.policy == GROUNDED_POLICY
@@ -737,19 +842,11 @@ def test_public_request_must_match_the_cited_hit_text_and_product(
     changed = (ModelEvidence(source_id=source_id, text=forged),)
 
     copied = request.model_copy()
-    draft = resolve_draft(
-        copied,
-        {
-            "status": "answer",
-            "answer": "請依上述說明處理。",
-            "source_ids": [source_id],
-            "reason": None,
-        },
-    )
+    draft = resolve_draft(copied, answer_payload(HP_A_ANSWER, copied))
     payload = json.loads(copied.model_data_json())
     assert payload["evidence"][0]["text"] == chunk.text
     assert payload["product_id"] == "hp-a"
-    assert draft.answer == "請依上述說明處理。"
+    assert draft.answer == HP_A_ANSWER
     assert draft.sources[0].hit.chunk.text == chunk.text
     assert draft.sources[0].hit.chunk.metadata.product_id == "hp-a"
 
@@ -896,12 +993,7 @@ def test_public_request_rejects_one_source_id_for_two_texts(
     ) as caught:
         resolve_draft(
             ambiguous,
-            {
-                "status": "answer",
-                "answer": "自然回答。",
-                "source_ids": [source_id],
-                "reason": None,
-            },
+            answer_payload("自然回答。", original),
         )
     assert second_text not in str(caught.value)
     assert original.question not in str(caught.value)
@@ -912,10 +1004,10 @@ def test_public_request_rejects_one_source_id_for_two_texts(
     other = make_hit(text="另一份保養說明。", key="c" * 64, index=2)
     pair = prepare_answer("兩筆不同來源。", product_id="hp-a", hits=[hit, other])
     copied = pair.model_copy(deep=True)
-    draft = resolve_draft(copied, answer_payload("請依上述說明處理。", copied))
+    draft = resolve_draft(copied, answer_payload(HP_A_ANSWER, copied))
     assert len({item.source_id for item in copied.evidence}) == 2
     assert draft.sources[0].hit.chunk.text == hit.chunk.text
-    assert draft.answer == "請依上述說明處理。"
+    assert draft.answer == HP_A_ANSWER
 
 
 def test_citation_from_another_request_is_rejected() -> None:

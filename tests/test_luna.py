@@ -21,6 +21,7 @@ from customer_support_rag.budget import (
 )
 from customer_support_rag.knowledge.answering import (
     GROUNDED_POLICY,
+    PROMPT_REVISION,
     prepare_answer,
     resolve_draft,
 )
@@ -42,6 +43,7 @@ from customer_support_rag.knowledge.retrieval import ExactCosineIndex, Retrieval
 from customer_support_rag.knowledge.storage import EmbeddingStore
 from customer_support_rag.luna import (
     DRAFT_SCHEMA,
+    MAX_INPUT_TOKENS,
     MAX_RESPONSE_BYTES,
     MODEL,
     WIRE_FUDGE,
@@ -49,16 +51,16 @@ from customer_support_rag.luna import (
     build_luna_body,
     generate_draft,
     input_reservation,
-    parse_luna_output,
     parse_usage,
     responses_client,
     wire_bytes,
+    wire_composition,
 )
 
 KNOWLEDGE = Path(__file__).parents[1] / "knowledge"
 DIGEST = "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"
 KEY = "synthetic-key-not-live"
-HP_A_ANSWER = "請用乾燥的軟布擦拭，耳機不可泡水，也別用溶劑清潔。"
+HP_A_ANSWER = "使用後以乾燥柔軟的布擦拭耳罩。請勿將耳機浸入水中，也不要使用溶劑清潔。"
 HP_B_FIRST = "請先確認耳機電量，再到藍牙設定移除舊配對，然後重新配對。"
 HP_B_FOLLOW = "請重新啟動播放裝置，並查閱製造商提供的說明。"
 CRITICAL = "若出現異味或冒煙，請停止使用、停止充電，並聯絡人工。"
@@ -125,12 +127,21 @@ def basic_usage() -> dict[str, object]:
 
 
 def answer_text(answer: str, source_id: str) -> str:
+    quote = "請勿將耳機浸入水中，也不要使用溶劑清潔。"
     return json.dumps(
         {
             "status": "answer",
             "answer": answer,
-            "source_ids": [source_id],
             "reason": None,
+            "claims": [
+                {
+                    "answer_start": 0,
+                    "answer_end": len(answer),
+                    "source_id": source_id,
+                    "source_start": 23,
+                    "source_end": 23 + len(quote),
+                }
+            ],
         },
         ensure_ascii=False,
     )
@@ -278,12 +289,175 @@ def test_hp_a_mock_http_settles_and_resolves_the_original_source(
     assert source_row.hit.chunk.index == 1
     assert (source_row.hit.chunk.char_start, source_row.hit.chunk.char_end) == (1, 71)
     assert source_row.hit.chunk.metadata.document_id == "hp-a-care"
-    for fact in ("軟布", "泡水", "溶劑"):
+    for fact in ("柔軟的布", "浸入水中", "溶劑"):
         assert fact in draft.answer
     row = states(ledger_path)[0]
     assert row["state"] == "settled"
     assert row["used_input"] == 12
     assert KEY.encode() not in ledger_path.read_bytes()
+
+
+@pytest.mark.parametrize(
+    ("case_name", "expected"),
+    [
+        ("valid-answer", "answer"),
+        ("valid-handoff", "handoff"),
+        ("handoff-text-and-source", "invalid_model_schema"),
+        ("handoff-text-only", "invalid_model_schema"),
+        ("handoff-source-only", "invalid_model_schema"),
+        ("handoff-null-reason", "invalid_model_schema"),
+        ("handoff-invalid-reason", "invalid_model_schema"),
+        ("answer-null-text", "invalid_model_schema"),
+        ("answer-blank-text", "invalid_model_schema"),
+        ("answer-with-reason", "invalid_model_schema"),
+        ("answer-without-sources", "invalid_model_schema"),
+        ("answer-duplicate-sources", "invalid_model_schema"),
+        ("answer-overlong", "invalid_model_schema"),
+        ("unknown-source-remains-rejected", "unknown_citation"),
+    ],
+)
+def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
+    tmp_path: Path, case_name: str, expected: str
+) -> None:
+    document = KnowledgeDocument(
+        metadata=KnowledgeMetadata(
+            document_id="museum-catalogue",
+            product_id="hp-a",
+            version="1",
+            title="Invented museum catalogue",
+            synthetic=True,
+        ),
+        body=(
+            "# Catalogue desk\n\n"
+            "The museum catalogue desk handles astronomy booklet enquiries.\n"
+        ),
+    )
+    chunk = next(item for item in chunk_document(document) if item.text.strip())
+    hit = RetrievalHit(artifact_key="f" * 64, chunk=chunk, raw_score=0.0)
+    request = prepare_answer(
+        "Which desk handles astronomy catalogue questions?",
+        product_id="hp-a",
+        hits=[hit],
+    )
+    source_id = request.evidence[0].source_id
+    evidence_text = request.evidence[0].text
+    claim = {
+        "answer_start": 0,
+        "answer_end": len("Ask the museum catalogue desk."),
+        "source_id": source_id,
+        "source_start": 0,
+        "source_end": len(evidence_text),
+    }
+    if case_name.startswith("handoff") or case_name == "valid-handoff":
+        payload: dict[str, object] = {
+            "status": "handoff",
+            "answer": None,
+            "reason": "conflicting_evidence",
+            "claims": [],
+        }
+        if case_name == "handoff-text-and-source":
+            payload.update(answer="Ask the museum catalogue desk.", claims=[claim])
+        elif case_name == "handoff-text-only":
+            payload["answer"] = "Ask the museum catalogue desk."
+        elif case_name == "handoff-source-only":
+            payload["claims"] = [claim]
+        elif case_name == "handoff-null-reason":
+            payload["reason"] = None
+        elif case_name == "handoff-invalid-reason":
+            payload["reason"] = "not-a-handoff-reason"
+    else:
+        payload = {
+            "status": "answer",
+            "answer": "Ask the museum catalogue desk.",
+            "reason": None,
+            "claims": [claim],
+        }
+        if case_name == "answer-null-text":
+            payload["answer"] = None
+        elif case_name == "answer-blank-text":
+            payload["answer"] = "   "
+        elif case_name == "answer-with-reason":
+            payload["reason"] = "no_evidence"
+        elif case_name == "answer-without-sources":
+            payload["claims"] = []
+        elif case_name == "answer-duplicate-sources":
+            payload["claims"] = [claim, claim]
+        elif case_name == "answer-overlong":
+            payload["answer"] = "x" * 2001
+        elif case_name == "unknown-source-remains-rejected":
+            payload["claims"] = [{**claim, "source_id": "ev:" + "a" * 64 + ":1"}]
+    spy = Spy(
+        httpx.Response(200, json=envelope(json.dumps(payload, ensure_ascii=False)))
+    )
+    _ledger_path, result = run_draft(tmp_path / case_name, request, spy, case_name)
+
+    assert len(spy.calls) == 1
+    sent = json.loads(spy.calls[0].content)
+    assert sent["instructions"] == GROUNDED_POLICY
+    model_data = json.loads(sent["input"][0]["content"][0]["text"])
+    assert model_data == json.loads(request.model_data_json())
+    assert "prompt_revision" not in model_data
+    assert request.prompt_revision == PROMPT_REVISION == "grounded-draft-v4"
+    for instruction in (
+        "handoff",
+        "claims=[]",
+        "answer: 非空且不超 2000 字",
+        "可同義改寫",
+        "相反許可",
+        "實際來源",
+    ):
+        assert instruction in sent["instructions"]
+    schema = sent["text"]["format"]["schema"]
+    assert schema["type"] == "object"
+    assert schema["additionalProperties"] is False
+    assert set(schema["required"]) == {"status", "answer", "reason", "claims"}
+    assert set(schema["properties"]) == {"status", "answer", "reason", "claims"}
+    assert "anyOf" not in schema["properties"]["claims"]
+    for unsupported in (
+        "allOf",
+        "not",
+        "dependentRequired",
+        "dependentSchemas",
+        "if",
+        "then",
+        "else",
+    ):
+        assert unsupported not in schema
+    if expected in {"answer", "handoff"}:
+        assert result.status == expected
+    else:
+        assert isinstance(result, LunaError)
+        assert result.code == expected
+
+
+def test_policy_v2_complete_evidence_fits_the_existing_wire_bound() -> None:
+    sources = (
+        ("a" * 64, "drafts/hp-a/return-policy-v2.md"),
+        ("b" * 64, "hp-a/headphone-care.md"),
+    )
+    hits = []
+    for artifact_key, relative_path in sources:
+        document = read_document(KNOWLEDGE, relative_path)
+        chunks = [chunk for chunk in chunk_document(document) if chunk.text.strip()]
+        assert len(chunks) == 1
+        hits.append(
+            RetrievalHit(artifact_key=artifact_key, chunk=chunks[0], raw_score=0.2)
+        )
+
+    request = prepare_answer(
+        "未拆封商品可在購買後14日內申請退貨嗎？",
+        product_id="hp-a",
+        hits=hits,
+    )
+    wire = wire_composition(request)
+    model_data = json.loads(request.model_data_json())
+
+    assert wire.total_bytes + WIRE_FUDGE <= MAX_INPUT_TOKENS
+    assert model_data["question"] == "未拆封商品可在購買後14日內申請退貨嗎？"
+    assert model_data["product_id"] == "hp-a"
+    assert [item["text"] for item in model_data["evidence"]] == [
+        hit.chunk.text for hit in hits
+    ]
 
 
 def test_empty_hits_do_not_reserve_or_call_http(tmp_path: Path) -> None:
@@ -766,60 +940,30 @@ def test_client_disables_env_proxy_and_redirects() -> None:
     asyncio.run(client.aclose())
 
 
-def test_schema_can_pass_a_claim_that_fails_human_review(tmp_path: Path) -> None:
-    """Human rubric: invented refund and a missed critical action stay failures.
-
-    The assertions record that boundary. They do not make schema a safety check.
-    """
-    care = _product_request("hp-a/headphone-care.md", "HP-A 耳機可以用水洗嗎？", "hp-a")
-    connection = _product_request(
-        "hp-b/connection-troubleshooting.md", "HP-B 無法連線時先做什麼？", "hp-b"
-    )
-    follow = _product_request(
-        "hp-b/connection-troubleshooting.md", "HP-B 仍不能連線時怎麼辦？", "hp-b"
-    )
+def test_valid_span_does_not_make_unsafe_semantics_a_parser_failure() -> None:
+    """Semantic safety and handoff intent remain human-review judgments."""
     critical = _critical_request()
-    for request, answer, facts in (
-        (connection, HP_B_FIRST, ("電量", "舊配對", "配對")),
-        (follow, HP_B_FOLLOW, ("重新啟動", "製造商")),
-        (critical, CRITICAL, ("停止使用", "停止充電", "聯絡人工")),
-    ):
-        draft = resolve_draft(
-            request,
-            {
-                "status": "answer",
-                "answer": answer,
-                "source_ids": [request.evidence[0].source_id],
-                "reason": None,
-            },
-        )
-        for fact in facts:
-            assert fact in draft.answer
-    refund = resolve_draft(
-        care,
+    source = critical.evidence[0]
+    draft = resolve_draft(
+        critical,
         {
-            "status": "handoff",
-            "answer": None,
-            "source_ids": [],
-            "reason": "refund_request",
+            "status": "answer",
+            "answer": "繼續使用即可。",
+            "reason": None,
+            "claims": [
+                {
+                    "answer_start": 0,
+                    "answer_end": len("繼續使用即可。"),
+                    "source_id": source.source_id,
+                    "source_start": 0,
+                    "source_end": len(source.text),
+                }
+            ],
         },
     )
-    assert refund.reason == "refund_request"
-    spy = Spy(
-        httpx.Response(
-            200,
-            json=envelope(answer_text(INVENTED, critical.evidence[0].source_id)),
-        )
-    )
-    path, draft = run_draft(tmp_path, critical, spy, "invented")
-    assert draft.answer == INVENTED
-    assert "全額退款" in draft.answer
-    assert "停止使用" not in draft.answer
-    assert states(path)[0]["state"] == "settled"
-    parsed = parse_luna_output(
-        envelope(answer_text(INVENTED, critical.evidence[0].source_id)), critical
-    )
-    assert parsed.sources[0].source_id == critical.evidence[0].source_id
+    assert draft.status == "answer"
+    manual_rubric = "fail: source says stop use, stop charging, and contact a human"
+    assert manual_rubric.startswith("fail:")
 
 
 def test_loader_ignores_environment_and_a_neighbor_file(
