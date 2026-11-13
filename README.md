@@ -4,7 +4,7 @@
 
 ## 目前狀態
 
-截至 PR #15 合併後的 main（`f7ec860a01ad447a9cb639fcb474b597b62f4fc6`），知識維護 CLI、`POST /ask`、`POST /assist` 與本機頁面已在程式中。PoC 仍未完成 P2 驗收：既有安全／語意失敗與未驗項保留，FAQ absent baseline 的舊錯誤根因未知，FAQ present 與 policy v1/v2 尚未完成驗證；sealed 評估不代表通過。既有真 embedding 候選尚未取得 release approval，也未啟用。離線 rehearsal 與 PR #15 的修補都不代表產品驗收完成；沒有解除 security hold。
+截至 PR #15 合併後的 main（[`f7ec860a01ad447a9cb639fcb474b597b62f4fc6`](https://github.com/bing-kuo/customer-support-rag/commit/f7ec860a01ad447a9cb639fcb474b597b62f4fc6)），知識維護 CLI、`POST /ask`、`POST /assist` 與本機頁面已在程式中。PoC 仍未完成 P2 驗收：既有安全／語意失敗與未驗項保留，FAQ absent baseline 的舊錯誤根因未知，FAQ present 與 policy v1/v2 尚未完成驗證；sealed 評估不代表通過。既有真 embedding 候選尚未取得 release approval，也未啟用。離線 rehearsal 與 PR #15 的修補都不代表產品驗收完成；沒有解除 security hold。
 
 已有兩筆可查的歷史單題 live 成功：PR [#11](https://github.com/bing-kuo/customer-support-rag/pull/11) 在當時的單題入口取得自然回答；PR [#12](https://github.com/bing-kuo/customer-support-rag/pull/12) 的舊版一般 `POST /ask` 也曾對一題取得 HTTP 200 與來源引用。兩筆都記錄 `usage: null`、`unknown_billing_component`，只證明當時單題路徑曾走通，不是整體品質或 P2 驗收。它們的程式 SHA 早於目前 main；PR #15 沒有重新執行 live 問答，不能推論目前版本的生成品質已通過。PR [#13](https://github.com/bing-kuo/customer-support-rag/pull/13) 另記錄了 UI 單題 live；公開 PR 記錄指出當時的畫面檔留在本機、未附為 GitHub 可檢視圖片，因此這份 README 不將它當作可公開的圖片證據。
 
@@ -81,7 +81,9 @@ uv run --locked python -m customer_support_rag.maintenance status \
 
 真實候選須先由授權 reviewer 核准文件 bytes 與 release manifest、資料庫及 regression hashes，再使用 `consume-document`／`consume-release`。只有已消費的真實 release approval 才可手動 `activate`。切換前讀取 `status`，`--expect` 必須是目前 `active.json` bytes 的 SHA-256；首次切換才使用 `--expect-none`。若結果為 `activated_unconfirmed`，先再查 `status`；若 pointer 已指向目標 release，不要以舊 `--expect` 重送。舊 snapshot 保留，除非另有明確授權，不要刪除。這些是真實環境操作說明，rehearsal 不會對真 workspace 執行。
 
-完整的初次 build、same-input no-op/reuse、FAQ 更新、evaluate、release 核准、activate 與 serving 啟動命令見[交付指南](docs/reproducible-delivery.md)。其中 `--embed ollama` 會呼叫本機 embedding model；範例是操作者參考流程，不是 P3 rehearsal，亦非本 PR 執行授權。PR #15 的 rehearsal 沒有呼叫 Luna 或啟用真候選；歷史單題 live 記錄見上方 PR #11、#12、#13，不能視為目前版本或完整品質驗收。
+完整的初次 build、same-input no-op/reuse、FAQ 更新、evaluate、release 核准、activate 與 serving 啟動命令見[交付指南](docs/reproducible-delivery.md)。其中 `--embed ollama` 會呼叫本機 embedding model；範例是操作者參考流程，不是 P3 rehearsal，亦非本 PR 執行授權。PR #15 合併版本的 rehearsal 沒有呼叫 Luna 或啟用真候選；歷史單題 live 記錄見上方 PR #11、#12、#13，不能視為目前版本或完整品質驗收。
+
+文章完整說明架構取捨、歷史 mock/live 證據及仍未驗證的範圍，見[PoC 收尾文章](docs/poc-closeout-article.md)。
 
 ## 故障與恢復
 
