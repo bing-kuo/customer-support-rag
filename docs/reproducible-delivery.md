@@ -164,14 +164,32 @@ uv run --locked python -m customer_support_rag.maintenance activate \
 - Answer 可在 `usage=null` 且 `usage_code` 有值時回傳。未知 usage 不等於零；保存 request ID 和安全錯誤碼，向 provider 核對後再決定下一步。
 - 不刪除舊 release snapshot。狀態未知時先執行 `status`，不以舊 expected pointer 重播 activate。
 
-## 生成輸出契約版本
+## 自然草稿契約與人工判讀（D-018 方案 A）
 
-本輪固定 instruction 版本為 `grounded-draft-v3`，policy UTF-8 SHA-256 為 `8871fd5579e1b8047ad69d2819c1acae32821907ebb793602a10a865acb74dc7`。Structured Outputs root 仍是 object；schema 有四個 required 欄位 `status`、`answer`、`reason`、`claims`，巢狀 claim 欄位記錄 answer 字元範圍、source ID、證據字元範圍與限制 ID。Canonical JSON（UTF-8、`sort_keys=true`、`separators=(',', ':')`）為 744 bytes，SHA-256 `03b18ba9205d3d27e54f2770fa80a13f540ed065f4140e101d5b0da4e61fb784`。schema 不宣稱強制跨欄位分支；本機 parser 會驗 answer 範圍完整覆蓋、來源／span 邊界、引用來源、限制 coverage、handoff 欄位一致性與可信 request-side handoff。錯誤仍固定分類，不修補、不 retry。
+內部 instruction 版本為 `grounded-draft-v4`，policy UTF-8 SHA-256 為 `86725336893b40324b0984a0f1eab9f1447dcda78f27634652f01204ba93c385`；canonical schema 是 677 bytes，SHA-256 `3bb66f4947eb708ff91476ebb60fc7542703bd112eb79c9941dc154f2e20f341`。公開 `AskResponse`、`CitedSource`、`/assist` 與 web API 形狀不變。Responses schema 仍是 flat object：root `status`、`answer`、`reason`、`claims`；每個 claim 只有 answer/source 字元 offsets 與 source ID，沒有 `required_limits`、`required_handoff` 或 `limit_ids`。嚴格 parser 拒絕額外欄位、未知來源、無效或不完整 span、未覆蓋的 answer，以及不一致的 handoff 欄位；它不做自然語言蘊含判斷。
 
-一般 `/ask` 在已選 snapshot 的唯讀來源文件上核對 artifact key、product、version、body hash，並檢查來源限制是否完整落在已選 whole-chunk evidence 中。若限制被 chunk／1200 字元 evidence budget 遺漏，或已知請求條件需要人工處理，先回既有 handoff，不呼叫 Luna；未超過原 16 KiB payload、Responses byte-based reservation、request/response limits。必要限制需在回答完整照錄；其他答案仍可自然改寫。public `AskResponse`／`CitedSource` 與 web API 未變，回答引用來源由經校驗的 claim span 推導。
+模型 instruction 要求自然改寫，保留本題相關的條件、禁止、必做與停止指示，允許語意等價說法，不能新增或反轉許可；證據不足、衝突或只有人工可完成的處置時要求 handoff。這是生成指令，不是 schema 或本機 parser 能保證的規則。草稿需要客服打開實際來源核對；現有 UI 沒有強制人工放行，不能稱為無人監督服務。
 
-全新 planetarium mock：來源 A「終端只使用公開演示目錄；不得輸入訪客姓名；不得更改帳號權限」，來源 B「目錄每週二更新；權限異常由館員確認」。不安全前例省略姓名／權限限制，parser 拒絕缺少 required-limit coverage；無法完整提供整句的 chunk／budget case 在送模前 handoff。正向日期 mock 將 `目錄每週二更新。` 的 claim span 對到來源 B 精確文字，公開引用只列來源 B；要求處理權限異常時，request-side handoff=true，答案草稿被拒並回 handoff。另驗可選「如需更多資訊可聯絡館員」不會單靠字樣強制 handoff。
+### 程式可驗與需人工判讀
 
-Span identity、bounds 與 coverage 是結構性必要檢查，不是通用語意蘊含證明；model 所回的來源對應不能代替人工逐 claim 核對語意。上述正反例是新 synthetic fixture 的人工核讀與 MockTransport 回歸，不代表真模型改善。舊候選 build SHA `0cb3a9a`、舊錯誤／holdout 污染與原生成結論均未改寫。未來已授權評測需 sidecar 另外連結 candidate build SHA、manifest/DB hashes、evaluation SHA/tree、suite/rubric、prompt/schema hash 與 request/response artifact hashes。
+| 檢查 | 程式可驗 | 不可由 span／關鍵字自動保證 |
+| --- | --- | --- |
+| 來源 | artifact、商品、版本、正文 hash、chunk offsets 與原始 body 對得上 | 檢索是否找到了跨文件的所有相關內容 |
+| 引用 | citation ID 必須屬於本次完整 evidence；claim span 在 answer 與來源範圍內；claims 完整覆蓋 answer | span 的內容是否真的支持該 claim、否定／條件是否被解反 |
+| 限制 | 從同一已命中文件提供全部非空原始 chunks，不挑 marker 句、不截斷；整包需在原 4 evidence、1200 字元與 wire limits 內 | 必要限制是否適用本問題、自然改寫是否保留其意思 |
+| 處置 | answer/handoff JSON 的欄位組合、reason enum 與 schema | 是否應交人工、同義異常、否定條件及可選聯絡語句的意圖 |
 
-固定 HP-A wire fixture 為 2,505 bytes；依既有 byte-based reservation headroom 為 55 units。較長 question/evidence 仍依舊界線拒絕或在證據準備階段 fail closed；沒有提高預留或自動截斷。
+`/ask` 僅對已由原檢索選中的文件擴展完整 chunk bundle，不宣稱找到所有跨文件依賴。store 回讀的 artifact／product／version／body hash 需一致，並以相同 chunker 驗證所有原始 chunks、順序、文字與 offset。若 bundle 缺段、身分不符、超過 4 個 chunks、1200 字元、模型資料或 wire 上限，會在呼叫 Luna 前 fail closed；不提高上限、不靜默省略、不截句，也不以 marker 猜限制無關。這種容量 handoff 與語意判定 handoff 不同；UI 的現有 reason enum 不提供更細的使用者解釋。
+
+### 全新天文館 mock 與人工 rubric
+
+synthetic source A：「終端只使用公開演示目錄；不得輸入訪客姓名；不得更改帳號權限。」source B：「目錄每週二更新；權限異常由館員確認。」以下例子只示範 parser 邊界和人工 rubric，不是模型能力結果：
+
+- **結構合法、語意錯誤：**回答「目錄每週二更新。」卻引用只寫終端位置的 A，或對「不得輸入訪客姓名」回答「可以輸入」。span 合法且 parser 會接受；rubric 分別判「claim support fail」與「極性／限制 fail」。不可將 parser 綠燈算成 D24／D25 通過。
+- **人工處置：**「權限異常要怎麼處理？」若模型回 `status=answer`，即使寫出館員資訊也由 rubric 判 status/意圖不符；依語意等價方式回答館員處置的 `status=handoff` 可供人工核查。單純問「目錄哪天更新？」時，source B 的「如需更多資訊可聯絡館員」屬可選語句，不應只因關鍵字自動 handoff。
+- **自然答案：**`「目錄每週二更新。」` 配 source B 是正常 mock 結構案例；實際語意正確性仍依原文人工確認。
+- **D25 限制：**來源寫「資料錯置時，立即停止輸入，交館員確認；請勿提供證件號碼。」回答漏掉停止／隱私限制或反向要求輸入，即人工 fail；不要求對無關的日期問題逐字重述整份來源。
+
+這輪從舊 parser 移除 marker-based 限制覆蓋、模型自報 limit IDs 與 bigram-based 人工分支。固定 instruction 保留生成要求，但不以模型自稱已涵蓋作為證明。測試分開記錄自動結構檢查與作者設定的 synthetic 人工 rubric；後者不是獨立 reviewer 對真生成的品質驗收。真生成改善尚未驗證，D24–D26 的語意品質不能標 pass。P2 acceptance-open/security hold、候選 build SHA `0cb3a9a`、09e 歷史評估及其錯誤／污染狀態均未改寫、重算或啟用。
+
+固定 HP-A wire fixture 在 v4 policy/schema 下為 2,337 bytes；policy 836、data 415、schema 677、framing 409 bytes。byte-based reservation headroom 仍為 223 units。較長 evidence 仍會依原界線拒絕或在證據準備階段 fail closed；沒有提高預留或自動截斷。

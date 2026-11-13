@@ -150,11 +150,6 @@ def answer_payload(
                 "source_id": source_id,
                 "source_start": 0,
                 "source_end": len(source_text) if source_text else 1,
-                "limit_ids": [
-                    limit.limit_id
-                    for limit in request.required_limits
-                    if limit.source_id == source_id
-                ],
             }
         )
     return {
@@ -274,7 +269,6 @@ def test_hp_a_mock_chain_uses_search_and_keeps_the_database(
         "product_id",
         "prompt_revision",
         "question",
-        "required_limits",
     }
     assert data["evidence"] == [
         {"source_id": resolved.source_id, "text": resolved.hit.chunk.text}
@@ -390,22 +384,18 @@ def test_different_documents_can_request_a_conflict_handoff() -> None:
     assert draft.sources == ()
 
 
-def test_required_safety_limit_and_human_status_cannot_be_omitted() -> None:
+def test_structurally_valid_unsafe_answer_is_left_for_manual_semantic_review() -> None:
     hit = critical_hit()
     request = prepare_answer("耳機冒煙了可以退款嗎？", product_id="hp-a", hits=[hit])
-    with pytest.raises(DraftValidationError, match="required handoff"):
-        resolve_draft(request, answer_payload(INVENTED_REFUND, request))
-    with pytest.raises(DraftValidationError, match="required handoff"):
-        resolve_draft(request, answer_payload(CRITICAL_ANSWER, request))
-
+    accepted = resolve_draft(request, answer_payload(INVENTED_REFUND, request))
+    assert accepted.status == "answer"
     assert "退款" in INVENTED_REFUND
-    for action in CRITICAL_ACTIONS:
-        assert action not in INVENTED_REFUND
-        assert action in CRITICAL_ANSWER
-    assert request.required_limits[0].quote in hit.chunk.text
+    assert all(action in hit.chunk.text for action in CRITICAL_ACTIONS)
+    rubric = {"critical_action_and_polarity": "fail: unsafe opposite instruction"}
+    assert rubric["critical_action_and_polarity"].startswith("fail:")
 
 
-def test_planetarium_answer_preserves_all_source_limits() -> None:
+def test_planetarium_limit_completeness_is_a_manual_rubric() -> None:
     source_a, _source_b = planetarium_hits()
     request = prepare_answer(
         "終端可以輸入訪客姓名嗎？", product_id="hp-a", hits=[source_a]
@@ -414,13 +404,13 @@ def test_planetarium_answer_preserves_all_source_limits() -> None:
     accepted = resolve_draft(request, answer_payload(safe, request))
 
     assert accepted.answer == safe
-    assert len(request.required_limits) == 1
-    assert request.required_limits[0].quote == source_a.chunk.text
-    with pytest.raises(DraftValidationError, match="required limit"):
-        resolve_draft(request, answer_payload("可以輸入訪客姓名。", request))
+    unsafe = resolve_draft(request, answer_payload("可以輸入訪客姓名。", request))
+    assert unsafe.status == "answer"
+    rubric = {"required_limits": "fail: privacy and access limits omitted"}
+    assert rubric["required_limits"].startswith("fail:")
 
 
-def test_planetarium_citation_comes_from_the_source_for_its_claim() -> None:
+def test_parser_records_claim_citation_without_semantic_support_proof() -> None:
     source_a, source_b = planetarium_hits()
     request = prepare_answer(
         "目錄何時更新？", product_id="hp-a", hits=[source_a, source_b]
@@ -435,21 +425,23 @@ def test_planetarium_citation_comes_from_the_source_for_its_claim() -> None:
         source_b.chunk.text
     ]
     unsupported = answer_payload(answer, request, request.evidence[0].source_id)
-    with pytest.raises(DraftValidationError, match="required limit"):
-        resolve_draft(request, unsupported)
+    wrong = resolve_draft(request, unsupported)
+    assert wrong.status == "answer"
+    assert wrong.sources == (request.sources[0],)
 
 
-def test_planetarium_human_action_controls_status_without_keyword_overreach() -> None:
+def test_human_action_status_is_a_rubric_not_a_keyword_gate() -> None:
     source_a, source_b = planetarium_hits()
     request = prepare_answer(
         "權限異常要怎麼處理？", product_id="hp-a", hits=[source_a, source_b]
     )
-    assert request.required_handoff
-    with pytest.raises(DraftValidationError, match="required handoff"):
-        resolve_draft(
-            request,
-            answer_payload("目錄每週二更新。", request, request.evidence[1].source_id),
-        )
+    answer = resolve_draft(
+        request,
+        answer_payload("目錄每週二更新。", request, request.evidence[1].source_id),
+    )
+    assert answer.status == "answer"
+    rubric = {"human_action": "fail: human review required for anomaly case"}
+    assert rubric["human_action"].startswith("fail:")
     handoff = resolve_draft(request, handoff_payload("no_evidence"))
     assert handoff.status == "handoff"
     assert handoff.answer is None
@@ -464,13 +456,22 @@ def test_planetarium_human_action_controls_status_without_keyword_overreach() ->
     optional_request = prepare_answer(
         "目錄何時更新？", product_id="hp-a", hits=[optional]
     )
-    assert not optional_request.required_handoff
     assert (
         resolve_draft(
             optional_request,
             answer_payload(
                 "目錄每週二更新；如需更多資訊可聯絡館員。", optional_request
             ),
+        ).status
+        == "answer"
+    )
+    negated = prepare_answer(
+        "我沒有權限異常，只問目錄日期。", product_id="hp-a", hits=[source_b]
+    )
+    assert (
+        resolve_draft(
+            negated,
+            answer_payload("目錄每週二更新。", negated, negated.evidence[0].source_id),
         ).status
         == "answer"
     )
@@ -510,7 +511,6 @@ def test_hostile_strings_remain_json_data(monkeypatch: pytest.MonkeyPatch) -> No
         "product_id",
         "prompt_revision",
         "question",
-        "required_limits",
     }
     assert draft.sources[0].hit.chunk.text == text
     assert "https://evil.example" not in request.policy
@@ -616,13 +616,11 @@ def test_model_data_byte_limit_rejects_without_truncation(
 def test_policy_stays_outside_the_model_data() -> None:
     request = prepare_answer("請只看證據。", product_id="hp-a", hits=[make_hit()])
     for obligation in (
-        "僅依本次證據",
+        "僅依本次完整證據",
         "claims 範圍",
         "精確字元 span",
-        "required_limits",
-        "required_handoff",
         "refund_request",
-        "不確定支持",
+        "語意正確",
         "2000 字",
         "不執行外部操作",
     ):
@@ -861,8 +859,6 @@ def test_public_request_must_match_the_cited_hit_text_and_product(
         policy=request.policy,
         evidence=request.evidence,
         sources=request.sources,
-        required_limits=request.required_limits,
-        required_handoff=request.required_handoff,
     )
     assert aligned.model_data_json() == request.model_data_json()
 

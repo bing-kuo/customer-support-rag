@@ -6,9 +6,9 @@
 
 截至 P3 Draft，知識維護 CLI、`POST /ask`、`POST /assist` 與本機頁面已在程式中。P2 尚未完成 acceptance：真實生成語意與完整 holdout 未通過；FAQ absent baseline 的舊錯誤根因未知；FAQ present、policy v1/v2 尚未跑完驗證。sealed 16 題也尚未完成驗收；既有紀錄為 5 pass、1 error、10 未跑，另有 11 題語意未驗，須保留既有錯誤／未送出狀態，不能改寫成全未跑或全通過。既有四個真 embedding 候選仍未核准或啟用。README、離線 rehearsal 與 P3 診斷修補正在同一個 PR 審查，不能據此宣稱產品驗收完成。
 
-最新 P3 切片新增必要限制覆蓋、claim 至來源文字 span 的結構校驗，以及人工處置時的 handoff 一致性。這些是離線 mock 與合成案例證據；span 存在不證明自然語意蘊含，未宣稱真模型品質改善。
+本輪依 D-018 調整自然 RAG 草稿的保證範圍：程式驗來源／版本／hash、引用 ID、字元 span、answer 範圍完整覆蓋、輸出 schema 與 handoff 欄位一致；這些檢查只能確認結構和定位，不能證明每個主張被來源語意支持、所有必要限制完整，或 status 符合人工處置意圖。模型 instruction 會要求保留條件、禁止、必做與停止指示，但這不是可機械保證。來源文件按已核對的原始 chunks 整份送入；超過既有 4 個 evidence／1200 字元／wire 界線就不送 Luna，回現有 handoff。錯誤或相反建議即使結構合法，仍須人工依來源判讀；目前 UI 沒有強制放行閘門。
 
-P2 原有生成候選仍綁建置 commit `0cb3a9a`。P3 的診斷或固定 prompt 改動不會改標舊證據，也不會重算既有向量。任何後續評測都須用新 sidecar 記錄評測程式版本與實際送出／回應狀態；診斷真呼叫目前停止。
+P2 原有生成候選仍綁建置 commit `0cb3a9a`。本輪程式／prompt/schema 變更不會改標舊證據，也不會重算既有向量。診斷與真生成呼叫仍停止；後續 live 評測須另獲明確授權，舊失敗與 holdout 狀態保留。
 
 ## 從乾淨 checkout 開始
 
@@ -40,7 +40,7 @@ uv run --locked uvicorn customer_support_rag.api:app \
 
 開啟 `http://127.0.0.1:8000/` 查看頁面，`/docs` 查看 OpenAPI，`/health` 查看程序狀態。Health 只證明 API 程序可回應，不檢查 active release、資料庫、Ollama、key 或 Luna 是否可用。請求須使用 loopback Host；瀏覽器 Origin 必須與本機頁面同源。未知路徑不會回退成首頁。
 
-真實 `POST /ask` 需要已核准的 active release 或相容的既有 SQLite 設定、可用的本機 Ollama embedding，以及 OpenAI key。查詢會先用 Ollama 產生問句向量，再以既有向量檢索，只有選出證據後才會送一次 `gpt-6-luna` 請求。無證據會轉人工，不呼叫 Luna。`POST /assist` 收集必要欄位後也可能進入模型。兩者都不是 mock rehearsal；下列請求範例只供操作者在已核准的環境手動執行，非測試命令：
+真實 `POST /ask` 需要已核准的 active release 或相容的既有 SQLite 設定、可用的本機 Ollama embedding，以及 OpenAI key。查詢會先用 Ollama 產生問句向量，再以既有向量檢索；在有來源且完整 bundle 可放入既有界線時，才送一次 `gpt-6-luna` 請求。沒有檢索來源或 bundle 無法完整、安全地提供時，API 回現有 handoff；它不會判斷一般語意何時必須交人工。`POST /assist` 收集必要欄位後也可能進入模型。回答是供客服打開來源核對的自然草稿，並非無人監督客服；現有 UI 沒有強制人工放行功能。下列請求範例只供操作者在已核准的環境手動執行，非測試命令：
 
 ```sh
 curl -sS http://127.0.0.1:8000/ask \

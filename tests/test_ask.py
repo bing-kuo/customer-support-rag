@@ -173,7 +173,68 @@ def test_ask_joins_stored_retrieval_to_one_mock_luna_call(
     assert _snapshot(path) == before
 
 
-def test_ask_hands_off_when_a_source_limit_is_omitted_by_the_budget(
+def test_ask_sends_all_chunks_for_a_retrieved_source(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    first = "開館日為週三。" + ("A" * 80)
+    second = "資料不符時應先暫停後續操作。" + ("B" * 80)
+    document = KnowledgeDocument(
+        metadata=KnowledgeMetadata(
+            document_id="planetarium-hours",
+            product_id="hp-a",
+            title="Planetarium hours",
+            version="synthetic-1",
+            synthetic=True,
+        ),
+        body=f"# Hours\n\n{first}\n\n# Help\n\n{second}",
+    )
+    chunks = chunk_document(document)
+    assert len(chunks) == 2
+    assert sum(len(chunk.text) for chunk in chunks) <= 1200
+    path = tmp_path / "bundle.sqlite"
+    _put_many(path, [(document, _vectors_by_index(document))])
+    original_search = ExactCosineIndex.search
+
+    def one_retrieved_chunk(
+        self: ExactCosineIndex,
+        query: object,
+        *,
+        product_id: str,
+        top_k: int = 5,
+    ) -> list[RetrievalHit]:
+        return original_search(self, query, product_id=product_id, top_k=top_k)[:1]
+
+    monkeypatch.setattr(ExactCosineIndex, "search", one_retrieved_chunk)
+    posted: list[dict[str, object]] = []
+
+    def embedding(request: httpx.Request) -> httpx.Response:
+        return _tags() if request.method == "GET" else _embed(axis(0, 1.0))
+
+    async def luna(_self: object, request: httpx.Request) -> httpx.Response:
+        data = _model_data(request)
+        posted.append(data)
+        return httpx.Response(
+            200,
+            json=_envelope(_draft("開館日為週三。", data)),
+        )
+
+    monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", luna)
+    client = _client(tmp_path, path, embedding=embedding, artifact_keys=_keys(path))
+    response = client.post("/ask", json=_body("hp-a", "哪天開館？"))
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "answer"
+    assert len(posted) == 1
+    evidence = posted[0]["evidence"]
+    assert isinstance(evidence, list)
+    assert [row["text"] for row in evidence] == [chunk.text for chunk in chunks]
+    artifact_key = _keys(path)[0]
+    assert [row["source_id"] for row in evidence] == [
+        f"ev:{artifact_key}:{chunk.index}" for chunk in chunks
+    ]
+
+
+def test_ask_hands_off_when_complete_source_bundle_exceeds_existing_budget(
     tmp_path: Path,
 ) -> None:
     document = KnowledgeDocument(
@@ -184,7 +245,7 @@ def test_ask_hands_off_when_a_source_limit_is_omitted_by_the_budget(
             version="synthetic-1",
             synthetic=True,
         ),
-        body="# 目錄\n\n" + ("目錄資訊。" * 238) + "\n\n不得更改帳號權限。",
+        body="# 目錄\n\n" + ("目錄資訊。" * 238) + "\n\n附加目錄說明。",
     )
     chunks = chunk_document(document)
     assert len(chunks) == 2
@@ -546,7 +607,6 @@ def test_embedding_failure_does_not_call_luna(
                                     "source_id": "missing-source",
                                     "source_start": 0,
                                     "source_end": 1,
-                                    "limit_ids": [],
                                 }
                             ],
                         }
@@ -591,7 +651,7 @@ def test_provider_failures_stop_without_retry_or_answer(
     assert str(path) not in leaked
 
 
-def test_hostile_question_cannot_change_endpoint_or_bypass_required_limits(
+def test_hostile_question_cannot_change_endpoint_or_claim_semantic_guarantees(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _save_products(tmp_path)
@@ -622,13 +682,12 @@ def test_hostile_question_cannot_change_endpoint_or_bypass_required_limits(
     client = _client(tmp_path, path, embedding=ollama)
     accepted = client.post("/ask", json=_body("hp-a", question))
     assert accepted.status_code == 200
-    assert accepted.json()["status"] == "handoff"
-    assert accepted.json()["answer"] is None
-    assert accepted.json()["sources"] == []
+    assert accepted.json()["status"] == "answer"
+    assert accepted.json()["answer"] == ANSWER
     assert "evil.example" not in accepted.text
     failed = client.post("/ask", json=_body("hp-a", question))
     assert failed.status_code == 200
-    assert failed.json()["status"] == "handoff"
+    assert failed.json()["status"] == "answer"
     assert "evil.example" not in failed.text
     assert KEY not in failed.text
     assert str(path) not in failed.text
@@ -637,8 +696,9 @@ def test_hostile_question_cannot_change_endpoint_or_bypass_required_limits(
     assert urls == {
         OLLAMA_TAGS_URL,
         OLLAMA_EMBED_URL,
+        "https://api.openai.com/v1/responses",
     }
-    assert luna_calls == 0
+    assert luna_calls == 2
     assert all(item.url.host != "evil.example" for item in seen)
 
 
@@ -679,14 +739,10 @@ def test_whole_chunks_stop_on_budget_conflict_or_one_oversize_source(
     client = _client(tmp_path, path, embedding=ollama, artifact_keys=_keys(path))
     response = client.post("/ask", json=_body("hp-a", "哪一段？"))
     assert response.status_code == 200
-    assert len(posted) == 1
-    evidence = posted[0]["evidence"]
-    assert isinstance(evidence, list)
-    assert len(evidence) == 1
-    assert first in evidence[0]["text"]
-    assert second not in evidence[0]["text"]
-    assert first in response.json()["sources"][0]["text"]
-    assert second not in response.json()["sources"][0]["text"]
+    assert posted == []
+    assert response.json()["status"] == "handoff"
+    assert response.json()["answer"] is None
+    assert response.json()["sources"] == []
 
     conflict = tmp_path / "conflict.sqlite"
     left = _version_document("1", "alpha")
@@ -737,7 +793,7 @@ def test_whole_chunks_stop_on_budget_conflict_or_one_oversize_source(
     too_big = client.post("/ask", json=_body())
     assert too_big.status_code == 503
     assert too_big.json()["code"] == "evidence_unavailable"
-    assert len(posted) == 1
+    assert len(posted) == 0
 
 
 def test_version_conflict_is_rejected_before_the_length_prefix(
@@ -985,8 +1041,6 @@ def _model_data(request: httpx.Request) -> dict[str, object]:
 def _draft(answer: str, data: dict[str, object]) -> str:
     evidence = data["evidence"]
     assert isinstance(evidence, list)
-    limits = data.get("required_limits", [])
-    assert isinstance(limits, list)
     claims = []
     for item in evidence:
         assert isinstance(item, dict)
@@ -1000,11 +1054,6 @@ def _draft(answer: str, data: dict[str, object]) -> str:
                 "source_id": source_id,
                 "source_start": 0,
                 "source_end": len(text),
-                "limit_ids": [
-                    limit["id"]
-                    for limit in limits
-                    if isinstance(limit, dict) and limit.get("source_id") == source_id
-                ],
             }
         )
     return json.dumps(

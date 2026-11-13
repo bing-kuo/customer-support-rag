@@ -22,7 +22,6 @@ from customer_support_rag.budget import (
 from customer_support_rag.knowledge.answering import (
     GROUNDED_POLICY,
     PROMPT_REVISION,
-    DraftValidationError,
     prepare_answer,
     resolve_draft,
 )
@@ -139,7 +138,6 @@ def answer_text(answer: str, source_id: str) -> str:
                     "source_id": source_id,
                     "source_start": 23,
                     "source_end": 23 + len(quote),
-                    "limit_ids": ["l0"],
                 }
             ],
         },
@@ -347,7 +345,6 @@ def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
         "source_id": source_id,
         "source_start": 0,
         "source_end": len(evidence_text),
-        "limit_ids": [],
     }
     if case_name.startswith("handoff") or case_name == "valid-handoff":
         payload: dict[str, object] = {
@@ -397,13 +394,14 @@ def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
     assert sent["instructions"] == GROUNDED_POLICY
     model_data = json.loads(sent["input"][0]["content"][0]["text"])
     assert model_data == json.loads(request.model_data_json())
-    assert model_data["prompt_revision"] == PROMPT_REVISION == "grounded-draft-v3"
+    assert model_data["prompt_revision"] == PROMPT_REVISION == "grounded-draft-v4"
     for instruction in (
         "handoff",
         "claims=[]",
         "answer: 非空且不超 2000 字",
-        "limit_ids",
-        "本次來源",
+        "意思相同的自然說法",
+        "相反的許可",
+        "實際提供來源",
     ):
         assert instruction in sent["instructions"]
     schema = sent["text"]["format"]["schema"]
@@ -909,74 +907,30 @@ def test_client_disables_env_proxy_and_redirects() -> None:
     asyncio.run(client.aclose())
 
 
-def test_required_handoff_blocks_an_answer_missing_the_safety_limit(
-    tmp_path: Path,
-) -> None:
-    """Synthetic provider output missing a required human action is rejected."""
-    care = _product_request("hp-a/headphone-care.md", "HP-A 耳機可以用水洗嗎？", "hp-a")
-    connection = _product_request(
-        "hp-b/connection-troubleshooting.md", "HP-B 無法連線時先做什麼？", "hp-b"
-    )
-    follow = _product_request(
-        "hp-b/connection-troubleshooting.md", "HP-B 仍不能連線時怎麼辦？", "hp-b"
-    )
+def test_valid_span_does_not_make_unsafe_semantics_a_parser_failure() -> None:
+    """Semantic safety and handoff intent remain human-review judgments."""
     critical = _critical_request()
-    for request, answer, facts in (
-        (connection, HP_B_FIRST, ("電量", "舊配對", "配對")),
-        (follow, HP_B_FOLLOW, ("重新啟動", "製造商")),
-    ):
-        evidence = request.evidence[0]
-        draft = resolve_draft(
-            request,
-            {
-                "status": "answer",
-                "answer": answer,
-                "reason": None,
-                "claims": [
-                    {
-                        "answer_start": 0,
-                        "answer_end": len(answer),
-                        "source_id": evidence.source_id,
-                        "source_start": 0,
-                        "source_end": len(evidence.text),
-                        "limit_ids": [],
-                    }
-                ],
-            },
-        )
-        for fact in facts:
-            assert fact in draft.answer
-    assert critical.required_handoff
-    with pytest.raises(DraftValidationError, match="required handoff"):
-        resolve_draft(
-            critical,
-            {
-                "status": "answer",
-                "answer": CRITICAL,
-                "reason": None,
-                "claims": [],
-            },
-        )
-    refund = resolve_draft(
-        care,
+    source = critical.evidence[0]
+    draft = resolve_draft(
+        critical,
         {
-            "status": "handoff",
-            "answer": None,
-            "reason": "refund_request",
-            "claims": [],
+            "status": "answer",
+            "answer": "繼續使用即可。",
+            "reason": None,
+            "claims": [
+                {
+                    "answer_start": 0,
+                    "answer_end": len("繼續使用即可。"),
+                    "source_id": source.source_id,
+                    "source_start": 0,
+                    "source_end": len(source.text),
+                }
+            ],
         },
     )
-    assert refund.reason == "refund_request"
-    spy = Spy(
-        httpx.Response(
-            200,
-            json=envelope(answer_text(INVENTED, critical.evidence[0].source_id)),
-        )
-    )
-    path, caught = run_draft(tmp_path, critical, spy, "invented")
-    assert isinstance(caught, LunaError)
-    assert caught.code == "invalid_model_schema"
-    assert states(path)[0]["state"] == "settled"
+    assert draft.status == "answer"
+    manual_rubric = "fail: source says stop use, stop charging, and contact a human"
+    assert manual_rubric.startswith("fail:")
 
 
 def test_loader_ignores_environment_and_a_neighbor_file(

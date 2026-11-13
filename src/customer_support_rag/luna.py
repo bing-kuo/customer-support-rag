@@ -109,7 +109,6 @@ DRAFT_SCHEMA = {
                     "source_id": {"type": "string"},
                     "source_start": {"type": "integer"},
                     "source_end": {"type": "integer"},
-                    "limit_ids": {"type": "array", "items": {"type": "string"}},
                 },
                 "required": [
                     "answer_start",
@@ -117,7 +116,6 @@ DRAFT_SCHEMA = {
                     "source_id",
                     "source_start",
                     "source_end",
-                    "limit_ids",
                 ],
             },
         },

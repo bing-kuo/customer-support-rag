@@ -1570,15 +1570,8 @@ def _handoff(reason: str) -> str:
 
 def _draft(answer_text: str, data: dict[str, object]) -> str:
     rows = data["evidence"]
-    limits = data.get("required_limits", [])
-    assert isinstance(rows, list) and isinstance(limits, list)
-    answer = answer_text + "".join(
-        item["quote"]
-        for item in limits
-        if isinstance(item, dict)
-        and isinstance(item.get("quote"), str)
-        and item["quote"] not in answer_text
-    )
+    assert isinstance(rows, list)
+    answer = answer_text
     claims = []
     for item in rows:
         assert isinstance(item, dict)
@@ -1592,11 +1585,6 @@ def _draft(answer_text: str, data: dict[str, object]) -> str:
                 "source_id": source_id,
                 "source_start": 0,
                 "source_end": len(text),
-                "limit_ids": [
-                    limit["id"]
-                    for limit in limits
-                    if isinstance(limit, dict) and limit.get("source_id") == source_id
-                ],
             }
         )
     return json.dumps(

@@ -25,11 +25,10 @@ from customer_support_rag.knowledge.answering import (
     GroundedDraft,
     ResolvedSource,
     _require_one_version,
-    _required_limit_sentences,
-    _requires_human_handoff_text,
     handoff_without_evidence,
     prepare_answer,
 )
+from customer_support_rag.knowledge.chunker import chunk_document
 from customer_support_rag.knowledge.embedding import (
     PUBLISHED_MODEL_DIGEST,
     EmbeddingError,
@@ -280,9 +279,13 @@ def _prepare(config: AskConfig, product_id: str, question: str) -> _Prepared:
                     or source.document.metadata.version != hit.chunk.metadata.version
                     or hashlib.sha256(source.document.body.encode("utf-8")).hexdigest()
                     != hit.chunk.body_sha256
+                    or tuple(
+                        chunk_document(source.document, max_chars=source.max_chars)
+                    )
+                    != source.chunks
                 ):
                     raise StorageError("Candidate source identity is inconsistent.")
-                source_documents[hit.artifact_key] = source.document
+                source_documents[hit.artifact_key] = source
         finally:
             adapter.close()
     finally:
@@ -291,20 +294,13 @@ def _prepare(config: AskConfig, product_id: str, question: str) -> _Prepared:
         empty = prepare_answer(question, product_id=product_id, hits=[])
         return _Prepared(draft=handoff_without_evidence(empty))
     _require_one_version(_candidate_sources(hits))
-    selected = _select_whole_chunks(hits)
-    selected_text_by_artifact: dict[str, list[str]] = {}
-    for hit in selected:
-        selected_text_by_artifact.setdefault(hit.artifact_key, []).append(
-            hit.chunk.text
-        )
-    omitted_limit = any(
-        sentence not in "\n".join(selected_text_by_artifact.get(artifact_key, []))
-        for artifact_key, document in source_documents.items()
-        for sentence in _required_limit_sentences(document.body)
-    )
-    if omitted_limit or any(
-        _requires_human_handoff_text(question, document.body)
-        for document in source_documents.values()
+    artifact_order = tuple(dict.fromkeys(hit.artifact_key for hit in hits))
+    selected = _complete_source_bundle(source_documents, artifact_order, hits)
+    if selected is None:
+        raise AskFailure(503, "evidence_unavailable")
+    if (
+        len(selected) > MAX_HITS
+        or sum(len(hit.chunk.text) for hit in selected) > MAX_EVIDENCE_CHARS
     ):
         return _Prepared(
             draft=GroundedDraft(
@@ -312,12 +308,6 @@ def _prepare(config: AskConfig, product_id: str, question: str) -> _Prepared:
             )
         )
     request = prepare_answer(question, product_id=product_id, hits=selected)
-    if request.required_handoff:
-        return _Prepared(
-            draft=GroundedDraft(
-                status="handoff", answer=None, reason="no_evidence", sources=()
-            )
-        )
     try:
         wire_composition(request)
     except LunaError as exc:
@@ -331,6 +321,61 @@ def _prepare(config: AskConfig, product_id: str, question: str) -> _Prepared:
     return _Prepared(request=request)
 
 
+def _complete_source_bundle(
+    stored_documents: dict[str, object],
+    artifact_order: tuple[str, ...],
+    ranked_hits: list[RetrievalHit],
+) -> tuple[RetrievalHit, ...] | None:
+    """Expand retrieved artifacts to their complete, verified stored chunks.
+
+    Unranked chunks are context only; their score is an internal zero sentinel
+    and is never sent to the model or exposed in the API response.
+    """
+    ranked_by_identity = {
+        (hit.artifact_key, hit.chunk.index): hit for hit in ranked_hits
+    }
+    bundle: list[RetrievalHit] = []
+    for artifact_key in artifact_order:
+        stored = stored_documents.get(artifact_key)
+        if stored is None:
+            return None
+        document = stored.document
+        body = document.body
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        original_chunks = tuple(chunk_document(document, max_chars=stored.max_chars))
+        eligible_chunks = tuple(
+            chunk for chunk in original_chunks if chunk.text.strip()
+        )
+        embedded_chunks = stored.embedded_chunks
+        if (
+            stored.artifact_key != artifact_key
+            or stored.document.metadata.product_id
+            != next(
+                hit.chunk.metadata.product_id
+                for hit in ranked_hits
+                if hit.artifact_key == artifact_key
+            )
+            or stored.chunks != original_chunks
+            or tuple(embedded.chunk for embedded in embedded_chunks) != eligible_chunks
+        ):
+            return None
+        for chunk in eligible_chunks:
+            if (
+                chunk.body_sha256 != digest
+                or body[chunk.char_start : chunk.char_end] != chunk.text
+            ):
+                return None
+            ranked = ranked_by_identity.get((artifact_key, chunk.index))
+            bundle.append(
+                RetrievalHit(
+                    artifact_key=artifact_key,
+                    chunk=chunk,
+                    raw_score=0.0 if ranked is None else ranked.raw_score,
+                )
+            )
+    return tuple(bundle)
+
+
 def _candidate_sources(hits: list[RetrievalHit]) -> tuple[ResolvedSource, ...]:
     """Map every search hit before any length prefix is dropped."""
     return tuple(
@@ -340,29 +385,6 @@ def _candidate_sources(hits: list[RetrievalHit]) -> tuple[ResolvedSource, ...]:
         )
         for hit in hits
     )
-
-
-def _select_whole_chunks(hits: list[RetrievalHit]) -> tuple[RetrievalHit, ...]:
-    """Keep a ranked prefix of complete chunks inside the evidence budget.
-
-    Conflicting versions are rejected on the full candidate list before this
-    runs. A chunk is never truncated. One chunk longer than the budget stops
-    the request. A later chunk that would overflow the total is left out,
-    together with every chunk after it.
-    """
-    selected: list[RetrievalHit] = []
-    total = 0
-    for hit in hits:
-        size = len(hit.chunk.text)
-        if size > MAX_EVIDENCE_CHARS:
-            raise AskFailure(503, "evidence_unavailable")
-        if total + size > MAX_EVIDENCE_CHARS or len(selected) >= MAX_HITS:
-            break
-        selected.append(hit)
-        total += size
-    if not selected:
-        raise AskFailure(503, "evidence_unavailable")
-    return tuple(selected)
 
 
 def _provider_failure(code: str) -> AskFailure:
