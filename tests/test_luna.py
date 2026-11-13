@@ -399,9 +399,9 @@ def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
         "handoff",
         "claims=[]",
         "answer: 非空且不超 2000 字",
-        "意思相同的自然說法",
-        "相反的許可",
-        "實際提供來源",
+        "可同義改寫",
+        "相反許可",
+        "實際來源",
     ):
         assert instruction in sent["instructions"]
     schema = sent["text"]["format"]["schema"]

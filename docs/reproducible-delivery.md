@@ -166,7 +166,7 @@ uv run --locked python -m customer_support_rag.maintenance activate \
 
 ## 自然草稿契約與人工判讀（D-018 方案 A）
 
-內部 instruction 版本為 `grounded-draft-v4`，policy UTF-8 SHA-256 為 `86725336893b40324b0984a0f1eab9f1447dcda78f27634652f01204ba93c385`；canonical schema 是 677 bytes，SHA-256 `3bb66f4947eb708ff91476ebb60fc7542703bd112eb79c9941dc154f2e20f341`。公開 `AskResponse`、`CitedSource`、`/assist` 與 web API 形狀不變。Responses schema 仍是 flat object：root `status`、`answer`、`reason`、`claims`；每個 claim 只有 answer/source 字元 offsets 與 source ID，沒有 `required_limits`、`required_handoff` 或 `limit_ids`。嚴格 parser 拒絕額外欄位、未知來源、無效或不完整 span、未覆蓋的 answer，以及不一致的 handoff 欄位；它不做自然語言蘊含判斷。
+內部 instruction 版本為 `grounded-draft-v4`，policy UTF-8 SHA-256 為 `4d1906435bcc03df1d9f595ccc7559d0c6d923dbd748cfaad927c9297bd4f2a5`；canonical schema 是 677 bytes，SHA-256 `3bb66f4947eb708ff91476ebb60fc7542703bd112eb79c9941dc154f2e20f341`。公開 `AskResponse`、`CitedSource`、`/assist` 與 web API 形狀不變。Responses schema 仍是 flat object：root `status`、`answer`、`reason`、`claims`；每個 claim 只有 answer/source 字元 offsets 與 source ID，沒有 `required_limits`、`required_handoff` 或 `limit_ids`。嚴格 parser 拒絕額外欄位、未知來源、無效或不完整 span、未覆蓋的 answer，以及不一致的 handoff 欄位；它不做自然語言蘊含判斷。
 
 模型 instruction 要求自然改寫，保留本題相關的條件、禁止、必做與停止指示，允許語意等價說法，不能新增或反轉許可；證據不足、衝突或只有人工可完成的處置時要求 handoff。這是生成指令，不是 schema 或本機 parser 能保證的規則。草稿需要客服打開實際來源核對；現有 UI 沒有強制人工放行，不能稱為無人監督服務。
 
@@ -192,4 +192,4 @@ synthetic source A：「終端只使用公開演示目錄；不得輸入訪客�
 
 這輪從舊 parser 移除 marker-based 限制覆蓋、模型自報 limit IDs 與 bigram-based 人工分支。固定 instruction 保留生成要求，但不以模型自稱已涵蓋作為證明。測試分開記錄自動結構檢查與作者設定的 synthetic 人工 rubric；後者不是獨立 reviewer 對真生成的品質驗收。真生成改善尚未驗證，D24–D26 的語意品質不能標 pass。P2 acceptance-open/security hold、候選 build SHA `0cb3a9a`、09e 歷史評估及其錯誤／污染狀態均未改寫、重算或啟用。
 
-固定 HP-A wire fixture 在 v4 policy/schema 下為 2,337 bytes；policy 836、data 415、schema 677、framing 409 bytes。byte-based reservation headroom 仍為 223 units。較長 evidence 仍會依原界線拒絕或在證據準備階段 fail closed；沒有提高預留或自動截斷。
+固定 HP-A wire fixture 在 v4 policy/schema 下為 2,124 bytes；policy 623、data 415、schema 677、framing 409 bytes。byte-based reservation headroom 仍為 436 units。較長 evidence 仍會依原界線拒絕或在證據準備階段 fail closed；沒有提高預留或自動截斷。

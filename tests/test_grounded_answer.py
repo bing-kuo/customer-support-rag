@@ -616,13 +616,13 @@ def test_model_data_byte_limit_rejects_without_truncation(
 def test_policy_stays_outside_the_model_data() -> None:
     request = prepare_answer("請只看證據。", product_id="hp-a", hits=[make_hit()])
     for obligation in (
-        "僅依本次完整證據",
-        "claims 範圍",
-        "精確字元 span",
+        "僅依完整證據",
+        "claims span",
+        "只標位置",
         "refund_request",
-        "語意正確",
+        "不證明語意",
         "2000 字",
-        "不執行外部操作",
+        "不外部執行",
     ):
         assert obligation in GROUNDED_POLICY
     assert request.policy == GROUNDED_POLICY

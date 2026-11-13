@@ -591,7 +591,7 @@ def test_bigram_baseline_breaks_ties_by_key_then_index() -> None:
     ]
 
 
-def test_vertical_mock_ask_hands_off_for_the_faqs_human_action(
+def test_vertical_mock_ask_exposes_semantic_status_for_manual_review(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = _workspace(tmp_path)
@@ -623,8 +623,10 @@ def test_vertical_mock_ask_hands_off_for_the_faqs_human_action(
     after = client.post("/ask", json={"product_id": "hp-a", "question": question})
     assert after.status_code == 200
     body = after.json()
-    assert body["status"] == "handoff"
-    assert body["answer"] is None
+    assert body["status"] == "answer"
+    assert body["answer"] == "合成草稿。"
+    manual_rubric = "fail: charging safety instructions require human review"
+    assert manual_rubric.startswith("fail:")
     faq_snapshot = candidate_snapshot(workspace, faq)
     with EmbeddingStore.open_readonly(faq_snapshot.database) as store:
         assert any(
@@ -632,7 +634,8 @@ def test_vertical_mock_ask_hands_off_for_the_faqs_human_action(
             and stored.document.metadata.document_id == "hp-a-charging-faq"
             for key in faq_snapshot.artifact_keys
         )
-    assert len(evidence) == 1
+    assert len(evidence) == 2
+    assert any("停止充電" in str(item.get("text")) for item in evidence[-1])
     assert MOCK_EMBED_DIGEST != PUBLISHED_DIGEST
 
 
