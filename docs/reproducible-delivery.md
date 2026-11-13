@@ -166,8 +166,12 @@ uv run --locked python -m customer_support_rag.maintenance activate \
 
 ## 生成輸出契約版本
 
-P3 request-side handoff/answer 指示版本為 `grounded-draft-v2`，固定 policy UTF-8 SHA-256 為 `e5d1bb83e6b8fd406b0bfe6af4d8a7879d3cc4473997702bfda22f970153f956`。Flat response schema description 標示 `grounded-draft-schema-v2`；以 UTF-8、`sort_keys=true`、`separators=(',', ':')` 序列化後 679 bytes，SHA-256 為 `875d3f42fa7bbcd8734b064b96ef984a5adc8d167527d099878683f1cb092ae7`。Structured Outputs schema 保持 root object、四個 required 欄位及 `additionalProperties=false`；欄位 description 只是指示，沒有跨欄位 schema constraint。Parser 是強制拒絕矛盾 handoff、空答案、錯誤 reason、空／重複／未知 source ID 的最後界線；拒絕後不修補、不 retry。
+本輪固定 instruction 版本為 `grounded-draft-v3`，policy UTF-8 SHA-256 為 `8871fd5579e1b8047ad69d2819c1acae32821907ebb793602a10a865acb74dc7`。Structured Outputs root 仍是 object；schema 有四個 required 欄位 `status`、`answer`、`reason`、`claims`，巢狀 claim 欄位記錄 answer 字元範圍、source ID、證據字元範圍與限制 ID。Canonical JSON（UTF-8、`sort_keys=true`、`separators=(',', ':')`）為 744 bytes，SHA-256 `03b18ba9205d3d27e54f2770fa80a13f540ed065f4140e101d5b0da4e61fb784`。schema 不宣稱強制跨欄位分支；本機 parser 會驗 answer 範圍完整覆蓋、來源／span 邊界、引用來源、限制 coverage、handoff 欄位一致性與可信 request-side handoff。錯誤仍固定分類，不修補、不 retry。
 
-此版本變更只影響 P3 新請求。它不改寫任何舊候選、舊 regression 或既有生成結論。未來若用此版本對既有 candidate 做已授權評測，evaluation sidecar 應另外連結 candidate build code SHA、manifest/DB hashes、evaluation code SHA/tree、suite/rubric、prompt/schema revision 或 hash，以及 request/response artifact hashes；不可重算既有向量後冒充相同 candidate。
+一般 `/ask` 在已選 snapshot 的唯讀來源文件上核對 artifact key、product、version、body hash，並檢查來源限制是否完整落在已選 whole-chunk evidence 中。若限制被 chunk／1200 字元 evidence budget 遺漏，或已知請求條件需要人工處理，先回既有 handoff，不呼叫 Luna；未超過原 16 KiB payload、Responses byte-based reservation、request/response limits。必要限制需在回答完整照錄；其他答案仍可自然改寫。public `AskResponse`／`CitedSource` 與 web API 未變，回答引用來源由經校驗的 claim span 推導。
 
-固定 HP-A wire fixture 現為 2,488 bytes；沿用既有 byte-based reservation 後 headroom 是 72 units。較長的 question/evidence 仍依既有界線拒絕，沒有提高預留或自動截斷；該拒絕不是模型驗收。
+全新 planetarium mock：來源 A「終端只使用公開演示目錄；不得輸入訪客姓名；不得更改帳號權限」，來源 B「目錄每週二更新；權限異常由館員確認」。不安全前例省略姓名／權限限制，parser 拒絕缺少 required-limit coverage；無法完整提供整句的 chunk／budget case 在送模前 handoff。正向日期 mock 將 `目錄每週二更新。` 的 claim span 對到來源 B 精確文字，公開引用只列來源 B；要求處理權限異常時，request-side handoff=true，答案草稿被拒並回 handoff。另驗可選「如需更多資訊可聯絡館員」不會單靠字樣強制 handoff。
+
+Span identity、bounds 與 coverage 是結構性必要檢查，不是通用語意蘊含證明；model 所回的來源對應不能代替人工逐 claim 核對語意。上述正反例是新 synthetic fixture 的人工核讀與 MockTransport 回歸，不代表真模型改善。舊候選 build SHA `0cb3a9a`、舊錯誤／holdout 污染與原生成結論均未改寫。未來已授權評測需 sidecar 另外連結 candidate build SHA、manifest/DB hashes、evaluation SHA/tree、suite/rubric、prompt/schema hash 與 request/response artifact hashes。
+
+固定 HP-A wire fixture 為 2,505 bytes；依既有 byte-based reservation headroom 為 55 units。較長 question/evidence 仍依舊界線拒絕或在證據準備階段 fail closed；沒有提高預留或自動截斷。

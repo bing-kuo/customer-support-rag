@@ -22,6 +22,7 @@ from customer_support_rag.budget import (
 from customer_support_rag.knowledge.answering import (
     GROUNDED_POLICY,
     PROMPT_REVISION,
+    DraftValidationError,
     prepare_answer,
     resolve_draft,
 )
@@ -50,7 +51,6 @@ from customer_support_rag.luna import (
     build_luna_body,
     generate_draft,
     input_reservation,
-    parse_luna_output,
     parse_usage,
     responses_client,
     wire_bytes,
@@ -59,7 +59,7 @@ from customer_support_rag.luna import (
 KNOWLEDGE = Path(__file__).parents[1] / "knowledge"
 DIGEST = "ac6da0dfba84a81fdbfbaf330198c33cd77c4cdfc53e8bc50eb581914a15621d"
 KEY = "synthetic-key-not-live"
-HP_A_ANSWER = "請用乾燥的軟布擦拭，耳機不可泡水，也別用溶劑清潔。"
+HP_A_ANSWER = "使用後以乾燥柔軟的布擦拭耳罩。請勿將耳機浸入水中，也不要使用溶劑清潔。"
 HP_B_FIRST = "請先確認耳機電量，再到藍牙設定移除舊配對，然後重新配對。"
 HP_B_FOLLOW = "請重新啟動播放裝置，並查閱製造商提供的說明。"
 CRITICAL = "若出現異味或冒煙，請停止使用、停止充電，並聯絡人工。"
@@ -126,12 +126,22 @@ def basic_usage() -> dict[str, object]:
 
 
 def answer_text(answer: str, source_id: str) -> str:
+    quote = "請勿將耳機浸入水中，也不要使用溶劑清潔。"
     return json.dumps(
         {
             "status": "answer",
             "answer": answer,
-            "source_ids": [source_id],
             "reason": None,
+            "claims": [
+                {
+                    "answer_start": 0,
+                    "answer_end": len(answer),
+                    "source_id": source_id,
+                    "source_start": 23,
+                    "source_end": 23 + len(quote),
+                    "limit_ids": ["l0"],
+                }
+            ],
         },
         ensure_ascii=False,
     )
@@ -279,7 +289,7 @@ def test_hp_a_mock_http_settles_and_resolves_the_original_source(
     assert source_row.hit.chunk.index == 1
     assert (source_row.hit.chunk.char_start, source_row.hit.chunk.char_end) == (1, 71)
     assert source_row.hit.chunk.metadata.document_id == "hp-a-care"
-    for fact in ("軟布", "泡水", "溶劑"):
+    for fact in ("柔軟的布", "浸入水中", "溶劑"):
         assert fact in draft.answer
     row = states(ledger_path)[0]
     assert row["state"] == "settled"
@@ -330,21 +340,28 @@ def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
         hits=[hit],
     )
     source_id = request.evidence[0].source_id
+    evidence_text = request.evidence[0].text
+    claim = {
+        "answer_start": 0,
+        "answer_end": len("Ask the museum catalogue desk."),
+        "source_id": source_id,
+        "source_start": 0,
+        "source_end": len(evidence_text),
+        "limit_ids": [],
+    }
     if case_name.startswith("handoff") or case_name == "valid-handoff":
         payload: dict[str, object] = {
             "status": "handoff",
             "answer": None,
-            "source_ids": [],
             "reason": "conflicting_evidence",
+            "claims": [],
         }
         if case_name == "handoff-text-and-source":
-            payload.update(
-                answer="Ask the museum catalogue desk.", source_ids=[source_id]
-            )
+            payload.update(answer="Ask the museum catalogue desk.", claims=[claim])
         elif case_name == "handoff-text-only":
             payload["answer"] = "Ask the museum catalogue desk."
         elif case_name == "handoff-source-only":
-            payload["source_ids"] = [source_id]
+            payload["claims"] = [claim]
         elif case_name == "handoff-null-reason":
             payload["reason"] = None
         elif case_name == "handoff-invalid-reason":
@@ -353,8 +370,8 @@ def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
         payload = {
             "status": "answer",
             "answer": "Ask the museum catalogue desk.",
-            "source_ids": [source_id],
             "reason": None,
+            "claims": [claim],
         }
         if case_name == "answer-null-text":
             payload["answer"] = None
@@ -363,13 +380,13 @@ def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
         elif case_name == "answer-with-reason":
             payload["reason"] = "no_evidence"
         elif case_name == "answer-without-sources":
-            payload["source_ids"] = []
+            payload["claims"] = []
         elif case_name == "answer-duplicate-sources":
-            payload["source_ids"] = [source_id, source_id]
+            payload["claims"] = [claim, claim]
         elif case_name == "answer-overlong":
             payload["answer"] = "x" * 2001
         elif case_name == "unknown-source-remains-rejected":
-            payload["source_ids"] = ["ev:" + "a" * 64 + ":1"]
+            payload["claims"] = [{**claim, "source_id": "ev:" + "a" * 64 + ":1"}]
     spy = Spy(
         httpx.Response(200, json=envelope(json.dumps(payload, ensure_ascii=False)))
     )
@@ -380,23 +397,21 @@ def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
     assert sent["instructions"] == GROUNDED_POLICY
     model_data = json.loads(sent["input"][0]["content"][0]["text"])
     assert model_data == json.loads(request.model_data_json())
-    assert model_data["prompt_revision"] == PROMPT_REVISION == "grounded-draft-v2"
+    assert model_data["prompt_revision"] == PROMPT_REVISION == "grounded-draft-v3"
     for instruction in (
-        "status=handoff 時 answer 必須是 null",
-        "source_ids 必須為 []",
-        "status=answer 時 answer 必須非空白",
-        "最多 2000 字元",
-        "1 至 4 個唯一 ID",
-        "本次 evidence",
+        "handoff",
+        "claims=[]",
+        "answer: 非空且不超 2000 字",
+        "limit_ids",
+        "本次來源",
     ):
         assert instruction in sent["instructions"]
     schema = sent["text"]["format"]["schema"]
     assert schema["type"] == "object"
     assert schema["additionalProperties"] is False
-    assert set(schema["required"]) == {"status", "answer", "source_ids", "reason"}
-    assert set(schema["properties"]) == {"status", "answer", "source_ids", "reason"}
-    assert "anyOf" not in schema
-    assert "branch rules are instructed, not enforced" in schema["description"]
+    assert set(schema["required"]) == {"status", "answer", "reason", "claims"}
+    assert set(schema["properties"]) == {"status", "answer", "reason", "claims"}
+    assert "anyOf" not in schema["properties"]["claims"]
     for unsupported in (
         "allOf",
         "not",
@@ -407,7 +422,6 @@ def test_mock_wire_carries_flat_contract_and_parser_rejects_invalid_case(
         "else",
     ):
         assert unsupported not in schema
-    assert "grounded-draft-schema-v2" in schema["description"]
     if expected in {"answer", "handoff"}:
         assert result.status == expected
     else:
@@ -895,11 +909,10 @@ def test_client_disables_env_proxy_and_redirects() -> None:
     asyncio.run(client.aclose())
 
 
-def test_schema_can_pass_a_claim_that_fails_human_review(tmp_path: Path) -> None:
-    """Human rubric: invented refund and a missed critical action stay failures.
-
-    The assertions record that boundary. They do not make schema a safety check.
-    """
+def test_required_handoff_blocks_an_answer_missing_the_safety_limit(
+    tmp_path: Path,
+) -> None:
+    """Synthetic provider output missing a required human action is rejected."""
     care = _product_request("hp-a/headphone-care.md", "HP-A 耳機可以用水洗嗎？", "hp-a")
     connection = _product_request(
         "hp-b/connection-troubleshooting.md", "HP-B 無法連線時先做什麼？", "hp-b"
@@ -911,26 +924,46 @@ def test_schema_can_pass_a_claim_that_fails_human_review(tmp_path: Path) -> None
     for request, answer, facts in (
         (connection, HP_B_FIRST, ("電量", "舊配對", "配對")),
         (follow, HP_B_FOLLOW, ("重新啟動", "製造商")),
-        (critical, CRITICAL, ("停止使用", "停止充電", "聯絡人工")),
     ):
+        evidence = request.evidence[0]
         draft = resolve_draft(
             request,
             {
                 "status": "answer",
                 "answer": answer,
-                "source_ids": [request.evidence[0].source_id],
                 "reason": None,
+                "claims": [
+                    {
+                        "answer_start": 0,
+                        "answer_end": len(answer),
+                        "source_id": evidence.source_id,
+                        "source_start": 0,
+                        "source_end": len(evidence.text),
+                        "limit_ids": [],
+                    }
+                ],
             },
         )
         for fact in facts:
             assert fact in draft.answer
+    assert critical.required_handoff
+    with pytest.raises(DraftValidationError, match="required handoff"):
+        resolve_draft(
+            critical,
+            {
+                "status": "answer",
+                "answer": CRITICAL,
+                "reason": None,
+                "claims": [],
+            },
+        )
     refund = resolve_draft(
         care,
         {
             "status": "handoff",
             "answer": None,
-            "source_ids": [],
             "reason": "refund_request",
+            "claims": [],
         },
     )
     assert refund.reason == "refund_request"
@@ -940,15 +973,10 @@ def test_schema_can_pass_a_claim_that_fails_human_review(tmp_path: Path) -> None
             json=envelope(answer_text(INVENTED, critical.evidence[0].source_id)),
         )
     )
-    path, draft = run_draft(tmp_path, critical, spy, "invented")
-    assert draft.answer == INVENTED
-    assert "全額退款" in draft.answer
-    assert "停止使用" not in draft.answer
+    path, caught = run_draft(tmp_path, critical, spy, "invented")
+    assert isinstance(caught, LunaError)
+    assert caught.code == "invalid_model_schema"
     assert states(path)[0]["state"] == "settled"
-    parsed = parse_luna_output(
-        envelope(answer_text(INVENTED, critical.evidence[0].source_id)), critical
-    )
-    assert parsed.sources[0].source_id == critical.evidence[0].source_id
 
 
 def test_loader_ignores_environment_and_a_neighbor_file(

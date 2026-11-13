@@ -124,8 +124,8 @@ def test_default_path_does_not_auto_capture_from_environment(
             {
                 "type": "output_text",
                 "text": (
-                    '{"status":"handoff","answer":null,"source_ids":[],'
-                    '"reason":"no_evidence"}'
+                    '{"status":"handoff","answer":null,"reason":"no_evidence",'
+                    '"claims":[]}'
                 ),
             },
             "handoff",
@@ -638,8 +638,8 @@ def test_secret_scan_is_bounded_and_accepts_metadata_text(
                             {
                                 "status": "handoff",
                                 "answer": None,
-                                "source_ids": [],
                                 "reason": "no_evidence",
+                                "claims": [],
                             }
                         ),
                     }
@@ -784,13 +784,31 @@ def test_finish_failure_is_a_safe_luna_error_after_one_exchange(
     async def mock_exchange(*_args: object, **_kwargs: object):
         nonlocal calls
         calls += 1
-        return (
-            b'{"output":[{"type":"message","role":"assistant","status":"completed",'
-            b'"content":[{"type":"output_text","text":"{\\"status\\":\\"handoff\\",'
-            b'\\"answer\\":null,\\"source_ids\\":[],\\"reason\\":\\"no_evidence\\"}"}]}]}',
-            200,
-            None,
-        )
+        response = json.dumps(
+            {
+                "output": [
+                    {
+                        "type": "message",
+                        "role": "assistant",
+                        "status": "completed",
+                        "content": [
+                            {
+                                "type": "output_text",
+                                "text": json.dumps(
+                                    {
+                                        "status": "handoff",
+                                        "answer": None,
+                                        "reason": "no_evidence",
+                                        "claims": [],
+                                    }
+                                ),
+                            }
+                        ],
+                    }
+                ]
+            }
+        ).encode()
+        return response, 200, None
 
     monkeypatch.setattr(eval_diagnostic_module, "_write_new_at", fail_finish_write)
     monkeypatch.setattr(luna, "_factory_transport", lambda _transport: True)

@@ -6,6 +6,8 @@
 
 截至 P3 Draft，知識維護 CLI、`POST /ask`、`POST /assist` 與本機頁面已在程式中。P2 尚未完成 acceptance：真實生成語意與完整 holdout 未通過；FAQ absent baseline 的舊錯誤根因未知；FAQ present、policy v1/v2 尚未跑完驗證。sealed 16 題也尚未完成驗收；既有紀錄為 5 pass、1 error、10 未跑，另有 11 題語意未驗，須保留既有錯誤／未送出狀態，不能改寫成全未跑或全通過。既有四個真 embedding 候選仍未核准或啟用。README、離線 rehearsal 與 P3 診斷修補正在同一個 PR 審查，不能據此宣稱產品驗收完成。
 
+最新 P3 切片新增必要限制覆蓋、claim 至來源文字 span 的結構校驗，以及人工處置時的 handoff 一致性。這些是離線 mock 與合成案例證據；span 存在不證明自然語意蘊含，未宣稱真模型品質改善。
+
 P2 原有生成候選仍綁建置 commit `0cb3a9a`。P3 的診斷或固定 prompt 改動不會改標舊證據，也不會重算既有向量。任何後續評測都須用新 sidecar 記錄評測程式版本與實際送出／回應狀態；診斷真呼叫目前停止。
 
 ## 從乾淨 checkout 開始

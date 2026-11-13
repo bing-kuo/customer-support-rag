@@ -22,6 +22,7 @@ from customer_support_rag.ask import (
     PUBLISHED_DIGEST,
     AskConfig,
     AskFailure,
+    _prepare,
 )
 from customer_support_rag.knowledge import (
     EMBEDDING_DIMENSIONS,
@@ -43,7 +44,7 @@ from customer_support_rag.luna_live import REQUEST_ID
 
 KNOWLEDGE = Path(__file__).parents[1] / "knowledge"
 KEY = "synthetic-key-not-live"
-ANSWER = "請用乾燥的軟布擦拭，耳機不可泡水，也別用溶劑清潔。"
+ANSWER = "使用後以乾燥柔軟的布擦拭耳罩。請勿將耳機浸入水中，也不要使用溶劑清潔。"
 HP_B_ANSWER = "請先確認電量，再移除舊配對並重新配對。這是 mock 草稿。"
 OTHER_DIGEST = "b" * 64
 Handler = Callable[[httpx.Request], httpx.Response]
@@ -94,7 +95,7 @@ def test_ask_joins_stored_retrieval_to_one_mock_luna_call(
         calls["luna"].append(request)
         data = _model_data(request)
         answer = HP_B_ANSWER if data["product_id"] == "hp-b" else ANSWER
-        payload = _envelope(_draft(answer, data["evidence"][0]["source_id"]))
+        payload = _envelope(_draft(answer, data))
         if data["product_id"] == "hp-b":
             usage = dict(payload["usage"])
             usage["priority_processing"] = "do-not-leak"
@@ -170,6 +171,54 @@ def test_ask_joins_stored_retrieval_to_one_mock_luna_call(
         assert posted["store"] is False
         assert posted["tools"] == []
     assert _snapshot(path) == before
+
+
+def test_ask_hands_off_when_a_source_limit_is_omitted_by_the_budget(
+    tmp_path: Path,
+) -> None:
+    document = KnowledgeDocument(
+        metadata=KnowledgeMetadata(
+            document_id="planetarium-terminal",
+            product_id="hp-a",
+            title="Planetarium terminal",
+            version="synthetic-1",
+            synthetic=True,
+        ),
+        body="# 目錄\n\n" + ("目錄資訊。" * 238) + "\n\n不得更改帳號權限。",
+    )
+    chunks = chunk_document(document)
+    assert len(chunks) == 2
+    assert "不得更改帳號權限" not in chunks[0].text
+    path = tmp_path / "planetarium.sqlite"
+    with EmbeddingStore(path) as store:
+        key = store.put_document(
+            document,
+            [
+                EmbeddedChunk(chunk=chunk, vector=axis(index, 1.0))
+                for index, chunk in enumerate(chunks)
+            ],
+            model_digest=PUBLISHED_DIGEST,
+        )
+
+    def embedding(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return _tags()
+        return _embed(axis(0, 1.0))
+
+    config = AskConfig(
+        database=path,
+        artifact_keys=(key,),
+        model_digest=PUBLISHED_DIGEST,
+        key_root=tmp_path,
+        embedding_transport=httpx.MockTransport(embedding),
+    )
+    prepared = _prepare(config, "hp-a", "帳號權限異常怎麼辦？")
+
+    assert prepared.request is None
+    assert prepared.draft is not None
+    assert prepared.draft.status == "handoff"
+    assert prepared.draft.answer is None
+    assert prepared.draft.sources == ()
     assert not (tmp_path / "runtime").exists()
 
 
@@ -187,7 +236,7 @@ def test_same_origin_localhost_ui_can_ask_once_with_mock(
     async def luna(_self: object, request: httpx.Request) -> httpx.Response:
         calls["luna"] += 1
         data = _model_data(request)
-        payload = _envelope(_draft(ANSWER, data["evidence"][0]["source_id"]))
+        payload = _envelope(_draft(ANSWER, data))
         return httpx.Response(200, json=payload)
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", luna)
@@ -489,8 +538,17 @@ def test_embedding_failure_does_not_call_luna(
                         {
                             "status": "answer",
                             "answer": ANSWER,
-                            "source_ids": ["missing-source"],
                             "reason": None,
+                            "claims": [
+                                {
+                                    "answer_start": 0,
+                                    "answer_end": len(ANSWER),
+                                    "source_id": "missing-source",
+                                    "source_start": 0,
+                                    "source_end": 1,
+                                    "limit_ids": [],
+                                }
+                            ],
                         }
                     )
                 ),
@@ -533,7 +591,7 @@ def test_provider_failures_stop_without_retry_or_answer(
     assert str(path) not in leaked
 
 
-def test_hostile_question_cannot_change_endpoint_product_or_error_text(
+def test_hostile_question_cannot_change_endpoint_or_bypass_required_limits(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = _save_products(tmp_path)
@@ -542,6 +600,7 @@ def test_hostile_question_cannot_change_endpoint_product_or_error_text(
         "<script>alert(1)</script>; rm -rf /; SELECT * FROM embedding_documents"
     )
     seen: list[httpx.Request] = []
+    luna_calls = 0
 
     def ollama(request: httpx.Request) -> httpx.Response:
         seen.append(request)
@@ -550,29 +609,26 @@ def test_hostile_question_cannot_change_endpoint_product_or_error_text(
         return _embed(axis(0, 1.0))
 
     async def luna(_self: object, request: httpx.Request) -> httpx.Response:
+        nonlocal luna_calls
+        luna_calls += 1
         seen.append(request)
-        if len([item for item in seen if item.url.host == "api.openai.com"]) > 1:
-            return httpx.Response(
-                500,
-                json={"error": question, "key": KEY, "path": str(path)},
-            )
         data = _model_data(request)
         assert data["product_id"] == "hp-a"
         assert data["question"] == question
         assert data["evidence"][0]["source_id"].startswith(f"ev:{HP_A_CARE_ARTIFACT}:")
-        return httpx.Response(
-            200, json=_envelope(_draft(ANSWER, data["evidence"][0]["source_id"]))
-        )
+        return httpx.Response(200, json=_envelope(_draft(ANSWER, data)))
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", luna)
     client = _client(tmp_path, path, embedding=ollama)
     accepted = client.post("/ask", json=_body("hp-a", question))
     assert accepted.status_code == 200
-    assert accepted.json()["sources"][0]["artifact_key"] == HP_A_CARE_ARTIFACT
+    assert accepted.json()["status"] == "handoff"
+    assert accepted.json()["answer"] is None
+    assert accepted.json()["sources"] == []
     assert "evil.example" not in accepted.text
     failed = client.post("/ask", json=_body("hp-a", question))
-    assert failed.status_code == 502
-    assert failed.json()["code"] == "provider_service_unavailable"
+    assert failed.status_code == 200
+    assert failed.json()["status"] == "handoff"
     assert "evil.example" not in failed.text
     assert KEY not in failed.text
     assert str(path) not in failed.text
@@ -581,8 +637,8 @@ def test_hostile_question_cannot_change_endpoint_product_or_error_text(
     assert urls == {
         OLLAMA_TAGS_URL,
         OLLAMA_EMBED_URL,
-        "https://api.openai.com/v1/responses",
     }
+    assert luna_calls == 0
     assert all(item.url.host != "evil.example" for item in seen)
 
 
@@ -590,8 +646,8 @@ def test_whole_chunks_stop_on_budget_conflict_or_one_oversize_source(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     path = tmp_path / "embeddings.sqlite"
-    first = "甲" * 700
-    second = "乙" * 700
+    first = "A" * 300
+    second = "B" * 1000
     body = f"# 第一段\n\n{first}\n\n# 第二段\n\n{second}\n"
     document = KnowledgeDocument(
         metadata=KnowledgeMetadata(
@@ -616,7 +672,7 @@ def test_whole_chunks_stop_on_budget_conflict_or_one_oversize_source(
         posted.append(data)
         return httpx.Response(
             200,
-            json=_envelope(_draft(ANSWER, data["evidence"][0]["source_id"])),
+            json=_envelope(_draft(ANSWER, data)),
         )
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", luna)
@@ -926,14 +982,37 @@ def _model_data(request: httpx.Request) -> dict[str, object]:
     return data
 
 
-def _draft(answer: str, source_id: object) -> str:
-    assert isinstance(source_id, str)
+def _draft(answer: str, data: dict[str, object]) -> str:
+    evidence = data["evidence"]
+    assert isinstance(evidence, list)
+    limits = data.get("required_limits", [])
+    assert isinstance(limits, list)
+    claims = []
+    for item in evidence:
+        assert isinstance(item, dict)
+        text = item["text"]
+        source_id = item["source_id"]
+        assert isinstance(text, str) and isinstance(source_id, str)
+        claims.append(
+            {
+                "answer_start": 0,
+                "answer_end": len(answer),
+                "source_id": source_id,
+                "source_start": 0,
+                "source_end": len(text),
+                "limit_ids": [
+                    limit["id"]
+                    for limit in limits
+                    if isinstance(limit, dict) and limit.get("source_id") == source_id
+                ],
+            }
+        )
     return json.dumps(
         {
             "status": "answer",
             "answer": answer,
-            "source_ids": [source_id],
             "reason": None,
+            "claims": claims,
         },
         ensure_ascii=False,
     )

@@ -591,7 +591,7 @@ def test_bigram_baseline_breaks_ties_by_key_then_index() -> None:
     ]
 
 
-def test_vertical_mock_ask_cites_faq_only_after_that_release(
+def test_vertical_mock_ask_hands_off_for_the_faqs_human_action(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     workspace = _workspace(tmp_path)
@@ -603,17 +603,16 @@ def test_vertical_mock_ask_cites_faq_only_after_that_release(
         rows = data["evidence"]
         assert isinstance(rows, list)
         evidence.append(rows)
-        source_ids = [item["source_id"] for item in rows]
-        return httpx.Response(200, json=_envelope(_draft("合成草稿。", source_ids)))
+        if not any("停止充電" in str(item.get("text")) for item in rows):
+            return httpx.Response(200, json=_envelope(_handoff("no_evidence")))
+        return httpx.Response(200, json=_envelope(_draft("合成草稿。", data)))
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", luna)
     baseline = _activate_sources(tmp_path / "base-approval", workspace, BASELINE)
     client = _ask_client(tmp_path, workspace)
     before = client.post("/ask", json={"product_id": "hp-a", "question": question})
     assert before.status_code == 200
-    assert "hp-a-charging-faq" not in {
-        item["document_id"] for item in before.json()["sources"]
-    }
+    assert before.json()["status"] == "handoff"
     faq = _build_evaluated(workspace, FAQ)
     _approve_release(tmp_path / "faq-approval", workspace, faq)
     assert (
@@ -624,9 +623,16 @@ def test_vertical_mock_ask_cites_faq_only_after_that_release(
     after = client.post("/ask", json={"product_id": "hp-a", "question": question})
     assert after.status_code == 200
     body = after.json()
-    assert body["status"] == "answer"
-    assert "hp-a-charging-faq" in {item["document_id"] for item in body["sources"]}
-    assert any("停止充電" in str(item.get("text")) for item in evidence[-1])
+    assert body["status"] == "handoff"
+    assert body["answer"] is None
+    faq_snapshot = candidate_snapshot(workspace, faq)
+    with EmbeddingStore.open_readonly(faq_snapshot.database) as store:
+        assert any(
+            (stored := store.get_document(key)) is not None
+            and stored.document.metadata.document_id == "hp-a-charging-faq"
+            for key in faq_snapshot.artifact_keys
+        )
+    assert len(evidence) == 1
     assert MOCK_EMBED_DIGEST != PUBLISHED_DIGEST
 
 
@@ -1131,8 +1137,7 @@ def test_ollama_release_keeps_the_published_digest_at_ask(
         data = _model_data(request)
         rows = data["evidence"]
         assert isinstance(rows, list)
-        source_ids = [item["source_id"] for item in rows]
-        return httpx.Response(200, json=_envelope(_draft("合成草稿。", source_ids)))
+        return httpx.Response(200, json=_envelope(_draft("合成草稿。", data)))
 
     monkeypatch.setattr(httpx.AsyncHTTPTransport, "handle_async_request", luna)
     release_id = _build_evaluated_ollama(workspace, BASELINE)
@@ -1556,13 +1561,50 @@ def _model_data(request: httpx.Request) -> dict[str, object]:
     return data
 
 
-def _draft(answer_text: str, source_ids: list[object]) -> str:
+def _handoff(reason: str) -> str:
+    return json.dumps(
+        {"status": "handoff", "answer": None, "reason": reason, "claims": []},
+        ensure_ascii=False,
+    )
+
+
+def _draft(answer_text: str, data: dict[str, object]) -> str:
+    rows = data["evidence"]
+    limits = data.get("required_limits", [])
+    assert isinstance(rows, list) and isinstance(limits, list)
+    answer = answer_text + "".join(
+        item["quote"]
+        for item in limits
+        if isinstance(item, dict)
+        and isinstance(item.get("quote"), str)
+        and item["quote"] not in answer_text
+    )
+    claims = []
+    for item in rows:
+        assert isinstance(item, dict)
+        text = item["text"]
+        source_id = item["source_id"]
+        assert isinstance(text, str) and isinstance(source_id, str)
+        claims.append(
+            {
+                "answer_start": 0,
+                "answer_end": len(answer),
+                "source_id": source_id,
+                "source_start": 0,
+                "source_end": len(text),
+                "limit_ids": [
+                    limit["id"]
+                    for limit in limits
+                    if isinstance(limit, dict) and limit.get("source_id") == source_id
+                ],
+            }
+        )
     return json.dumps(
         {
             "status": "answer",
-            "answer": answer_text,
-            "source_ids": source_ids,
+            "answer": answer,
             "reason": None,
+            "claims": claims,
         },
         ensure_ascii=False,
     )

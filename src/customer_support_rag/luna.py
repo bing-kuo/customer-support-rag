@@ -76,10 +76,6 @@ _IMAGE_GEN_COUNTS = frozenset(
 _IMAGE_GEN_OPTIONAL = frozenset({"cached_tokens_details", "output_tokens_details"})
 DRAFT_SCHEMA = {
     "type": "object",
-    "description": (
-        "grounded-draft-schema-v2; flat object; branch rules are instructed, "
-        "not enforced."
-    ),
     "additionalProperties": False,
     "properties": {
         "status": {
@@ -88,12 +84,6 @@ DRAFT_SCHEMA = {
         },
         "answer": {
             "anyOf": [{"type": "string"}, {"type": "null"}],
-            "description": "Answer: nonblank <=2000 chars; handoff: null.",
-        },
-        "source_ids": {
-            "type": "array",
-            "items": {"type": "string"},
-            "description": "Answer: 1-4 unique evidence IDs; handoff: [].",
         },
         "reason": {
             "anyOf": [
@@ -107,10 +97,32 @@ DRAFT_SCHEMA = {
                     ],
                 },
             ],
-            "description": "Answer: null; handoff: one allowed reason.",
+        },
+        "claims": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "answer_start": {"type": "integer"},
+                    "answer_end": {"type": "integer"},
+                    "source_id": {"type": "string"},
+                    "source_start": {"type": "integer"},
+                    "source_end": {"type": "integer"},
+                    "limit_ids": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": [
+                    "answer_start",
+                    "answer_end",
+                    "source_id",
+                    "source_start",
+                    "source_end",
+                    "limit_ids",
+                ],
+            },
         },
     },
-    "required": ["status", "answer", "source_ids", "reason"],
+    "required": ["status", "answer", "reason", "claims"],
 }
 
 __all__ = [

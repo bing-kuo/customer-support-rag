@@ -8,6 +8,7 @@ fixed digest, and the project root that holds ``.env``.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -24,6 +25,8 @@ from customer_support_rag.knowledge.answering import (
     GroundedDraft,
     ResolvedSource,
     _require_one_version,
+    _required_limit_sentences,
+    _requires_human_handoff_text,
     handoff_without_evidence,
     prepare_answer,
 )
@@ -38,7 +41,7 @@ from customer_support_rag.knowledge.retrieval import (
     RetrievalHit,
 )
 from customer_support_rag.knowledge.storage import EmbeddingStore, StorageError
-from customer_support_rag.luna import LunaError, Usage
+from customer_support_rag.luna import LunaError, Usage, wire_composition
 from customer_support_rag.luna_live import post_prepared_answer
 from customer_support_rag.maintenance.errors import MaintenanceError
 from customer_support_rag.maintenance.release import load_active_snapshot
@@ -249,6 +252,7 @@ def _prepare(config: AskConfig, product_id: str, question: str) -> _Prepared:
         artifact_keys = config.artifact_keys
         model_digest = config.model_digest
     store = EmbeddingStore.open_readonly(database)
+    source_documents = {}
     try:
         try:
             index = ExactCosineIndex.from_store(
@@ -262,6 +266,23 @@ def _prepare(config: AskConfig, product_id: str, question: str) -> _Prepared:
         try:
             query = adapter.embed_query(question, expected_model_digest=model_digest)
             hits = index.search(query, product_id=product_id, top_k=_TOP_K)
+            if any(len(hit.chunk.text) > MAX_EVIDENCE_CHARS for hit in hits):
+                raise AskFailure(503, "evidence_unavailable")
+            for hit in hits:
+                if hit.artifact_key in source_documents:
+                    continue
+                source = store.get_document(hit.artifact_key)
+                if source is None:
+                    raise StorageError("Candidate source document is unavailable.")
+                if (
+                    source.artifact_key != hit.artifact_key
+                    or source.document.metadata.product_id != product_id
+                    or source.document.metadata.version != hit.chunk.metadata.version
+                    or hashlib.sha256(source.document.body.encode("utf-8")).hexdigest()
+                    != hit.chunk.body_sha256
+                ):
+                    raise StorageError("Candidate source identity is inconsistent.")
+                source_documents[hit.artifact_key] = source.document
         finally:
             adapter.close()
     finally:
@@ -270,9 +291,43 @@ def _prepare(config: AskConfig, product_id: str, question: str) -> _Prepared:
         empty = prepare_answer(question, product_id=product_id, hits=[])
         return _Prepared(draft=handoff_without_evidence(empty))
     _require_one_version(_candidate_sources(hits))
-    request = prepare_answer(
-        question, product_id=product_id, hits=_select_whole_chunks(hits)
+    selected = _select_whole_chunks(hits)
+    selected_text_by_artifact: dict[str, list[str]] = {}
+    for hit in selected:
+        selected_text_by_artifact.setdefault(hit.artifact_key, []).append(
+            hit.chunk.text
+        )
+    omitted_limit = any(
+        sentence not in "\n".join(selected_text_by_artifact.get(artifact_key, []))
+        for artifact_key, document in source_documents.items()
+        for sentence in _required_limit_sentences(document.body)
     )
+    if omitted_limit or any(
+        _requires_human_handoff_text(question, document.body)
+        for document in source_documents.values()
+    ):
+        return _Prepared(
+            draft=GroundedDraft(
+                status="handoff", answer=None, reason="no_evidence", sources=()
+            )
+        )
+    request = prepare_answer(question, product_id=product_id, hits=selected)
+    if request.required_handoff:
+        return _Prepared(
+            draft=GroundedDraft(
+                status="handoff", answer=None, reason="no_evidence", sources=()
+            )
+        )
+    try:
+        wire_composition(request)
+    except LunaError as exc:
+        if exc.code in {"input_bound_exceeded", "wire_body_exceeded"}:
+            return _Prepared(
+                draft=GroundedDraft(
+                    status="handoff", answer=None, reason="no_evidence", sources=()
+                )
+            )
+        raise AskFailure(503, "evidence_unavailable") from None
     return _Prepared(request=request)
 
 
