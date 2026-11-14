@@ -85,6 +85,8 @@ uv run --locked python -m customer_support_rag.maintenance status \
 
 文章完整說明架構取捨、歷史 mock/live 證據及仍未驗證的範圍，見[PoC 收尾文章](docs/poc-closeout-article.md)。
 
+初學者可先讀 [RAG、chunking 與檢索品質驗證入門](docs/rag-explained.md)，再閱讀 PoC 結案案例與限制。
+
 ## 故障與恢復
 
 - `paid_blocked`：key 缺少、格式或權限不符，或程序未提供所需設定。確認 key directory 內只有正確的 `OPENAI_API_KEY`、檔案 mode 為 `0600`；不要輸出或貼上 key。

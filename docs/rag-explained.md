@@ -30,6 +30,17 @@ RAG 是 Retrieval-Augmented Generation 的縮寫。檢索負責找出可參考�
 
 目前支援 1 到 6 個 `#` 的 ATX 標題，前面最多容許三個空格；不是完整的 CommonMark parser。標題行仍留在原始 `body` 的切片文字中。`heading_path` 則是 chunk 附帶的 metadata（中繼資料），不是額外拼進 chunk 文字的內容。掃描標題時會略過 code fence 內看起來像標題的行，但後續切分仍依段落、換行和字元上限進行，不保證 fence 或程式碼區塊永遠不會被拆開。
 
+### 切分設計的取捨
+
+| 設計選擇 | 為什麼這樣做 | 代價與界線 |
+| --- | --- | --- |
+| Deterministic，同輸入與設定重現同結果 | 方便重現 chunk 邊界、對照引用位置與 debug | 只代表同一演算法版本和設定；改 profile／實作後仍須記版本並重新比較 |
+| Heading-aware，先按支援的標題分 section | 保留文件主題脈絡，另存 `heading_path` 協助辨識來源 | 只支援簡化 ATX heading；路徑是 metadata，heading 本身仍在 body slice |
+| Paragraph-first，再退到換行，最後硬切 | 儘量保留完整段落，片段仍超過上限時才用較弱邊界 | 長段落或長行可能被切開；不是語意理解或完整 Markdown parser |
+| No overlap | 避免預設重複索引與重複候選，讓片段邊界容易追查 | 無重疊本身不保證無損；要靠 offsets 驗證完整涵蓋、無 gap 且文字未改寫。有 overlap 也能依 offset 去重還原 |
+| 半開字元 offsets 加整份 body SHA-256 | offsets 指向原 body 的 Python 字元範圍，body hash 用來辨認來源內容變更 | offsets 不是 UTF-8 byte index；hash 是整份 body，不是每個 chunk 個別 hash |
+| Bounded boundary regex search | 每次只在當前 chunk 上限附近找切點，避免每個 chunk 都從頭掃完整篇文字 | 測試只限制候選搜尋窗口；它是 regression instrumentation，不是完整效能 benchmark |
+
 ## Overlap 能幫什麼忙？
 
 Overlap（重疊）是讓相鄰 chunks 共用一小段文字。例如把長段落切成兩段時，第二段可重複第一段末尾幾個字，減少答案線索剛好落在邊界兩側、單獨檢索其中一段時上下文不足的情況。代價是重複索引與儲存，搜尋也可能回傳相似的重複片段，並把重複文字送入生成上下文。
@@ -63,9 +74,9 @@ Keyword search（關鍵字搜尋）適合找型號、代碼、精確詞句；emb
 | Determinism | 固定輸入、切分演算法版本和設定，輸出應可重現。 | 既有測試比較相同 document 與 `max_chars` 的 `chunk_document(...)` 結果。 | 不代表未來演算法版本或所有 runtime 永遠相同；品質流程仍應記錄 chunk profile/version。 |
 | Edge Cases | 明確涵蓋空輸入、長行、Unicode、換行、標題與格式邊界。 | 既有來源包含 plain text、繁中／emoji、LF／CRLF／單 CR、長行硬切、略過 fence 內標題及跳級標題。 | fence 不保證不可拆；簡化標題辨識不是完整 Markdown parser。 |
 | Performance Regression | 先定義可重現的上限或基準，再追蹤回歸；測試 instrumentation 和完整效能基準是不同證據。 | `test_candidate_searches_are_bounded_to_one_chunk_window` 追蹤候選搜尋範圍：4096 個 `a`、`max_chars=32` 時最大搜尋 span 不超過 33，並檢查切成 128 段。 | 這是 bounded regex instrumentation regression，不是完整 chunker benchmark、營運延遲測量或全程線性保證；標題與行掃描另有工作。 |
-| Retrieval／回答品質 | 固定問題和相關來源標準，檢查 Recall@k、正確來源排名（如 MRR／rank distribution），再用人工規準判斷回答事實、條件、引用與 handoff。 | evaluator 有 cosine 排名和 lexical baseline 排名程式；本輪沒有執行產品測試或品質評估。 | 尚無本輪實測 Recall@k／MRR，也不能推論 embedding 勝過 keyword、答案正確或 cosine 是信心值。 |
+| Retrieval／回答品質 | 固定問題和相關來源標準，檢查前 k 名召回率（Recall@k；相關來源有多少出現在前 k 名）或平均倒數排名（MRR；每題第一個相關來源名次取倒數後再平均），再用人工規準判斷回答事實、條件、引用與 handoff。 | evaluator 有 cosine 排名和 lexical baseline 排名程式；本輪沒有執行產品測試或品質評估。 | 尚未實測前 k 名召回率（Recall@k；相關來源有多少出現在前 k 名）或平均倒數排名（MRR；每題第一個相關來源名次取倒數後再平均），也不能推論 embedding 勝過 keyword、答案正確或 cosine 是信心值。 |
 
-開始調參前，先固定代表性問題集、每題期望來源、商品與知識版本，並留出不參與調參的 held-out 問題。同一份資料、相同問題和同一評分方式先建立 keyword／lexical baseline；每輪只改一項，例如 chunk size、overlap 或 retrieval 組合，並記錄 corpus、query、chunk profile、embedding identity、top-k、filter 等 config 版本。設定用題目調參，held-out 只在設定完成後檢查泛化，不拿來反覆選參數。報告 Recall@k 和來源排名時，也要另外用人工 rubric 檢查必要事實、條件是否保留、引用能否支持主張，以及是否正確回答或 handoff。延遲和資源需依實際測量記錄；usage 未知就記 `null`／未知，不填零或推估費用。
+開始調參前，先固定代表性問題集、每題期望來源、商品與知識版本，並留出不參與調參的 held-out 問題。同一份資料、相同問題和同一評分方式先建立 keyword／lexical baseline；每輪只改一項，例如 chunk size、overlap 或 retrieval 組合，並記錄 corpus、query、chunk profile、embedding identity、top-k、filter 等 config 版本。設定用題目調參，held-out 只在設定完成後檢查泛化，不拿來反覆選參數。報告前 k 名召回率（Recall@k）和平均倒數排名（MRR）等來源排名指標時，也要另外用人工評分規準檢查必要事實、條件是否保留、引用能否支持主張，以及是否正確回答或 handoff。延遲和資源需依實際測量記錄；usage 未知就記 `null`／未知，不填零或推估費用。
 
 ## 本 PoC 做到哪裡
 
