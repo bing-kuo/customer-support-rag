@@ -4,11 +4,13 @@
 
 ## 目前狀態
 
-截至 P3 Draft，知識維護 CLI、`POST /ask`、`POST /assist` 與本機頁面已在程式中。P2 尚未完成 acceptance：真實生成語意與完整 holdout 未通過；FAQ absent baseline 的舊錯誤根因未知；FAQ present、policy v1/v2 尚未跑完驗證。sealed 16 題也尚未完成驗收；既有紀錄為 5 pass、1 error、10 未跑，另有 11 題語意未驗，須保留既有錯誤／未送出狀態，不能改寫成全未跑或全通過。既有四個真 embedding 候選仍未核准或啟用。README、離線 rehearsal 與 P3 診斷修補正在同一個 PR 審查，不能據此宣稱產品驗收完成。
+截至 PR #15 合併後的 main（[`f7ec860a01ad447a9cb639fcb474b597b62f4fc6`](https://github.com/bing-kuo/customer-support-rag/commit/f7ec860a01ad447a9cb639fcb474b597b62f4fc6)），知識維護 CLI、`POST /ask`、`POST /assist` 與本機頁面已在程式中。PoC 仍未完成 P2 驗收：既有安全／語意失敗與未驗項保留，FAQ absent baseline 的舊錯誤根因未知，FAQ present 與 policy v1/v2 尚未完成驗證；sealed 評估不代表通過。既有真 embedding 候選尚未取得 release approval，也未啟用。離線 rehearsal 與 PR #15 的修補都不代表產品驗收完成；沒有解除 security hold。
+
+本 repo 內記錄了不同舊版的歷史 live 生成結果：PR [#11](https://github.com/bing-kuo/customer-support-rag/pull/11) 的單題入口與 PR [#12](https://github.com/bing-kuo/customer-support-rag/pull/12) 舊版一般 `POST /ask` 各有一題回答；兩筆 `usage` 均為 `null`，`usage_code` 為 `unknown_billing_component`。較早的 PR #15 核准版本 [`09e24d1`](https://github.com/bing-kuo/customer-support-rag/commit/09e24d1e48ac71768dab08600feb8b47d04e17ce) 另記錄四個合成 dev 案例當時均成功取得生成回答，四案用量均未知。這些結果分屬不同舊版，不合併計算，也不代表 PR #15 最終合併版本或目前版本的語意品質已通過；最終合併版本沒有重跑 live 問答。PR [#13](https://github.com/bing-kuo/customer-support-rag/pull/13) 記錄了 UI 單題 live，但當時的畫面檔留在本機、未附為 GitHub 可檢視圖片。此 repo 為 private；以上 PR 與 commit 證據連結需要 repo 存取權，外部讀者可能無法開啟。
 
 本輪依 D-018 調整自然 RAG 草稿的保證範圍：程式驗來源／版本／hash、引用 ID、字元 span、answer 範圍完整覆蓋、輸出 schema 與 handoff 欄位一致；這些檢查只能確認結構和定位，不能證明每個主張被來源語意支持、所有必要限制完整，或 status 符合人工處置意圖。模型 instruction 會要求保留條件、禁止、必做與停止指示，但這不是可機械保證。來源文件按已核對的原始 chunks 整份送入；超過既有 4 個 evidence／1200 字元／wire 界線就不送 Luna，回現有 handoff。錯誤或相反建議即使結構合法，仍須人工依來源判讀；目前 UI 沒有強制放行閘門。
 
-P2 原有生成候選仍綁建置 commit `0cb3a9a`。本輪程式／prompt/schema 變更不會改標舊證據，也不會重算既有向量。診斷與真生成呼叫仍停止；後續 live 評測須另獲明確授權，舊失敗與 holdout 狀態保留。
+P2 歷史生成候選仍綁建置 commit `0cb3a9a`。PR #15 的程式／prompt/schema 變更沒有改標舊證據，也沒有重算既有向量。此 PoC 收尾不包含新的 live 評測、真候選核准或啟用；既有錯誤與未驗狀態保持原樣。
 
 ## 從乾淨 checkout 開始
 
@@ -79,7 +81,11 @@ uv run --locked python -m customer_support_rag.maintenance status \
 
 真實候選須先由授權 reviewer 核准文件 bytes 與 release manifest、資料庫及 regression hashes，再使用 `consume-document`／`consume-release`。只有已消費的真實 release approval 才可手動 `activate`。切換前讀取 `status`，`--expect` 必須是目前 `active.json` bytes 的 SHA-256；首次切換才使用 `--expect-none`。若結果為 `activated_unconfirmed`，先再查 `status`；若 pointer 已指向目標 release，不要以舊 `--expect` 重送。舊 snapshot 保留，除非另有明確授權，不要刪除。這些是真實環境操作說明，rehearsal 不會對真 workspace 執行。
 
-完整的初次 build、same-input no-op/reuse、FAQ 更新、evaluate、release 核准、activate 與 serving 啟動命令見[交付指南](docs/reproducible-delivery.md)。其中 `--embed ollama` 會呼叫本機 embedding model；範例是操作者參考流程，不是 P3 rehearsal，亦非本 PR 執行授權。真實生成與 holdout 仍未完成驗收，沒有呼叫 Luna 或啟用真候選。
+完整的初次 build、same-input no-op/reuse、FAQ 更新、evaluate、release 核准、activate 與 serving 啟動命令見[交付指南](docs/reproducible-delivery.md)。其中 `--embed ollama` 會呼叫本機 embedding model；範例是操作者參考流程，不是 P3 rehearsal，亦非本 PR 執行授權。PR #15 合併版本的 rehearsal 沒有呼叫 Luna 或啟用真候選；歷史單題 live 記錄見上方 PR #11、#12、#13，不能視為目前版本或完整品質驗收。
+
+文章完整說明架構取捨、歷史 mock/live 證據及仍未驗證的範圍，見[PoC 收尾文章](docs/poc-closeout-article.md)。
+
+初學者可先讀 [RAG、chunking 與檢索品質驗證入門](docs/rag-explained.md)，再閱讀 PoC 結案案例與限制。
 
 ## 故障與恢復
 
